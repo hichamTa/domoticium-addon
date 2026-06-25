@@ -1,0 +1,40 @@
+name: "Domoticium"
+description: >
+  Configure automatiquement Home Assistant pour Domoticium :
+  installe et configure Zigbee2MQTT, Matter Server et go2rtc (caméras),
+  crée les automations MQTT, puis tourne en service pont WebRTC.
+  À lancer une seule fois après la création du compte admin HA.
+version: "1.2.0"
+slug: "domoticium"
+init: false
+arch:
+  - aarch64
+  - armv7
+  - amd64
+startup: "services"
+boot: "auto"
+host_network: true
+hassio_api: true
+homeassistant_api: true
+map:
+  - homeassistant_config:rw
+options:
+  site_prefix: ""
+  emqx_host: ""
+  pi_username: ""
+  pi_password: ""
+  zigbee_adapter: "auto"
+  install_thread_border_router: false
+  thread_adapter: "auto"
+  app_url: "https://app.domoticium.fr"
+  go2rtc_url: "http://localhost:1984"
+schema:
+  site_prefix: str
+  emqx_host: str
+  pi_username: str
+  pi_password: str
+  zigbee_adapter: str
+  install_thread_border_router: bool
+  thread_adapter: str
+  app_url: str
+  go2rtc_url: str
