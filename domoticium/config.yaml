@@ -3,8 +3,9 @@ description: >
   Configure automatiquement Home Assistant pour Domoticium :
   installe Zigbee2MQTT, Matter Server et Frigate NVR (caméras HLS via Cloudflare Tunnel),
   crée les automations MQTT, puis tourne en service pont permanent.
+  Supporte les coordinateurs USB et réseau PoE (SLZB-MR4U, SLZB-06…).
   À lancer une seule fois après la création du compte admin HA.
-version: "1.4.1"
+version: "1.5.0"
 slug: "domoticium"
 init: false
 arch:
@@ -23,20 +24,24 @@ options:
   emqx_host: ""
   pi_username: ""
   pi_password: ""
+  coordinator_host: ""
+  coordinator_zigbee_port: 6638
+  coordinator_thread_port: 20108
   zigbee_adapter: "auto"
   install_thread_border_router: false
   thread_adapter: "auto"
   app_url: "https://app.domoticium.fr"
-  go2rtc_url: "http://localhost:1984"
   cloudflare_tunnel_token: ""
 schema:
   site_prefix: str
   emqx_host: str
   pi_username: str
   pi_password: str
+  coordinator_host: str
+  coordinator_zigbee_port: int
+  coordinator_thread_port: int
   zigbee_adapter: str
   install_thread_border_router: bool
   thread_adapter: str
   app_url: str
-  go2rtc_url: str
   cloudflare_tunnel_token: str

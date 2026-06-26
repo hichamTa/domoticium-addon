@@ -23,12 +23,17 @@ SITE_PREFIX             = cfg["site_prefix"]
 EMQX_HOST               = cfg["emqx_host"]
 PI_USER                 = cfg["pi_username"]
 PI_PASS                 = cfg["pi_password"]
+COORDINATOR_HOST        = cfg.get("coordinator_host", "").strip()   # vide = mode USB
+COORDINATOR_ZIGBEE_PORT = cfg.get("coordinator_zigbee_port", 6638)
+COORDINATOR_THREAD_PORT = cfg.get("coordinator_thread_port", 20108)
 ZIGBEE_ADAPTER          = cfg.get("zigbee_adapter", "auto")
 INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
 THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
 APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
-GO2RTC_URL              = cfg.get("go2rtc_url", "http://localhost:1984")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
+
+# Mode réseau (PoE) ou USB
+NETWORK_MODE = bool(COORDINATOR_HOST)
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 SUP  = "http://supervisor"
@@ -122,6 +127,12 @@ def install_zigbee2mqtt():
     else:
         log("Zigbee2MQTT déjà installé")
 
+    if NETWORK_MODE:
+        zigbee_port = f"tcp://{COORDINATOR_HOST}:{COORDINATOR_ZIGBEE_PORT}"
+        log(f"Mode réseau PoE — coordinateur Zigbee : {zigbee_port}")
+    else:
+        zigbee_port = ZIGBEE_ADAPTER  # "auto" ou port USB explicite
+
     z2m_config = {
         "mqtt": {
             "server": f"mqtts://{EMQX_HOST}:8883",
@@ -129,7 +140,7 @@ def install_zigbee2mqtt():
             "password": PI_PASS,
             "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
         },
-        "serial": {"port": ZIGBEE_ADAPTER},
+        "serial": {"port": zigbee_port},
         "homeassistant": False,
         "permit_join": False,
         "advanced": {"log_level": "info", "network_key": "GENERATE"},
@@ -198,21 +209,30 @@ def install_thread_border_router():
     else:
         log("Open Thread Border Router déjà installé")
 
-    thread_port = THREAD_ADAPTER
-    if thread_port == "auto":
-        thread_port = _detect_thread_adapter()
-        if thread_port:
-            log(f"Dongle Thread détecté : {thread_port}")
-        else:
-            warn("Aucun dongle Thread détecté — configurer manuellement.")
-            thread_port = "/dev/ttyACM1"
-
-    options = {
-        "device": thread_port,
-        "baudrate": 460800,
-        "flow_control": True,
-        "autoflash_firmware": True,
-    }
+    if NETWORK_MODE:
+        thread_device = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
+        log(f"Mode réseau PoE — coordinateur Thread : {thread_device}")
+        options = {
+            "device": thread_device,
+            "baudrate": 460800,
+            "flow_control": False,
+            "autoflash_firmware": False,  # impossible de flasher via réseau
+        }
+    else:
+        thread_port = THREAD_ADAPTER
+        if thread_port == "auto":
+            thread_port = _detect_thread_adapter()
+            if thread_port:
+                log(f"Dongle Thread détecté : {thread_port}")
+            else:
+                warn("Aucun dongle Thread détecté — configurer manuellement.")
+                thread_port = "/dev/ttyACM1"
+        options = {
+            "device": thread_port,
+            "baudrate": 460800,
+            "flow_control": True,
+            "autoflash_firmware": True,
+        }
     r = sup_post(f"/addons/{THREAD_SLUG}/options", {"options": options})
     mark = "✓" if r.ok else f"✗ {r.status_code}"
     log(f"{mark} Configuration Thread Border Router (port: {thread_port})")
