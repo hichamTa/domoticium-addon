@@ -239,18 +239,58 @@ def install_thread_border_router():
 
 
 def _detect_thread_adapter():
+    """
+    Détecte le port Thread parmi les dongles USB disponibles.
+
+    Ordre de priorité :
+      1. Dongles combo Zigbee+Thread (ex: SLZB-MR4U) → sélection par interface USB
+         if00 = Zigbee (pour Z2M), if02 = Thread (pour OTBR)
+      2. Nom explicitement Thread dans l'identifiant USB
+      3. Fabricant Thread connu, en excluant les dongles Zigbee identifiés
+      4. Fallback ttyACM1 / ttyUSB1
+    """
     import glob
-    thread_ids = [
+
+    # Dongles combo Zigbee+Thread — interface Thread connue
+    # Format : { sous-chaîne du nom USB : interface Thread }
+    COMBO_THREAD_IFACE = {
+        "SLZB-MR": "if02",   # SMLIGHT SLZB-MR4U / SLZB-MR1 : if00=Zigbee, if02=Thread
+    }
+
+    ZIGBEE_ONLY   = ["zigbee", "sonoff", "conbee", "raspbee", "husbzb", "zha"]
+    THREAD_NAMES  = ["thread", "openthread", "border_router", "otbr", "nrf52840"]
+    THREAD_VENDORS = [
         "usb-Silicon_Labs",
         "usb-SEGGER",
         "usb-Nordic_Semiconductor",
         "usb-dresden_elektronik",
+        "usb-SMLIGHT",
     ]
+
     by_id = glob.glob("/dev/serial/by-id/*")
-    for path in by_id:
-        for tid in thread_ids:
-            if tid in path and "zigbee" not in path.lower():
+
+    # Passe 0 : dongles combo → sélection par interface USB
+    for device_key, thread_iface in COMBO_THREAD_IFACE.items():
+        for path in by_id:
+            if device_key in path and thread_iface in path:
+                log(f"Dongle combo Zigbee+Thread détecté ({device_key}) — port Thread : {path}")
                 return os.path.realpath(path)
+
+    # Passe 1 : Thread explicite dans le nom USB
+    for path in by_id:
+        if any(kw in path.lower() for kw in THREAD_NAMES):
+            log(f"Dongle Thread détecté (nom) : {path}")
+            return os.path.realpath(path)
+
+    # Passe 2 : fabricant Thread potentiel, dongles Zigbee exclus
+    for path in by_id:
+        if any(kw in path.lower() for kw in ZIGBEE_ONLY):
+            continue
+        if any(vid in path for vid in THREAD_VENDORS):
+            log(f"Dongle Thread détecté (heuristique) : {path}")
+            return os.path.realpath(path)
+
+    # Fallback
     for port in ["/dev/ttyACM1", "/dev/ttyUSB1"]:
         if os.path.exists(port):
             return port

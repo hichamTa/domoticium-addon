@@ -4,7 +4,7 @@ description: >
   installe Zigbee2MQTT, Matter Server et Frigate NVR (caméras HLS via Cloudflare Tunnel),
   crée les automations MQTT, puis tourne en service pont permanent.
   À lancer une seule fois après la création du compte admin HA.
-version: "1.4.0"
+version: "1.4.1"
 slug: "domoticium"
 init: false
 arch:
