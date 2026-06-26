@@ -4,7 +4,7 @@ description: >
   installe et configure Zigbee2MQTT, Matter Server et go2rtc (caméras),
   crée les automations MQTT, puis tourne en service pont WebRTC.
   À lancer une seule fois après la création du compte admin HA.
-version: "1.2.0"
+version: "1.3.0"
 slug: "domoticium"
 init: false
 arch:
@@ -28,6 +28,7 @@ options:
   thread_adapter: "auto"
   app_url: "https://app.domoticium.fr"
   go2rtc_url: "http://localhost:1984"
+  cloudflare_tunnel_token: ""
 schema:
   site_prefix: str
   emqx_host: str
@@ -38,3 +39,4 @@ schema:
   thread_adapter: str
   app_url: str
   go2rtc_url: str
+  cloudflare_tunnel_token: str

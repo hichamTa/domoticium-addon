@@ -10,7 +10,7 @@ Phase 2 (service permanent) :
   • Pont WebRTC : reçoit les SDP offers via MQTT, les forward à go2rtc local
   • Gestion des streams caméra : ajoute / supprime des flux dans go2rtc à la demande
 """
-import base64, json, os, sys, threading, time
+import base64, json, os, subprocess, sys, threading, time
 import paho.mqtt.client as mqtt
 import requests
 
@@ -26,7 +26,8 @@ ZIGBEE_ADAPTER          = cfg.get("zigbee_adapter", "auto")
 INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
 THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
 APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
-GO2RTC_URL      = cfg.get("go2rtc_url", "http://localhost:1984")
+GO2RTC_URL              = cfg.get("go2rtc_url", "http://localhost:1984")
+CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 SUP  = "http://supervisor"
@@ -415,30 +416,30 @@ def run_setup():
 # PHASE 2 — SERVICE PERMANENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def handle_webrtc_request(client, msg):
-    """Reçoit un SDP offer via MQTT, le forward à go2rtc, publie l'answer."""
+def start_cloudflared():
+    """Démarre cloudflared en arrière-plan pour exposer go2rtc via Cloudflare Tunnel."""
+    if not CLOUDFLARE_TUNNEL_TOKEN:
+        log("cloudflared: pas de token configuré — tunnel caméras désactivé")
+        return
+
+    log("Démarrage de cloudflared…")
     try:
-        request_id  = msg.topic.split("/")[-1]
-        data        = json.loads(msg.payload.decode())
-        stream_name = data["streamName"]
-        sdp_offer   = data["sdp"]
-
-        log(f"WebRTC {request_id[:8]}… → '{stream_name}'")
-        resp = requests.post(
-            f"{GO2RTC_URL}/api/webrtc?src={stream_name}",
-            data=sdp_offer.encode(),
-            headers={"Content-Type": "application/sdp"},
-            timeout=6,
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--no-autoupdate", "run",
+             "--token", CLOUDFLARE_TUNNEL_TOKEN],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
-        if resp.status_code != 200:
-            warn(f"go2rtc {resp.status_code}: {resp.text[:200]}")
-            return
 
-        answer_topic = f"{SITE_PREFIX}/webrtc/answer/{request_id}"
-        client.publish(answer_topic, json.dumps({"sdp": resp.text}), qos=1)
-        log(f"Answer → {answer_topic}")
+        def _log_output():
+            for line in proc.stdout:
+                log(f"cloudflared: {line.decode().strip()}")
+
+        threading.Thread(target=_log_output, daemon=True).start()
+        log("✓ cloudflared actif — go2rtc accessible via Cloudflare Tunnel")
+    except FileNotFoundError:
+        warn("cloudflared introuvable — le binaire n'est pas installé dans l'image")
     except Exception as e:
-        warn(f"WebRTC: {e}")
+        warn(f"cloudflared: {e}")
 
 
 def handle_matter_commission(client, msg):
@@ -531,25 +532,23 @@ def on_connect(client, userdata, flags, rc):
         warn(f"Connexion MQTT échouée (rc={rc})")
         return
     topics = [
-        (f"{SITE_PREFIX}/webrtc/request/+", 1),
         (f"{SITE_PREFIX}/cameras/+/configure", 1),
         (f"{SITE_PREFIX}/matter/commission/start", 1),
     ]
     client.subscribe(topics)
-    log(f"Service actif — souscrit à {SITE_PREFIX}/webrtc/#, /cameras/#, /matter/#")
+    log(f"Service actif — souscrit à {SITE_PREFIX}/cameras/#, /matter/#")
 
 
 def on_message(client, userdata, msg):
     parts = msg.topic.split("/")
-    if len(parts) >= 4 and parts[1] == "webrtc" and parts[2] == "request":
-        handle_webrtc_request(client, msg)
-    elif len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
+    if len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
         handle_camera_configure(client, msg)
     elif len(parts) >= 4 and parts[1] == "matter" and parts[2] == "commission" and parts[3] == "start":
         handle_matter_commission(client, msg)
 
 
 def run_bridge():
+    start_cloudflared()
     client = mqtt.Client(client_id="domoticium-addon", clean_session=True)
     client.username_pw_set(PI_USER, PI_PASS)
     client.tls_set()
