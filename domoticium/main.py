@@ -2,13 +2,14 @@
 """
 Domoticium — Add-on Home Assistant
 Phase 1 (une seule fois) :
-  • Installe et configure Zigbee2MQTT (→ EMQX direct)
-  • Installe Matter Server
+  • Configure MQTT → EMQX
+  • Installe Zigbee2MQTT, Matter Server, Frigate NVR
   • Crée les 4 automations MQTT (State Stream, Commands, Heartbeat, Camera Status)
   • Écrit le rest_command caméra hors ligne
 Phase 2 (service permanent) :
-  • Pont WebRTC : reçoit les SDP offers via MQTT, les forward à go2rtc local
-  • Gestion des streams caméra : ajoute / supprime des flux dans go2rtc à la demande
+  • Démarre cloudflared (Cloudflare Tunnel → go2rtc Frigate port 1984)
+  • Gestion des caméras : ajoute/supprime dans Frigate à la demande
+  • Commissionnement Matter
 """
 import base64, json, os, subprocess, sys, threading, time
 import paho.mqtt.client as mqtt
@@ -18,10 +19,10 @@ import requests
 with open("/data/options.json") as f:
     cfg = json.load(f)
 
-SITE_PREFIX     = cfg["site_prefix"]
-EMQX_HOST       = cfg["emqx_host"]
-PI_USER         = cfg["pi_username"]
-PI_PASS         = cfg["pi_password"]
+SITE_PREFIX             = cfg["site_prefix"]
+EMQX_HOST               = cfg["emqx_host"]
+PI_USER                 = cfg["pi_username"]
+PI_PASS                 = cfg["pi_password"]
 ZIGBEE_ADAPTER          = cfg.get("zigbee_adapter", "auto")
 INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
 THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
@@ -34,11 +35,17 @@ SUP  = "http://supervisor"
 API  = f"{SUP}/core/api"
 HDRS = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
 
-SETUP_DONE = "/data/.setup_done"
-Z2M_REPO   = "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt"
-Z2M_SLUG   = "45df7312_zigbee2mqtt"   # slug après ajout du repo communautaire
-MATTER_SLUG  = "core_matter_server"          # add-on officiel HA
-THREAD_SLUG  = "core_openthread_border_router"  # add-on officiel HA
+SETUP_DONE   = "/data/.setup_done"
+CAMERAS_FILE = "/data/cameras.json"
+
+Z2M_REPO     = "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt"
+Z2M_SLUG     = "45df7312_zigbee2mqtt"
+MATTER_SLUG  = "core_matter_server"
+THREAD_SLUG  = "core_openthread_border_router"
+FRIGATE_REPO = "https://github.com/blakeblackshear/frigate-hass-addons"
+FRIGATE_SLUG = "ccab4aaf_frigate"
+
+_cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
 
 
 def log(msg):  print(f"[domoticium] {msg}", flush=True)
@@ -48,10 +55,23 @@ def sup_get(path):
     return requests.get(f"{SUP}{path}", headers=HDRS, timeout=15)
 
 def sup_post(path, data=None):
-    return requests.post(f"{SUP}{path}", headers=HDRS, json=data or {}, timeout=30)
+    return requests.post(f"{SUP}{path}", headers=HDRS, json=data or {}, timeout=60)
 
 def ha_post(path, data=None):
     return requests.post(f"{API}{path}", headers=HDRS, json=data or {}, timeout=15)
+
+def _load_cameras():
+    global _cameras
+    try:
+        with open(CAMERAS_FILE) as f:
+            _cameras = json.load(f)
+        log(f"Caméras chargées : {list(_cameras.keys()) or '(aucune)'}")
+    except FileNotFoundError:
+        _cameras = {}
+
+def _save_cameras():
+    with open(CAMERAS_FILE, "w") as f:
+        json.dump(_cameras, f)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,20 +97,18 @@ def wait_for_ha():
 def install_zigbee2mqtt():
     log("── Zigbee2MQTT ──────────────────────────────")
 
-    # 1. Ajouter le dépôt communautaire
     repos = sup_get("/store/repositories").json()
     existing_urls = [r.get("source", "") for r in (repos if isinstance(repos, list) else [])]
     if Z2M_REPO not in existing_urls:
         r = sup_post("/store/repositories", {"repository": Z2M_REPO})
         if r.ok:
             log("✓ Dépôt Zigbee2MQTT ajouté")
-            time.sleep(3)  # laisser le Supervisor indexer
+            time.sleep(3)
         else:
             warn(f"Dépôt Z2M : {r.status_code} — continuer quand même")
     else:
         log("Dépôt Zigbee2MQTT déjà présent")
 
-    # 2. Installer l'add-on si pas encore installé
     info = sup_get(f"/addons/{Z2M_SLUG}/info")
     if info.status_code == 404:
         log("Installation de Zigbee2MQTT…")
@@ -104,7 +122,6 @@ def install_zigbee2mqtt():
     else:
         log("Zigbee2MQTT déjà installé")
 
-    # 3. Écrire la configuration zigbee2mqtt
     z2m_config = {
         "mqtt": {
             "server": f"mqtts://{EMQX_HOST}:8883",
@@ -113,25 +130,22 @@ def install_zigbee2mqtt():
             "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
         },
         "serial": {"port": ZIGBEE_ADAPTER},
-        "homeassistant": False,  # on gère les états via EMQX, pas via HA discovery
+        "homeassistant": False,
         "permit_join": False,
         "advanced": {"log_level": "info", "network_key": "GENERATE"},
-        "frontend": {"port": 8099},  # accessible depuis HA (ingress)
+        "frontend": {"port": 8099},
     }
 
     z2m_dir = "/homeassistant/zigbee2mqtt"
     os.makedirs(z2m_dir, exist_ok=True)
     with open(f"{z2m_dir}/configuration.yaml", "w") as f:
-        # Écriture YAML simple sans dépendance PyYAML
         f.write(_dict_to_yaml(z2m_config))
     log("✓ Configuration Zigbee2MQTT écrite")
 
-    # 4. Options add-on : pointer vers le dossier de config
     sup_post(f"/addons/{Z2M_SLUG}/options", {
         "options": {"data_path": "/config/zigbee2mqtt"}
     })
 
-    # 5. Démarrer
     r = sup_post(f"/addons/{Z2M_SLUG}/start")
     mark = "✓" if r.ok else f"✗ {r.status_code}"
     log(f"{mark} Zigbee2MQTT démarré")
@@ -159,12 +173,11 @@ def install_matter_server():
     mark = "✓" if r.ok else f"✗ {r.status_code}"
     log(f"{mark} Matter Server démarré")
 
-    # Activer l'intégration Matter dans HA
     flow = ha_post("/config/config_entries/flow", {"handler": "matter"})
     if flow.ok and flow.json().get("type") == "create_entry":
         log("✓ Intégration Matter activée")
     else:
-        log("Intégration Matter : à activer manuellement si besoin (Paramètres → Intégrations → Matter)")
+        log("Intégration Matter : à activer manuellement si besoin")
 
 
 # ── Thread Border Router ─────────────────────────────────────────────────────
@@ -172,7 +185,6 @@ def install_matter_server():
 def install_thread_border_router():
     log("── Thread Border Router ──────────────────────")
 
-    # 1. Installer l'add-on
     info = sup_get(f"/addons/{THREAD_SLUG}/info")
     if info.status_code == 404:
         log("Installation de Open Thread Border Router…")
@@ -186,33 +198,29 @@ def install_thread_border_router():
     else:
         log("Open Thread Border Router déjà installé")
 
-    # 2. Auto-détection du port série du dongle Thread
     thread_port = THREAD_ADAPTER
     if thread_port == "auto":
         thread_port = _detect_thread_adapter()
         if thread_port:
             log(f"Dongle Thread détecté : {thread_port}")
         else:
-            warn("Aucun dongle Thread détecté — configurer manuellement dans l'add-on.")
-            thread_port = "/dev/ttyACM1"  # valeur par défaut commune
+            warn("Aucun dongle Thread détecté — configurer manuellement.")
+            thread_port = "/dev/ttyACM1"
 
-    # 3. Configurer l'add-on
     options = {
         "device": thread_port,
         "baudrate": 460800,
         "flow_control": True,
-        "autoflash_firmware": True,  # flash automatique du firmware OpenThread si besoin
+        "autoflash_firmware": True,
     }
     r = sup_post(f"/addons/{THREAD_SLUG}/options", {"options": options})
     mark = "✓" if r.ok else f"✗ {r.status_code}"
     log(f"{mark} Configuration Thread Border Router (port: {thread_port})")
 
-    # 4. Démarrer
     r = sup_post(f"/addons/{THREAD_SLUG}/start")
     mark = "✓" if r.ok else f"✗ {r.status_code}"
     log(f"{mark} Thread Border Router démarré")
 
-    # 5. Activer l'intégration Thread dans HA (permet à Matter d'utiliser Thread)
     time.sleep(3)
     flow = ha_post("/config/config_entries/flow", {"handler": "otbr"})
     if flow.ok:
@@ -220,7 +228,6 @@ def install_thread_border_router():
         if result.get("type") == "create_entry":
             log("✓ Intégration OTBR (Thread) activée dans HA")
         elif result.get("flow_id"):
-            # Soumettre la config par défaut si le flow demande confirmation
             r2 = requests.post(
                 f"{API}/config/config_entries/flow/{result['flow_id']}",
                 headers=HDRS, json={}, timeout=10
@@ -228,14 +235,11 @@ def install_thread_border_router():
             mark = "✓" if r2.ok else "? (à valider dans HA)"
             log(f"{mark} Intégration OTBR (Thread)")
     else:
-        log("Intégration Thread : à activer si besoin dans Paramètres → Intégrations → OpenThread Border Router")
+        log("Intégration Thread : à activer si besoin dans Paramètres → Intégrations")
 
 
 def _detect_thread_adapter():
-    """Détecte automatiquement un dongle Thread USB parmi les ports série connus."""
-    import glob, os
-
-    # Dongles Thread courants (Silicon Labs EFR32, Nordic nRF52840, etc.)
+    import glob
     thread_ids = [
         "usb-Silicon_Labs",
         "usb-SEGGER",
@@ -245,17 +249,87 @@ def _detect_thread_adapter():
     by_id = glob.glob("/dev/serial/by-id/*")
     for path in by_id:
         for tid in thread_ids:
-            # Éviter de prendre le coordinateur Zigbee (déjà affecté)
             if tid in path and "zigbee" not in path.lower():
-                real = os.path.realpath(path)
-                return real
-
-    # Fallback : essayer le deuxième port ACM (le premier est souvent Zigbee)
+                return os.path.realpath(path)
     for port in ["/dev/ttyACM1", "/dev/ttyUSB1"]:
         if os.path.exists(port):
             return port
-
     return None
+
+
+# ── Frigate NVR ───────────────────────────────────────────────────────────────
+
+def install_frigate():
+    log("── Frigate NVR ──────────────────────────────")
+
+    # 1. Ajouter le dépôt
+    repos = sup_get("/store/repositories").json()
+    existing_urls = [r.get("source", "") for r in (repos if isinstance(repos, list) else [])]
+    if FRIGATE_REPO not in existing_urls:
+        r = sup_post("/store/repositories", {"repository": FRIGATE_REPO})
+        if r.ok:
+            log("✓ Dépôt Frigate ajouté")
+            time.sleep(5)
+        else:
+            warn(f"Dépôt Frigate : {r.status_code} — on continue")
+    else:
+        log("Dépôt Frigate déjà présent")
+
+    # 2. Installer si nécessaire
+    info = sup_get(f"/addons/{FRIGATE_SLUG}/info")
+    if info.status_code == 404:
+        log("Installation de Frigate (peut prendre 2-3 min)…")
+        r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install")
+        if r.ok:
+            log("✓ Frigate installé")
+            time.sleep(10)
+        else:
+            warn(f"Installation Frigate : {r.status_code} {r.text[:200]}")
+            return
+    else:
+        log("Frigate déjà installé")
+
+    # 3. Écrire la config initiale (caméras vides)
+    _load_cameras()
+    write_frigate_config()
+
+    # 4. Démarrer
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/start")
+    mark = "✓" if r.ok else f"✗ {r.status_code}"
+    log(f"{mark} Frigate démarré — go2rtc HLS disponible sur :1984")
+
+
+def write_frigate_config():
+    """Génère /homeassistant/frigate.yml depuis le registre des caméras."""
+    lines = [
+        "# Généré par Domoticium — ne pas modifier manuellement",
+        "mqtt:",
+        "  enabled: false",
+        "",
+        "cameras:",
+    ]
+
+    for name, rtsp_url in _cameras.items():
+        lines += [
+            f"  {name}:",
+            "    ffmpeg:",
+            "      inputs:",
+            f"        - path: {rtsp_url}",
+            "          roles:",
+            "            - detect",
+            "    detect:",
+            "      enabled: false",
+            "    record:",
+            "      enabled: false",
+        ]
+
+    if not _cameras:
+        lines.append("  # Aucune caméra configurée")
+
+    with open("/homeassistant/frigate.yml", "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    log(f"✓ frigate.yml mis à jour ({len(_cameras)} caméra(s))")
 
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
@@ -403,13 +477,13 @@ def run_setup():
     install_matter_server()
     if INSTALL_THREAD_ROUTER:
         install_thread_border_router()
+    install_frigate()
     create_automations()
     write_rest_commands()
     ha_post("/services/homeassistant/reload_all")
     with open(SETUP_DONE, "w") as f:
         f.write("done")
     log("═══ Configuration terminée ✓ ═══")
-    log("Passage en mode service (WebRTC + caméras)…")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -417,9 +491,9 @@ def run_setup():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def start_cloudflared():
-    """Démarre cloudflared en arrière-plan pour exposer go2rtc via Cloudflare Tunnel."""
+    """Démarre cloudflared → Frigate go2rtc port 1984 via Cloudflare Tunnel."""
     if not CLOUDFLARE_TUNNEL_TOKEN:
-        log("cloudflared: pas de token configuré — tunnel caméras désactivé")
+        log("cloudflared: pas de token — tunnel caméras désactivé")
         return
 
     log("Démarrage de cloudflared…")
@@ -435,19 +509,58 @@ def start_cloudflared():
                 log(f"cloudflared: {line.decode().strip()}")
 
         threading.Thread(target=_log_output, daemon=True).start()
-        log("✓ cloudflared actif — go2rtc accessible via Cloudflare Tunnel")
+        log("✓ cloudflared actif — Frigate go2rtc accessible via Cloudflare Tunnel")
     except FileNotFoundError:
-        warn("cloudflared introuvable — le binaire n'est pas installé dans l'image")
+        warn("cloudflared introuvable")
     except Exception as e:
         warn(f"cloudflared: {e}")
 
 
+def restart_frigate():
+    """Redémarre Frigate en arrière-plan pour recharger frigate.yml."""
+    def _do():
+        time.sleep(1)
+        r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
+        mark = "✓" if r.ok else f"✗ {r.status_code}"
+        log(f"{mark} Frigate redémarré")
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def handle_camera_configure(client, msg):
+    """
+    Ajoute ou supprime une caméra dans Frigate.
+    Topic   : {prefix}/cameras/{cameraId}/configure
+    Payload : {"action": "add"|"remove", "streamName": "...", "rtspUrl": "rtsp://..."}
+    """
+    try:
+        data        = json.loads(msg.payload.decode())
+        action      = data.get("action", "add")
+        stream_name = data["streamName"]
+
+        if action == "add":
+            rtsp_url = data["rtspUrl"]
+            _cameras[stream_name] = rtsp_url
+            _save_cameras()
+            write_frigate_config()
+            restart_frigate()
+            log(f"✓ Caméra ajoutée : '{stream_name}' — Frigate redémarre")
+
+        elif action == "remove":
+            _cameras.pop(stream_name, None)
+            _save_cameras()
+            write_frigate_config()
+            restart_frigate()
+            log(f"✓ Caméra supprimée : '{stream_name}' — Frigate redémarre")
+
+    except Exception as e:
+        warn(f"Camera configure: {e}")
+
+
 def handle_matter_commission(client, msg):
     """
-    Reçoit un code PIN Matter via MQTT, commissionne le device via HA,
-    publie le résultat sur {prefix}/matter/commission/status/{requestId}.
-    Exécuté dans un thread séparé pour ne pas bloquer la boucle MQTT.
-    Topic : {prefix}/matter/commission/start
+    Commissionne un device Matter via HA.
+    Topic   : {prefix}/matter/commission/start
     Payload : {"requestId": "...", "code": "12345678"}
     """
     def _do():
@@ -460,8 +573,6 @@ def handle_matter_commission(client, msg):
                 raise ValueError("Code PIN manquant")
 
             log(f"Matter commission {(request_id or '?')[:8]}… code={code}")
-
-            # Appel au service matter.commission de Home Assistant
             resp = ha_post("/services/matter/commission", {"code": code})
 
             result_topic = f"{SITE_PREFIX}/matter/commission/status/{request_id}"
@@ -491,42 +602,6 @@ def handle_matter_commission(client, msg):
     threading.Thread(target=_do, daemon=True).start()
 
 
-def handle_camera_configure(client, msg):
-    """
-    Ajoute ou supprime un flux dans go2rtc à la demande.
-    Topic : {prefix}/cameras/{cameraId}/configure
-    Payload : {"action": "add"|"remove", "streamName": "...", "rtspUrl": "rtsp://..."}
-    """
-    try:
-        data        = json.loads(msg.payload.decode())
-        action      = data.get("action", "add")
-        stream_name = data["streamName"]
-
-        if action == "add":
-            rtsp_url = data["rtspUrl"]
-            resp = requests.put(
-                f"{GO2RTC_URL}/api/streams",
-                params={"name": stream_name},
-                data=rtsp_url,
-                headers={"Content-Type": "text/plain"},
-                timeout=5,
-            )
-            mark = "✓" if resp.status_code in (200, 204) else f"✗ {resp.status_code}"
-            log(f"{mark} go2rtc stream ajouté : '{stream_name}' → {rtsp_url}")
-
-        elif action == "remove":
-            resp = requests.delete(
-                f"{GO2RTC_URL}/api/streams",
-                params={"name": stream_name},
-                timeout=5,
-            )
-            mark = "✓" if resp.status_code in (200, 204) else f"✗ {resp.status_code}"
-            log(f"{mark} go2rtc stream supprimé : '{stream_name}'")
-
-    except Exception as e:
-        warn(f"Camera configure: {e}")
-
-
 def on_connect(client, userdata, flags, rc):
     if rc != 0:
         warn(f"Connexion MQTT échouée (rc={rc})")
@@ -548,6 +623,7 @@ def on_message(client, userdata, msg):
 
 
 def run_bridge():
+    _load_cameras()
     start_cloudflared()
     client = mqtt.Client(client_id="domoticium-addon", clean_session=True)
     client.username_pw_set(PI_USER, PI_PASS)
