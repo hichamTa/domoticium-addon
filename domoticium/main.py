@@ -227,13 +227,13 @@ def install_thread_border_router():
         log("Open Thread Border Router déjà installé")
 
     if NETWORK_MODE:
-        thread_device = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
-        log(f"Mode réseau PoE — coordinateur Thread : {thread_device}")
+        device_label = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
+        log(f"Mode réseau PoE — coordinateur Thread : {device_label}")
         options = {
-            "device": thread_device,
+            "device": device_label,
             "baudrate": 460800,
             "flow_control": False,
-            "autoflash_firmware": False,  # impossible de flasher via réseau
+            "autoflash_firmware": False,
         }
     else:
         thread_port = THREAD_ADAPTER
@@ -244,6 +244,7 @@ def install_thread_border_router():
             else:
                 warn("Aucun dongle Thread détecté — configurer manuellement.")
                 thread_port = "/dev/ttyACM1"
+        device_label = thread_port
         options = {
             "device": thread_port,
             "baudrate": 460800,
@@ -252,7 +253,7 @@ def install_thread_border_router():
         }
     r = sup_post(f"/addons/{THREAD_SLUG}/options", {"options": options})
     mark = "✓" if r.ok else f"✗ {r.status_code}"
-    log(f"{mark} Configuration Thread Border Router (port: {thread_port})")
+    log(f"{mark} Configuration Thread Border Router ({device_label})")
 
     r = sup_post(f"/addons/{THREAD_SLUG}/start")
     mark = "✓" if r.ok else f"✗ {r.status_code}"
