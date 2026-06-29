@@ -75,10 +75,16 @@ def _sup_repos():
     except Exception as e:
         warn(f"/store/repositories parse error: {e} | raw: {resp.text[:200]}")
         return []
-    if isinstance(body, dict):
-        repos = body.get("data", {}).get("repositories", body.get("repositories", []))
-    elif isinstance(body, list):
+    if isinstance(body, list):
         repos = body
+    elif isinstance(body, dict):
+        data = body.get("data", body.get("repositories", []))
+        if isinstance(data, list):
+            repos = data
+        elif isinstance(data, dict):
+            repos = data.get("repositories", [])
+        else:
+            repos = []
     else:
         repos = []
     return [r.get("source", "") for r in repos if isinstance(r, dict)]
