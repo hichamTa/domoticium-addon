@@ -65,6 +65,24 @@ def sup_post(path, data=None):
 def ha_post(path, data=None):
     return requests.post(f"{API}{path}", headers=HDRS, json=data or {}, timeout=15)
 
+def _sup_repos():
+    """Retourne la liste des URLs de dépôts depuis le Supervisor.
+    Gère le format HA Supervisor : {"result":"ok","data":{"repositories":[...]}}.
+    """
+    resp = sup_get("/store/repositories")
+    try:
+        body = resp.json()
+    except Exception as e:
+        warn(f"/store/repositories parse error: {e} | raw: {resp.text[:200]}")
+        return []
+    if isinstance(body, dict):
+        repos = body.get("data", {}).get("repositories", body.get("repositories", []))
+    elif isinstance(body, list):
+        repos = body
+    else:
+        repos = []
+    return [r.get("source", "") for r in repos if isinstance(r, dict)]
+
 def _load_cameras():
     global _cameras
     try:
@@ -102,8 +120,7 @@ def wait_for_ha():
 def install_zigbee2mqtt():
     log("── Zigbee2MQTT ──────────────────────────────")
 
-    repos = sup_get("/store/repositories").json()
-    existing_urls = [r.get("source", "") for r in (repos if isinstance(repos, list) else [])]
+    existing_urls = _sup_repos()
     if Z2M_REPO not in existing_urls:
         r = sup_post("/store/repositories", {"repository": Z2M_REPO})
         if r.ok:
@@ -323,8 +340,7 @@ def install_frigate():
     log("── Frigate NVR ──────────────────────────────")
 
     # 1. Ajouter le dépôt
-    repos = sup_get("/store/repositories").json()
-    existing_urls = [r.get("source", "") for r in (repos if isinstance(repos, list) else [])]
+    existing_urls = _sup_repos()
     if FRIGATE_REPO not in existing_urls:
         r = sup_post("/store/repositories", {"repository": FRIGATE_REPO})
         if r.ok:
