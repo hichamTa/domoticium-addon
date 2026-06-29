@@ -5,7 +5,7 @@ description: >
   crée les automations MQTT, puis tourne en service pont permanent.
   Supporte les coordinateurs USB et réseau PoE (SLZB-MR4U, SLZB-06…).
   À lancer une seule fois après la création du compte admin HA.
-version: "1.5.1"
+version: "1.5.2"
 slug: "domoticium"
 init: false
 arch:
@@ -16,6 +16,7 @@ startup: "services"
 boot: "auto"
 host_network: true
 hassio_api: true
+hassio_role: manager
 homeassistant_api: true
 map:
   - homeassistant_config:rw
