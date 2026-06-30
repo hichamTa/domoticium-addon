@@ -176,10 +176,18 @@ def install_zigbee2mqtt():
         log("Zigbee2MQTT déjà installé")
 
     if NETWORK_MODE:
-        zigbee_port = f"tcp://{COORDINATOR_HOST}:{COORDINATOR_ZIGBEE_PORT}"
-        log(f"Mode réseau PoE — coordinateur Zigbee : {zigbee_port}")
+        zigbee_port    = f"tcp://{COORDINATOR_HOST}:{COORDINATOR_ZIGBEE_PORT}"
+        zigbee_adapter = ZIGBEE_ADAPTER  # "auto" ou type explicite (ember, zstack…)
+        log(f"Mode réseau PoE — coordinateur Zigbee : {zigbee_port} (adapter={zigbee_adapter})")
     else:
-        zigbee_port = ZIGBEE_ADAPTER  # "auto" ou port USB explicite
+        zigbee_port    = ZIGBEE_ADAPTER  # "auto" ou port USB explicite
+        zigbee_adapter = None            # USB : Z2M détecte le type tout seul
+
+    serial_cfg: dict = {"port": zigbee_port}
+    if zigbee_adapter:
+        # Z2M v2 exige 'adapter' pour les connexions TCP ; sans lui il tente
+        # une découverte réseau (scan) qui échoue avec "Cannot discover TCP adapters".
+        serial_cfg["adapter"] = zigbee_adapter
 
     z2m_config = {
         "mqtt": {
@@ -188,7 +196,7 @@ def install_zigbee2mqtt():
             "password": PI_PASS,
             "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
         },
-        "serial": {"port": zigbee_port},
+        "serial": serial_cfg,
         "homeassistant": False,
         "permit_join": False,
         "advanced": {"log_level": "info", "network_key": "GENERATE"},
