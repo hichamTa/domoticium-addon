@@ -89,6 +89,25 @@ def _sup_repos():
         repos = []
     return [r.get("source", "") for r in repos if isinstance(r, dict)]
 
+def _is_addon_installed(slug: str) -> bool:
+    """Vérifie si un add-on est réellement installé (pas seulement disponible en store).
+    Le Supervisor retourne 200 avec installed=null/state=unknown pour les add-ons connus
+    mais non installés — on ne peut pas se fier uniquement au code HTTP.
+    """
+    r = sup_get(f"/addons/{slug}/info")
+    if r.status_code == 404:
+        return False
+    if not r.ok:
+        return False
+    try:
+        body = r.json()
+        data = body.get("data", body) if isinstance(body, dict) else {}
+        installed = data.get("installed")   # version str si installé, None sinon
+        state     = data.get("state", "")   # "unknown" si non installé
+        return (installed is not None) or (state not in ("", "unknown", None))
+    except Exception:
+        return True  # si parsing impossible, on fait confiance au HTTP 200
+
 def _load_cameras():
     global _cameras
     try:
@@ -137,8 +156,7 @@ def install_zigbee2mqtt():
     else:
         log("Dépôt Zigbee2MQTT déjà présent")
 
-    info = sup_get(f"/addons/{Z2M_SLUG}/info")
-    if info.status_code == 404:
+    if not _is_addon_installed(Z2M_SLUG):
         log("Installation de Zigbee2MQTT…")
         r = sup_post(f"/store/addons/{Z2M_SLUG}/install")
         if r.ok:
@@ -181,8 +199,10 @@ def install_zigbee2mqtt():
     })
 
     r = sup_post(f"/addons/{Z2M_SLUG}/start")
-    mark = "✓" if r.ok else f"✗ {r.status_code}"
-    log(f"{mark} Zigbee2MQTT démarré")
+    if r.ok:
+        log("✓ Zigbee2MQTT démarré")
+    else:
+        warn(f"✗ {r.status_code} Zigbee2MQTT start : {r.text[:150]}")
 
 
 # ── Matter Server ─────────────────────────────────────────────────────────────
@@ -190,8 +210,7 @@ def install_zigbee2mqtt():
 def install_matter_server():
     log("── Matter Server ────────────────────────────")
 
-    info = sup_get(f"/addons/{MATTER_SLUG}/info")
-    if info.status_code == 404:
+    if not _is_addon_installed(MATTER_SLUG):
         log("Installation de Matter Server…")
         r = sup_post(f"/store/addons/{MATTER_SLUG}/install")
         if r.ok:
@@ -204,8 +223,10 @@ def install_matter_server():
         log("Matter Server déjà installé")
 
     r = sup_post(f"/addons/{MATTER_SLUG}/start")
-    mark = "✓" if r.ok else f"✗ {r.status_code}"
-    log(f"{mark} Matter Server démarré")
+    if r.ok:
+        log("✓ Matter Server démarré")
+    else:
+        warn(f"✗ {r.status_code} Matter Server start : {r.text[:150]}")
 
     flow = ha_post("/config/config_entries/flow", {"handler": "matter"})
     if flow.ok and flow.json().get("type") == "create_entry":
@@ -219,8 +240,7 @@ def install_matter_server():
 def install_thread_border_router():
     log("── Thread Border Router ──────────────────────")
 
-    info = sup_get(f"/addons/{THREAD_SLUG}/info")
-    if info.status_code == 404:
+    if not _is_addon_installed(THREAD_SLUG):
         log("Installation de Open Thread Border Router…")
         r = sup_post(f"/store/addons/{THREAD_SLUG}/install")
         if r.ok:
@@ -262,8 +282,10 @@ def install_thread_border_router():
     log(f"{mark} Configuration Thread Border Router ({device_label})")
 
     r = sup_post(f"/addons/{THREAD_SLUG}/start")
-    mark = "✓" if r.ok else f"✗ {r.status_code}"
-    log(f"{mark} Thread Border Router démarré")
+    if r.ok:
+        log("✓ Thread Border Router démarré")
+    else:
+        warn(f"✗ {r.status_code} Thread Border Router start : {r.text[:150]}")
 
     time.sleep(3)
     flow = ha_post("/config/config_entries/flow", {"handler": "otbr"})
@@ -359,8 +381,7 @@ def install_frigate():
         log("Dépôt Frigate déjà présent")
 
     # 2. Installer si nécessaire
-    info = sup_get(f"/addons/{FRIGATE_SLUG}/info")
-    if info.status_code == 404:
+    if not _is_addon_installed(FRIGATE_SLUG):
         log("Installation de Frigate (peut prendre 2-3 min)…")
         r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install")
         if r.ok:
@@ -378,8 +399,10 @@ def install_frigate():
 
     # 4. Démarrer
     r = sup_post(f"/addons/{FRIGATE_SLUG}/start")
-    mark = "✓" if r.ok else f"✗ {r.status_code}"
-    log(f"{mark} Frigate démarré — go2rtc HLS disponible sur :1984")
+    if r.ok:
+        log("✓ Frigate démarré — go2rtc HLS disponible sur :1984")
+    else:
+        warn(f"✗ {r.status_code} Frigate start : {r.text[:150]}")
 
 
 def write_frigate_config():
