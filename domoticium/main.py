@@ -285,8 +285,11 @@ def install_thread_border_router():
             "autoflash_firmware": True,
         }
     r = sup_post(f"/addons/{THREAD_SLUG}/options", {"options": options})
-    mark = "✓" if r.ok else f"✗ {r.status_code}"
-    log(f"{mark} Configuration Thread Border Router ({device_label})")
+    if not r.ok:
+        warn(f"✗ {r.status_code} Configuration Thread Border Router ({device_label}) : {r.text[:200]}")
+        warn(f"Configurer manuellement dans HA : Paramètres → Add-ons → Open Thread Border Router → device = {device_label}")
+        return
+    log(f"✓ Configuration Thread Border Router ({device_label})")
 
     r = sup_post(f"/addons/{THREAD_SLUG}/restart")
     if r.ok:
@@ -413,10 +416,24 @@ def install_frigate():
 
     # 5. Démarrer (restart fonctionne aussi sur un add-on arrêté ou en erreur)
     r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
-    if r.ok:
-        log("✓ Frigate démarré — go2rtc HLS disponible sur :1984")
-    else:
+    if not r.ok:
         warn(f"✗ {r.status_code} Frigate restart : {r.text[:150]}")
+        return
+    log("Frigate redémarré — attente que go2rtc soit disponible sur :1984…")
+
+    # 6. Health-check : attendre que go2rtc soit opérationnel (max 3 min)
+    for i in range(36):
+        time.sleep(5)
+        try:
+            resp = requests.get("http://127.0.0.1:1984/api", timeout=3)
+            if resp.status_code < 500:
+                log(f"✓ Frigate go2rtc opérationnel sur :1984 (démarré en ~{(i+1)*5}s)")
+                return
+        except Exception:
+            pass
+        if i % 6 == 5:
+            log(f"  … toujours en attente ({(i+1)*5}s)")
+    warn("go2rtc pas encore disponible sur :1984 après 3 min — vérifier les logs Frigate dans HA")
 
 
 def write_frigate_config():
@@ -536,10 +553,11 @@ def create_automations():
             "alias": "Domoticium — Camera Status Reporter",
             "description": "Notifie l'API quand une caméra change d'état",
             "mode": "parallel", "max": 10,
-            "trigger": [{"platform": "state", "entity_id": ["camera.*"],
-                         "to": ["unavailable", "idle", "recording", "streaming"]}],
+            "trigger": [
+                {"platform": "state", "entity_id": "camera.*", "to": "unavailable"},
+                {"platform": "state", "entity_id": "camera.*", "from": "unavailable"},
+            ],
             "action": [{"service": "rest_command.domoticium_camera_status", "data": {
-                "site_id": p,
                 "ha_entity_id": "{{ trigger.entity_id }}",
                 "online": "{{ trigger.to_state.state != 'unavailable' }}",
             }}],
