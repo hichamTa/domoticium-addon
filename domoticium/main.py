@@ -31,6 +31,7 @@ INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
 THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
 APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
+FORCE_SETUP             = cfg.get("force_setup", False)
 
 # Mode réseau (PoE) ou USB
 NETWORK_MODE = bool(COORDINATOR_HOST)
@@ -776,6 +777,10 @@ def _dict_to_yaml(d, indent=0):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    if FORCE_SETUP:
+        log("force_setup activé — réinitialisation complète de la configuration")
+        if os.path.exists(SETUP_DONE):
+            os.remove(SETUP_DONE)
     if not os.path.exists(SETUP_DONE):
         run_setup()
     else:
