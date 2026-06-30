@@ -644,9 +644,13 @@ def _build_mqtt_broker_payload(schema: list) -> dict:
         payload["advanced_options"] = True
 
     # Step TLS/avancé (affiché après advanced_options=True)
-    if "certificate" in schema_names:
-        # "auto" = utiliser les CAs système (EMQX Cloud a un certificat Let's Encrypt valide)
-        payload["certificate"] = "auto"
+    # Le nom du champ qui active la vérification CA a changé selon les versions HA :
+    # 'certificate' (anciennes versions) ou 'set_ca_cert' (HA 2025.x, confirmé par logs).
+    # Sans ce champ = "off" par défaut → HA tente une connexion SANS TLS même sur port 8883.
+    for k in ("certificate", "set_ca_cert"):
+        if k in schema_names:
+            # "auto" = utiliser les CAs système (EMQX Cloud a un certificat Let's Encrypt valide)
+            payload[k] = "auto"
     if "tls_insecure" in schema_names:
         payload["tls_insecure"] = False  # vérification stricte du certificat
 
