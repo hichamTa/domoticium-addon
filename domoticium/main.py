@@ -184,7 +184,7 @@ def install_zigbee2mqtt():
     z2m_config = {
         "mqtt": {
             "server": f"mqtts://{EMQX_HOST}:8883",
-            "user": PI_USER,
+            "username": PI_USER,  # Z2M v2 : 'username' (ex 'user' en v1)
             "password": PI_PASS,
             "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
         },
@@ -844,15 +844,15 @@ def run_setup():
     # ── MQTT uniquement le temps de valider la connexion ─────────────────────
     configure_mqtt()
 
-    # TODO: réactiver après validation MQTT
-    # install_zigbee2mqtt()
+    install_zigbee2mqtt()
+
+    # À valider après Zigbee2MQTT
     # install_matter_server()
     # if INSTALL_THREAD_ROUTER:
     #     install_thread_border_router()
     # install_frigate()
     # create_automations()
     # write_rest_commands()
-    # ─────────────────────────────────────────────────────────────────────────
 
     ha_post("/services/homeassistant/reload_all")
     with open(SETUP_DONE, "w") as f:
