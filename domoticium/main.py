@@ -409,10 +409,69 @@ def _detect_thread_adapter():
 
 # ── Frigate NVR ───────────────────────────────────────────────────────────────
 
+def _frigate_go2rtc_ready() -> bool:
+    """Teste si go2rtc écoute sur :1984. Retourne True si opérationnel."""
+    try:
+        return requests.get("http://127.0.0.1:1984/api", timeout=3).status_code < 500
+    except Exception:
+        return False
+
+
+def _wait_frigate_ready(max_attempts: int = 36) -> bool:
+    """Attend jusqu'à 3 min que go2rtc soit disponible. Retourne True si succès."""
+    log("Attente que go2rtc soit disponible sur :1984…")
+    for i in range(max_attempts):
+        time.sleep(5)
+        if _frigate_go2rtc_ready():
+            log(f"✓ Frigate go2rtc opérationnel sur :1984 (~{(i+1)*5}s)")
+            return True
+        if i % 6 == 5:
+            log(f"  … toujours en attente ({(i+1)*5}s)")
+    warn("go2rtc pas disponible après 3 min")
+    return False
+
+
+def _frigate_state() -> str:
+    """Retourne l'état courant de l'add-on Frigate."""
+    r = sup_get(f"/addons/{FRIGATE_SLUG}/info")
+    if not r.ok:
+        return "unknown"
+    try:
+        data = r.json()
+        if isinstance(data, dict):
+            data = data.get("data", data)
+        return data.get("state", "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _configure_frigate_and_start() -> bool:
+    """Configure et démarre Frigate. Retourne True si go2rtc est opérationnel."""
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/options", {"network": {"1984/tcp": 1984}})
+    mark = "✓" if r.ok else f"✗ {r.status_code} {r.text[:80]}"
+    log(f"{mark} Frigate port 1984 exposé")
+
+    _load_cameras()
+    write_frigate_config()
+
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
+    if not r.ok:
+        warn(f"✗ {r.status_code} Frigate restart : {r.text[:150]}")
+        return False
+
+    return _wait_frigate_ready()
+
+
 def install_frigate():
     log("── Frigate NVR ──────────────────────────────")
 
-    # 1. Ajouter le dépôt
+    # 1. Nettoyer un go2rtc.yml résiduel de l'ancienne architecture standalone
+    old_go2rtc = "/homeassistant/go2rtc.yml"
+    if os.path.exists(old_go2rtc):
+        os.rename(old_go2rtc, f"{old_go2rtc}.bak")
+        log("⚠ Ancien go2rtc.yml archivé → go2rtc.yml.bak (utilise le go2rtc embarqué dans Frigate)")
+
+    # 2. Ajouter le dépôt
     existing_urls = _sup_repos()
     if FRIGATE_REPO not in existing_urls:
         r = sup_post("/store/repositories", {"repository": FRIGATE_REPO})
@@ -424,7 +483,7 @@ def install_frigate():
     else:
         log("Dépôt Frigate déjà présent")
 
-    # 2. Installer si nécessaire
+    # 3. Installer si nécessaire
     if not _is_addon_installed(FRIGATE_SLUG):
         log("Installation de Frigate (peut prendre 2-3 min)…")
         r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install")
@@ -437,37 +496,28 @@ def install_frigate():
     else:
         log("Frigate déjà installé")
 
-    # 3. Exposer le port go2rtc 1984 sur l'hôte (null par défaut → non accessible)
-    r = sup_post(f"/addons/{FRIGATE_SLUG}/options", {
-        "network": {"1984/tcp": 1984}
-    })
-    mark = "✓" if r.ok else f"✗ {r.status_code} {r.text[:80]}"
-    log(f"{mark} Frigate port 1984 exposé")
-
-    # 4. Écrire la config initiale (caméras vides)
-    _load_cameras()
-    write_frigate_config()
-
-    # 5. Démarrer (restart fonctionne aussi sur un add-on arrêté ou en erreur)
-    r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
-    if not r.ok:
-        warn(f"✗ {r.status_code} Frigate restart : {r.text[:150]}")
+    # 4. Configurer + démarrer
+    if _configure_frigate_and_start():
         return
-    log("Frigate redémarré — attente que go2rtc soit disponible sur :1984…")
 
-    # 6. Health-check : attendre que go2rtc soit opérationnel (max 3 min)
-    for i in range(36):
-        time.sleep(5)
-        try:
-            resp = requests.get("http://127.0.0.1:1984/api", timeout=3)
-            if resp.status_code < 500:
-                log(f"✓ Frigate go2rtc opérationnel sur :1984 (démarré en ~{(i+1)*5}s)")
-                return
-        except Exception:
-            pass
-        if i % 6 == 5:
-            log(f"  … toujours en attente ({(i+1)*5}s)")
-    warn("go2rtc pas encore disponible sur :1984 après 3 min — vérifier les logs Frigate dans HA")
+    # 5. Toujours en erreur → réinstallation propre automatique
+    state = _frigate_state()
+    warn(f"Frigate état={state!r} après timeout — réinstallation propre…")
+
+    sup_post(f"/addons/{FRIGATE_SLUG}/uninstall")
+    log("Désinstallation Frigate…")
+    time.sleep(20)
+
+    r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install")
+    if not r.ok:
+        warn(f"✗ {r.status_code} Réinstallation Frigate impossible : {r.text[:100]}")
+        return
+    log("✓ Frigate réinstallé — reconfiguration…")
+    time.sleep(15)
+
+    if _configure_frigate_and_start():
+        return
+    warn("Frigate toujours inopérationnel après réinstallation — vérifier les logs Frigate dans HA")
 
 
 def write_frigate_config():
@@ -477,25 +527,28 @@ def write_frigate_config():
         "mqtt:",
         "  enabled: false",
         "",
-        "cameras:",
+        "go2rtc:",
+        "  streams: {}",
+        "",
     ]
 
-    for name, rtsp_url in _cameras.items():
-        lines += [
-            f"  {name}:",
-            "    ffmpeg:",
-            "      inputs:",
-            f"        - path: {rtsp_url}",
-            "          roles:",
-            "            - detect",
-            "    detect:",
-            "      enabled: false",
-            "    record:",
-            "      enabled: false",
-        ]
-
-    if not _cameras:
-        lines.append("  # Aucune caméra configurée")
+    if _cameras:
+        lines.append("cameras:")
+        for name, rtsp_url in _cameras.items():
+            lines += [
+                f"  {name}:",
+                "    ffmpeg:",
+                "      inputs:",
+                f"        - path: {rtsp_url}",
+                "          roles:",
+                "            - detect",
+                "    detect:",
+                "      enabled: false",
+                "    record:",
+                "      enabled: false",
+            ]
+    else:
+        lines.append("cameras: {}")
 
     with open("/homeassistant/frigate.yml", "w") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -505,29 +558,51 @@ def write_frigate_config():
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
 
+def _unwrap(resp_json):
+    """Dépaquète l'enveloppe Supervisor {result, data} si présente."""
+    if isinstance(resp_json, dict) and "data" in resp_json and "result" in resp_json:
+        return resp_json["data"]
+    return resp_json
+
+
 def configure_mqtt():
     log("── MQTT ─────────────────────────────────────")
     entries = requests.get(f"{API}/config/config_entries/entry", headers=HDRS, timeout=10)
-    if entries.ok and any(e.get("domain") == "mqtt" for e in entries.json()):
-        log("MQTT déjà configuré")
-        return
+    if entries.ok:
+        try:
+            entry_list = _unwrap(entries.json())
+            if isinstance(entry_list, list) and any(e.get("domain") == "mqtt" for e in entry_list):
+                log("MQTT déjà configuré")
+                return
+        except Exception:
+            pass
 
     log(f"Configuration MQTT → {EMQX_HOST}:8883…")
-    flow = ha_post("/config/config_entries/flow", {"handler": "mqtt"}).json()
+    flow_resp = ha_post("/config/config_entries/flow", {"handler": "mqtt"})
+    flow = _unwrap(flow_resp.json())
     flow_id = flow.get("flow_id")
     if not flow_id:
-        warn(f"Flow MQTT impossible : {flow}")
+        warn(f"Flow MQTT impossible : {flow_resp.text[:200]}")
         return
 
     payload = {"broker": EMQX_HOST, "port": 8883, "username": PI_USER, "password": PI_PASS}
-    result = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
-                           headers=HDRS, json=payload, timeout=15).json()
-    if result.get("type") == "form":
-        payload["tls"] = True
-        result = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
-                               headers=HDRS, json=payload, timeout=15).json()
+    r1 = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
+                       headers=HDRS, json=payload, timeout=15)
+    result = _unwrap(r1.json())
 
-    mark = "✓" if result.get("type") == "create_entry" else f"? ({result.get('type')})"
+    if result.get("type") == "form":
+        step = result.get("step_id", "?")
+        errors = result.get("errors", {})
+        log(f"[MQTT] Étape supplémentaire : {step} — {errors}")
+        payload["tls"] = True
+        r2 = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
+                           headers=HDRS, json=payload, timeout=15)
+        result = _unwrap(r2.json())
+
+    flow_type = result.get("type", "?")
+    if flow_type not in ("create_entry", "abort"):
+        log(f"[MQTT] Réponse brute : {r1.text[:300]}")
+    mark = "✓" if flow_type == "create_entry" else f"? ({flow_type})"
     log(f"{mark} MQTT configuré")
 
 
