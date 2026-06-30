@@ -400,11 +400,18 @@ def install_frigate():
     else:
         log("Frigate déjà installé")
 
-    # 3. Écrire la config initiale (caméras vides)
+    # 3. Exposer le port go2rtc 1984 sur l'hôte (null par défaut → non accessible)
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/options", {
+        "network": {"1984/tcp": 1984}
+    })
+    mark = "✓" if r.ok else f"✗ {r.status_code} {r.text[:80]}"
+    log(f"{mark} Frigate port 1984 exposé")
+
+    # 4. Écrire la config initiale (caméras vides)
     _load_cameras()
     write_frigate_config()
 
-    # 4. Démarrer
+    # 5. Démarrer
     r = sup_post(f"/addons/{FRIGATE_SLUG}/start")
     if r.ok:
         log("✓ Frigate démarré — go2rtc HLS disponible sur :1984")
