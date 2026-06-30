@@ -490,6 +490,11 @@ def install_frigate():
         if r.ok:
             log("✓ Frigate installé")
             time.sleep(10)
+        elif "already_installed" in r.text or "already installed" in r.text.lower():
+            # Supervisor dit "already installed" mais _is_addon_installed a retourné False
+            # (peut arriver si Frigate est en crash loop → state='unknown').
+            # On continue quand même à configurer.
+            log("Frigate déjà installé (détection Supervisor corrigée)")
         else:
             warn(f"Installation Frigate : {r.status_code} {r.text[:200]}")
             return
@@ -553,10 +558,12 @@ def write_frigate_config():
     # La migration Frigate 0.13→0.14 crashe si "cameras: {}" (parsé comme None).
     # Sans la clé, config.get("cameras", {}) retourne {} et la migration réussit.
 
+    content = "\n".join(lines) + "\n"
     with open("/homeassistant/frigate.yml", "w") as fh:
-        fh.write("\n".join(lines) + "\n")
+        fh.write(content)
 
     log(f"✓ frigate.yml mis à jour ({len(_cameras)} caméra(s))")
+    log(f"[frigate.yml]\n{content}")
 
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
@@ -568,10 +575,38 @@ def _unwrap(resp_json):
     return resp_json
 
 
+def _mqtt_submit(flow_id, payload, label):
+    """Soumet une étape du flow MQTT. Retourne (ok, result_dict)."""
+    r = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
+                      headers=HDRS, json=payload, timeout=15)
+    if not r.ok:
+        warn(f"[MQTT] {label} erreur {r.status_code}: {r.text[:300]}")
+        return False, {}
+    result = _unwrap(r.json())
+    log(f"[MQTT] {label} → type={result.get('type','?')} step={result.get('step_id','?')}")
+    return True, result
+
+
+def _mqtt_is_done(result):
+    """Retourne True si le flow est terminé (succès ou déjà configuré)."""
+    t = result.get("type", "?")
+    if t == "create_entry":
+        log("✓ MQTT configuré")
+        return True
+    if t == "abort":
+        reason = result.get("reason", "?")
+        if reason in ("already_configured", "single_instance_allowed"):
+            log("✓ MQTT déjà configuré")
+        else:
+            warn(f"MQTT flow abort : {reason}")
+        return True
+    return False
+
+
 def configure_mqtt():
     log("── MQTT ─────────────────────────────────────")
 
-    # Vérifier si MQTT est déjà actif via la liste des services
+    # Vérifier si MQTT est déjà actif
     svc_resp = requests.get(f"{API}/services", headers=HDRS, timeout=10)
     if svc_resp.ok:
         try:
@@ -597,65 +632,37 @@ def configure_mqtt():
         warn(f"[MQTT] Pas de flow_id : {flow_resp.text[:200]}")
         return
 
-    # Flow déjà terminé à la création
-    if flow_type == "create_entry":
-        log("✓ MQTT configuré")
-        return
-    if flow_type == "abort":
-        reason = flow.get("reason", "?")
-        if reason in ("already_configured", "single_instance_allowed"):
-            log("✓ MQTT déjà configuré")
-        else:
-            warn(f"MQTT flow abort : {reason}")
+    if _mqtt_is_done(flow):
         return
 
     broker_payload = {"broker": EMQX_HOST, "port": 8883, "username": PI_USER, "password": PI_PASS}
 
-    # Sur le step "user" on envoie directement les credentials.
-    # Sur tout autre step (confirm, confirm_setup…) on envoie {} d'abord.
-    if step_id == "user":
-        payload1 = broker_payload
-    else:
-        log(f"[MQTT] Step initial '{step_id}' inattendu — soumission vide puis credentials")
-        payload1 = {}
+    # Étape 1 : si le flow démarre par un menu (HA 2024.4+), choisir "broker"
+    if flow_type == "menu":
+        menu_options = flow.get("menu_options", [])
+        log(f"[MQTT] Menu options : {menu_options}")
+        choice = "broker" if "broker" in menu_options else (menu_options[0] if menu_options else "broker")
+        ok, flow = _mqtt_submit(flow_id, {"next_step_id": choice}, f"menu→{choice}")
+        if not ok or _mqtt_is_done(flow):
+            return
+        flow_type = flow.get("type", "?")
+        step_id   = flow.get("step_id", "?")
 
-    r1 = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
-                       headers=HDRS, json=payload1, timeout=15)
-    if not r1.ok:
-        warn(f"[MQTT] Step '{step_id}' erreur {r1.status_code}: {r1.text[:300]}")
+    # Étape 2 : si le flow est sur un step "form", soumettre les credentials
+    if flow_type == "form":
+        ok, result = _mqtt_submit(flow_id, broker_payload, f"credentials (step={step_id})")
+        if not ok or _mqtt_is_done(result):
+            return
+        # Un step supplémentaire éventuel
+        if result.get("type") == "form":
+            next_step = result.get("step_id", "?")
+            ok, result = _mqtt_submit(flow_id, broker_payload, f"retry (step={next_step})")
+            if not ok:
+                return
+            _mqtt_is_done(result)
         return
 
-    result = _unwrap(r1.json())
-    r1_type = result.get("type", "?")
-    r1_step = result.get("step_id", "?")
-    log(f"[MQTT] Réponse step 1 : type={r1_type} step={r1_step}")
-
-    if r1_type == "form":
-        errors = result.get("errors", {})
-        if errors:
-            warn(f"[MQTT] Erreurs step '{r1_step}': {errors}")
-        # Si le step "user" vient maintenant (après confirmation), on envoie les creds
-        payload2 = broker_payload
-        r2 = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
-                           headers=HDRS, json=payload2, timeout=15)
-        if not r2.ok:
-            warn(f"[MQTT] Step '{r1_step}' erreur {r2.status_code}: {r2.text[:300]}")
-            return
-        result = _unwrap(r2.json())
-        log(f"[MQTT] Réponse step 2 : type={result.get('type','?')} step={result.get('step_id','?')}")
-
-    final_type = result.get("type", "?")
-    if final_type == "create_entry":
-        log("✓ MQTT configuré")
-    elif final_type == "abort":
-        reason = result.get("reason", "?")
-        if reason in ("already_configured", "single_instance_allowed"):
-            log("✓ MQTT déjà configuré")
-        else:
-            warn(f"MQTT flow abort : {reason}")
-    else:
-        warn(f"[MQTT] État final inattendu : type={final_type}")
-        log(f"[MQTT] Réponse brute r1: {r1.text[:300]}")
+    warn(f"[MQTT] Type inattendu : {flow_type} — {flow_resp.text[:200]}")
 
 
 def create_automations():
@@ -969,6 +976,13 @@ def _dict_to_yaml(d, indent=0):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Priorité absolue : écrire frigate.yml AVANT tout le reste.
+    # Frigate peut auto-démarrer pendant notre setup et lire ce fichier.
+    # On le fait ici, avant même d'attendre HA, pour éviter le crash de migration
+    # causé par un "cameras: {}" ou "cameras: null" résiduel.
+    _load_cameras()
+    write_frigate_config()
+
     if FORCE_SETUP:
         log("force_setup activé — réinitialisation complète de la configuration")
         if os.path.exists(SETUP_DONE):
