@@ -92,8 +92,8 @@ def _sup_repos():
 
 def _is_addon_installed(slug: str) -> bool:
     """Vérifie si un add-on est réellement installé (pas seulement disponible en store).
-    Le Supervisor retourne 200 avec installed=null/state=unknown pour les add-ons connus
-    mais non installés — on ne peut pas se fier uniquement au code HTTP.
+    Le Supervisor retourne 200 même pour les add-ons du store non installés.
+    Seul un champ 'installed' contenant une version string prouve l'installation réelle.
     """
     r = sup_get(f"/addons/{slug}/info")
     if r.status_code == 404:
@@ -103,11 +103,17 @@ def _is_addon_installed(slug: str) -> bool:
     try:
         body = r.json()
         data = body.get("data", body) if isinstance(body, dict) else {}
-        installed = data.get("installed")   # version str si installé, None sinon
-        state     = data.get("state", "")   # "unknown" si non installé
-        return (installed is not None) or (state not in ("", "unknown", None))
-    except Exception:
-        return True  # si parsing impossible, on fait confiance au HTTP 200
+        installed = data.get("installed")
+        state     = data.get("state", "unknown")
+        log(f"[check] {slug}: installed={installed!r} state={state!r}")
+        # Seule preuve fiable : installed est une version string non vide
+        if isinstance(installed, str) and installed:
+            return True
+        # Ou state explicitement "started" / "running" (add-on déjà en cours)
+        return state in ("started", "running")
+    except Exception as e:
+        warn(f"_is_addon_installed({slug}) erreur: {e}")
+        return True
 
 def _load_cameras():
     global _cameras
