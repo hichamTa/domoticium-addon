@@ -605,9 +605,9 @@ def _mqtt_is_done(result):
 
 def _build_mqtt_broker_payload(schema: list) -> dict:
     """
-    Construit le payload broker à partir des noms de champs réels du data_schema HA.
-    HA peut utiliser 'broker' ou 'host' selon la version. On s'adapte.
-    Si schema vide → confirmation/navigation sans champ → payload {}.
+    Construit le payload pour chaque étape du flow MQTT HA en lisant le data_schema.
+    Gère le step broker (credentials) et les steps TLS/options avancées.
+    Si schema vide → étape de confirmation sans champ → payload {}.
     """
     if not schema:
         return {}
@@ -616,7 +616,8 @@ def _build_mqtt_broker_payload(schema: list) -> dict:
     log(f"[MQTT] Champs du schéma : {sorted(schema_names)}")
     payload = {}
 
-    # Hostname du broker (HA utilise 'broker' historiquement, possiblement 'host' en 2025.x)
+    # ── Credentials broker ────────────────────────────────────────────────────
+    # HA utilise 'broker' (CONF_BROKER) depuis toujours ; 'host' dans certaines versions.
     for k in ("broker", "host", "server", "hostname"):
         if k in schema_names:
             payload[k] = EMQX_HOST
@@ -635,11 +636,19 @@ def _build_mqtt_broker_payload(schema: list) -> dict:
             payload[k] = PI_PASS
             break
 
-    # Champs TLS présents dans certaines versions
-    if "tls_insecure" in schema_names:
-        payload["tls_insecure"] = False  # EMQX Cloud a un certificat CA public valide
+    # ── TLS via options avancées ──────────────────────────────────────────────
+    # EMQX Cloud Serverless n'expose que le port 8883 (TLS obligatoire).
+    # Sans advanced_options=True, HA tente une connexion TCP plain → cannot_connect.
+    # Avec advanced_options=True, HA ouvre le formulaire TLS (certificate, tls_insecure…).
+    if "advanced_options" in schema_names:
+        payload["advanced_options"] = True
+
+    # Step TLS/avancé (affiché après advanced_options=True)
     if "certificate" in schema_names:
-        payload["certificate"] = "auto"  # utiliser les CAs système
+        # "auto" = utiliser les CAs système (EMQX Cloud a un certificat Let's Encrypt valide)
+        payload["certificate"] = "auto"
+    if "tls_insecure" in schema_names:
+        payload["tls_insecure"] = False  # vérification stricte du certificat
 
     return payload
 
@@ -827,14 +836,20 @@ def write_rest_commands():
 def run_setup():
     wait_for_ha()
     log("═══ Début de la configuration Domoticium ═══")
+
+    # ── MQTT uniquement le temps de valider la connexion ─────────────────────
     configure_mqtt()
-    install_zigbee2mqtt()
-    install_matter_server()
-    if INSTALL_THREAD_ROUTER:
-        install_thread_border_router()
-    install_frigate()
-    create_automations()
-    write_rest_commands()
+
+    # TODO: réactiver après validation MQTT
+    # install_zigbee2mqtt()
+    # install_matter_server()
+    # if INSTALL_THREAD_ROUTER:
+    #     install_thread_border_router()
+    # install_frigate()
+    # create_automations()
+    # write_rest_commands()
+    # ─────────────────────────────────────────────────────────────────────────
+
     ha_post("/services/homeassistant/reload_all")
     with open(SETUP_DONE, "w") as f:
         f.write("done")
