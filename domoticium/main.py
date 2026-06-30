@@ -504,6 +504,11 @@ def install_frigate():
     state = _frigate_state()
     warn(f"Frigate état={state!r} après timeout — réinstallation propre…")
 
+    # Écrire la config AVANT la désinstallation : elle persiste sur le disque
+    # et Frigate la lira lors de l'auto-démarrage post-réinstallation.
+    _load_cameras()
+    write_frigate_config()
+
     sup_post(f"/addons/{FRIGATE_SLUG}/uninstall")
     log("Désinstallation Frigate…")
     time.sleep(20)
@@ -513,7 +518,7 @@ def install_frigate():
         warn(f"✗ {r.status_code} Réinstallation Frigate impossible : {r.text[:100]}")
         return
     log("✓ Frigate réinstallé — reconfiguration…")
-    time.sleep(15)
+    time.sleep(30)
 
     if _configure_frigate_and_start():
         return
@@ -526,9 +531,6 @@ def write_frigate_config():
         "# Généré par Domoticium — ne pas modifier manuellement",
         "mqtt:",
         "  enabled: false",
-        "",
-        "go2rtc:",
-        "  streams: {}",
         "",
     ]
 
@@ -547,8 +549,9 @@ def write_frigate_config():
                 "    record:",
                 "      enabled: false",
             ]
-    else:
-        lines.append("cameras: {}")
+    # Intentionnellement PAS de clé "cameras:" quand vide.
+    # La migration Frigate 0.13→0.14 crashe si "cameras: {}" (parsé comme None).
+    # Sans la clé, config.get("cameras", {}) retourne {} et la migration réussit.
 
     with open("/homeassistant/frigate.yml", "w") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -567,43 +570,92 @@ def _unwrap(resp_json):
 
 def configure_mqtt():
     log("── MQTT ─────────────────────────────────────")
-    entries = requests.get(f"{API}/config/config_entries/entry", headers=HDRS, timeout=10)
-    if entries.ok:
+
+    # Vérifier si MQTT est déjà actif via la liste des services
+    svc_resp = requests.get(f"{API}/services", headers=HDRS, timeout=10)
+    if svc_resp.ok:
         try:
-            entry_list = _unwrap(entries.json())
-            if isinstance(entry_list, list) and any(e.get("domain") == "mqtt" for e in entry_list):
-                log("MQTT déjà configuré")
+            if any(s.get("domain") == "mqtt" for s in svc_resp.json()):
+                log("MQTT déjà configuré et actif")
                 return
         except Exception:
             pass
 
     log(f"Configuration MQTT → {EMQX_HOST}:8883…")
     flow_resp = ha_post("/config/config_entries/flow", {"handler": "mqtt"})
-    flow = _unwrap(flow_resp.json())
-    flow_id = flow.get("flow_id")
-    if not flow_id:
-        warn(f"Flow MQTT impossible : {flow_resp.text[:200]}")
+    if not flow_resp.ok:
+        warn(f"Flow MQTT impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
         return
 
-    payload = {"broker": EMQX_HOST, "port": 8883, "username": PI_USER, "password": PI_PASS}
+    flow = _unwrap(flow_resp.json())
+    flow_id   = flow.get("flow_id")
+    step_id   = flow.get("step_id", "?")
+    flow_type = flow.get("type", "?")
+    log(f"[MQTT] Flow démarré : type={flow_type} step={step_id}")
+
+    if not flow_id:
+        warn(f"[MQTT] Pas de flow_id : {flow_resp.text[:200]}")
+        return
+
+    # Flow déjà terminé à la création
+    if flow_type == "create_entry":
+        log("✓ MQTT configuré")
+        return
+    if flow_type == "abort":
+        reason = flow.get("reason", "?")
+        if reason in ("already_configured", "single_instance_allowed"):
+            log("✓ MQTT déjà configuré")
+        else:
+            warn(f"MQTT flow abort : {reason}")
+        return
+
+    broker_payload = {"broker": EMQX_HOST, "port": 8883, "username": PI_USER, "password": PI_PASS}
+
+    # Sur le step "user" on envoie directement les credentials.
+    # Sur tout autre step (confirm, confirm_setup…) on envoie {} d'abord.
+    if step_id == "user":
+        payload1 = broker_payload
+    else:
+        log(f"[MQTT] Step initial '{step_id}' inattendu — soumission vide puis credentials")
+        payload1 = {}
+
     r1 = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
-                       headers=HDRS, json=payload, timeout=15)
+                       headers=HDRS, json=payload1, timeout=15)
+    if not r1.ok:
+        warn(f"[MQTT] Step '{step_id}' erreur {r1.status_code}: {r1.text[:300]}")
+        return
+
     result = _unwrap(r1.json())
+    r1_type = result.get("type", "?")
+    r1_step = result.get("step_id", "?")
+    log(f"[MQTT] Réponse step 1 : type={r1_type} step={r1_step}")
 
-    if result.get("type") == "form":
-        step = result.get("step_id", "?")
+    if r1_type == "form":
         errors = result.get("errors", {})
-        log(f"[MQTT] Étape supplémentaire : {step} — {errors}")
-        payload["tls"] = True
+        if errors:
+            warn(f"[MQTT] Erreurs step '{r1_step}': {errors}")
+        # Si le step "user" vient maintenant (après confirmation), on envoie les creds
+        payload2 = broker_payload
         r2 = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
-                           headers=HDRS, json=payload, timeout=15)
+                           headers=HDRS, json=payload2, timeout=15)
+        if not r2.ok:
+            warn(f"[MQTT] Step '{r1_step}' erreur {r2.status_code}: {r2.text[:300]}")
+            return
         result = _unwrap(r2.json())
+        log(f"[MQTT] Réponse step 2 : type={result.get('type','?')} step={result.get('step_id','?')}")
 
-    flow_type = result.get("type", "?")
-    if flow_type not in ("create_entry", "abort"):
-        log(f"[MQTT] Réponse brute : {r1.text[:300]}")
-    mark = "✓" if flow_type == "create_entry" else f"? ({flow_type})"
-    log(f"{mark} MQTT configuré")
+    final_type = result.get("type", "?")
+    if final_type == "create_entry":
+        log("✓ MQTT configuré")
+    elif final_type == "abort":
+        reason = result.get("reason", "?")
+        if reason in ("already_configured", "single_instance_allowed"):
+            log("✓ MQTT déjà configuré")
+        else:
+            warn(f"MQTT flow abort : {reason}")
+    else:
+        warn(f"[MQTT] État final inattendu : type={final_type}")
+        log(f"[MQTT] Réponse brute r1: {r1.text[:300]}")
 
 
 def create_automations():
