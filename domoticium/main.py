@@ -109,8 +109,8 @@ def _is_addon_installed(slug: str) -> bool:
         # Seule preuve fiable : installed est une version string non vide
         if isinstance(installed, str) and installed:
             return True
-        # Ou state explicitement "started" / "running" (add-on déjà en cours)
-        return state in ("started", "running")
+        # state != "unknown" = add-on connu du supervisor et installé (peut être stopped/error/started)
+        return state not in ("unknown", None, "")
     except Exception as e:
         warn(f"_is_addon_installed({slug}) erreur: {e}")
         return True
@@ -205,11 +205,11 @@ def install_zigbee2mqtt():
         "options": {"data_path": "/config/zigbee2mqtt"}
     })
 
-    r = sup_post(f"/addons/{Z2M_SLUG}/start")
+    r = sup_post(f"/addons/{Z2M_SLUG}/restart")
     if r.ok:
         log("✓ Zigbee2MQTT démarré")
     else:
-        warn(f"✗ {r.status_code} Zigbee2MQTT start : {r.text[:150]}")
+        warn(f"✗ {r.status_code} Zigbee2MQTT restart : {r.text[:150]}")
 
 
 # ── Matter Server ─────────────────────────────────────────────────────────────
@@ -229,11 +229,11 @@ def install_matter_server():
     else:
         log("Matter Server déjà installé")
 
-    r = sup_post(f"/addons/{MATTER_SLUG}/start")
+    r = sup_post(f"/addons/{MATTER_SLUG}/restart")
     if r.ok:
         log("✓ Matter Server démarré")
     else:
-        warn(f"✗ {r.status_code} Matter Server start : {r.text[:150]}")
+        warn(f"✗ {r.status_code} Matter Server restart : {r.text[:150]}")
 
     flow = ha_post("/config/config_entries/flow", {"handler": "matter"})
     if flow.ok and flow.json().get("type") == "create_entry":
@@ -288,11 +288,11 @@ def install_thread_border_router():
     mark = "✓" if r.ok else f"✗ {r.status_code}"
     log(f"{mark} Configuration Thread Border Router ({device_label})")
 
-    r = sup_post(f"/addons/{THREAD_SLUG}/start")
+    r = sup_post(f"/addons/{THREAD_SLUG}/restart")
     if r.ok:
         log("✓ Thread Border Router démarré")
     else:
-        warn(f"✗ {r.status_code} Thread Border Router start : {r.text[:150]}")
+        warn(f"✗ {r.status_code} Thread Border Router restart : {r.text[:150]}")
 
     time.sleep(3)
     flow = ha_post("/config/config_entries/flow", {"handler": "otbr"})
@@ -411,12 +411,12 @@ def install_frigate():
     _load_cameras()
     write_frigate_config()
 
-    # 5. Démarrer
-    r = sup_post(f"/addons/{FRIGATE_SLUG}/start")
+    # 5. Démarrer (restart fonctionne aussi sur un add-on arrêté ou en erreur)
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
     if r.ok:
         log("✓ Frigate démarré — go2rtc HLS disponible sur :1984")
     else:
-        warn(f"✗ {r.status_code} Frigate start : {r.text[:150]}")
+        warn(f"✗ {r.status_code} Frigate restart : {r.text[:150]}")
 
 
 def write_frigate_config():
