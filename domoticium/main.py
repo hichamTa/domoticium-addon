@@ -27,6 +27,7 @@ COORDINATOR_HOST        = cfg.get("coordinator_host", "").strip()   # vide = mod
 COORDINATOR_ZIGBEE_PORT = cfg.get("coordinator_zigbee_port", 6638)
 COORDINATOR_THREAD_PORT = cfg.get("coordinator_thread_port", 20108)
 ZIGBEE_ADAPTER          = cfg.get("zigbee_adapter", "auto")
+ZIGBEE_ADAPTER_TYPE     = cfg.get("zigbee_adapter_type", "ember")
 INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
 THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
 APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
@@ -176,18 +177,16 @@ def install_zigbee2mqtt():
         log("Zigbee2MQTT déjà installé")
 
     if NETWORK_MODE:
-        zigbee_port    = f"tcp://{COORDINATOR_HOST}:{COORDINATOR_ZIGBEE_PORT}"
-        zigbee_adapter = ZIGBEE_ADAPTER  # "auto" ou type explicite (ember, zstack…)
-        log(f"Mode réseau PoE — coordinateur Zigbee : {zigbee_port} (adapter={zigbee_adapter})")
+        zigbee_port = f"tcp://{COORDINATOR_HOST}:{COORDINATOR_ZIGBEE_PORT}"
+        # Z2M v2 exige 'serial.adapter' pour TCP (ember/zstack/zboss…).
+        # Sans lui, Z2M tente une découverte réseau qui échoue systématiquement.
+        # 'auto' n'est PAS une valeur valide en v2 — le champ zigbee_adapter_type
+        # (défaut 'ember', valide pour les coordinateurs SMLIGHT/EFR32) est utilisé.
+        serial_cfg: dict = {"port": zigbee_port, "adapter": ZIGBEE_ADAPTER_TYPE}
+        log(f"Mode réseau PoE — coordinateur Zigbee : {zigbee_port} (adapter={ZIGBEE_ADAPTER_TYPE})")
     else:
-        zigbee_port    = ZIGBEE_ADAPTER  # "auto" ou port USB explicite
-        zigbee_adapter = None            # USB : Z2M détecte le type tout seul
-
-    serial_cfg: dict = {"port": zigbee_port}
-    if zigbee_adapter:
-        # Z2M v2 exige 'adapter' pour les connexions TCP ; sans lui il tente
-        # une découverte réseau (scan) qui échoue avec "Cannot discover TCP adapters".
-        serial_cfg["adapter"] = zigbee_adapter
+        zigbee_port = ZIGBEE_ADAPTER  # "auto" ou port USB explicite
+        serial_cfg  = {"port": zigbee_port}  # USB : pas besoin de préciser le type
 
     z2m_config = {
         "mqtt": {
