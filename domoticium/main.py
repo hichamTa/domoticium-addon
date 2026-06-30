@@ -262,7 +262,7 @@ def install_thread_border_router():
     if NETWORK_MODE:
         device_label = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
         log(f"Mode réseau PoE — coordinateur Thread : {device_label}")
-        options = {
+        base_options = {
             "device": device_label,
             "baudrate": 460800,
             "flow_control": False,
@@ -275,21 +275,55 @@ def install_thread_border_router():
             if thread_port:
                 log(f"Dongle Thread détecté : {thread_port}")
             else:
-                warn("Aucun dongle Thread détecté — configurer manuellement.")
+                warn("Aucun dongle Thread détecté.")
                 thread_port = "/dev/ttyACM1"
         device_label = thread_port
-        options = {
+        base_options = {
             "device": thread_port,
             "baudrate": 460800,
             "flow_control": True,
             "autoflash_firmware": True,
         }
-    r = sup_post(f"/addons/{THREAD_SLUG}/options", {"options": options})
-    if not r.ok:
-        warn(f"✗ {r.status_code} Configuration Thread Border Router ({device_label}) : {r.text[:200]}")
-        warn(f"Configurer manuellement dans HA : Paramètres → Add-ons → Open Thread Border Router → device = {device_label}")
+
+    # Lire le schéma réel pour n'envoyer que les champs acceptés par cette version
+    schema_keys = None
+    try:
+        info = sup_get(f"/addons/{THREAD_SLUG}/info")
+        if info.ok:
+            data = info.json()
+            if isinstance(data, dict):
+                data = data.get("data", data)
+            schema = data.get("schema", {})
+            if isinstance(schema, dict) and schema:
+                schema_keys = set(schema.keys())
+                log(f"[OTBR] Schéma : {sorted(schema_keys)}")
+    except Exception as e:
+        warn(f"[OTBR] Lecture schéma : {e}")
+
+    # Options filtrées aux champs connus du schéma (évite les 400 pour champ inconnu)
+    if schema_keys:
+        filtered = {k: v for k, v in base_options.items() if k in schema_keys}
+    else:
+        filtered = base_options
+
+    # 3 tentatives : schéma filtré → device seul → options à plat (sans wrapper)
+    attempts = [
+        ("options filtrées", {"options": filtered}),
+        ("device seul",      {"options": {"device": device_label}}),
+        ("sans wrapper",     base_options),
+    ]
+    options_ok = False
+    for label, body in attempts:
+        r = sup_post(f"/addons/{THREAD_SLUG}/options", body)
+        if r.ok:
+            log(f"✓ Configuration Thread Border Router ({device_label}) [{label}]")
+            options_ok = True
+            break
+        warn(f"[OTBR] {label} → {r.status_code}: {r.text[:200]}")
+
+    if not options_ok:
+        warn(f"✗ Impossible de configurer OTBR via Supervisor API — device={device_label}")
         return
-    log(f"✓ Configuration Thread Border Router ({device_label})")
 
     r = sup_post(f"/addons/{THREAD_SLUG}/restart")
     if r.ok:
