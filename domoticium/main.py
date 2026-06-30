@@ -580,7 +580,7 @@ def _mqtt_submit(flow_id, payload, label):
     r = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
                       headers=HDRS, json=payload, timeout=15)
     if not r.ok:
-        warn(f"[MQTT] {label} erreur {r.status_code}: {r.text[:300]}")
+        warn(f"[MQTT] {label} erreur {r.status_code}: {r.text[:400]}")
         return False, {}
     result = _unwrap(r.json())
     log(f"[MQTT] {label} → type={result.get('type','?')} step={result.get('step_id','?')}")
@@ -601,6 +601,47 @@ def _mqtt_is_done(result):
             warn(f"MQTT flow abort : {reason}")
         return True
     return False
+
+
+def _build_mqtt_broker_payload(schema: list) -> dict:
+    """
+    Construit le payload broker à partir des noms de champs réels du data_schema HA.
+    HA peut utiliser 'broker' ou 'host' selon la version. On s'adapte.
+    Si schema vide → confirmation/navigation sans champ → payload {}.
+    """
+    if not schema:
+        return {}
+
+    schema_names = {f.get("name", "") for f in schema}
+    log(f"[MQTT] Champs du schéma : {sorted(schema_names)}")
+    payload = {}
+
+    # Hostname du broker (HA utilise 'broker' historiquement, possiblement 'host' en 2025.x)
+    for k in ("broker", "host", "server", "hostname"):
+        if k in schema_names:
+            payload[k] = EMQX_HOST
+            break
+
+    if "port" in schema_names:
+        payload["port"] = 8883
+
+    for k in ("username", "user"):
+        if k in schema_names:
+            payload[k] = PI_USER
+            break
+
+    for k in ("password", "pass"):
+        if k in schema_names:
+            payload[k] = PI_PASS
+            break
+
+    # Champs TLS présents dans certaines versions
+    if "tls_insecure" in schema_names:
+        payload["tls_insecure"] = False  # EMQX Cloud a un certificat CA public valide
+    if "certificate" in schema_names:
+        payload["certificate"] = "auto"  # utiliser les CAs système
+
+    return payload
 
 
 def configure_mqtt():
@@ -635,8 +676,6 @@ def configure_mqtt():
     if _mqtt_is_done(flow):
         return
 
-    broker_payload = {"broker": EMQX_HOST, "port": 8883, "username": PI_USER, "password": PI_PASS}
-
     # Étape 1 : si le flow démarre par un menu (HA 2024.4+), choisir "broker"
     if flow_type == "menu":
         menu_options = flow.get("menu_options", [])
@@ -648,21 +687,31 @@ def configure_mqtt():
         flow_type = flow.get("type", "?")
         step_id   = flow.get("step_id", "?")
 
-    # Étape 2 : si le flow est sur un step "form", soumettre les credentials
-    if flow_type == "form":
-        ok, result = _mqtt_submit(flow_id, broker_payload, f"credentials (step={step_id})")
-        if not ok or _mqtt_is_done(result):
-            return
-        # Un step supplémentaire éventuel
-        if result.get("type") == "form":
-            next_step = result.get("step_id", "?")
-            ok, result = _mqtt_submit(flow_id, broker_payload, f"retry (step={next_step})")
-            if not ok:
-                return
-            _mqtt_is_done(result)
-        return
+    # Étape 2 : traiter les formulaires broker en boucle (max 5 étapes)
+    for _step_num in range(5):
+        if flow_type != "form":
+            break
 
-    warn(f"[MQTT] Type inattendu : {flow_type} — {flow_resp.text[:200]}")
+        schema = flow.get("data_schema", [])
+        errors = flow.get("errors", {})
+        log(f"[MQTT] Formulaire step={step_id} — schema={json.dumps(schema, ensure_ascii=False)}")
+        if errors:
+            warn(f"[MQTT] Erreurs dans le formulaire : {errors}")
+
+        payload = _build_mqtt_broker_payload(schema)
+        log(f"[MQTT] Payload envoyé : {payload}")
+
+        ok, flow = _mqtt_submit(flow_id, payload, f"form step={step_id}")
+        if not ok or _mqtt_is_done(flow):
+            return
+
+        flow_type = flow.get("type", "?")
+        step_id   = flow.get("step_id", "?")
+
+    if flow_type == "form":
+        warn(f"[MQTT] Boucle de formulaires non résolue — dernier step={step_id}")
+    elif flow_type not in ("create_entry", "abort"):
+        warn(f"[MQTT] Type inattendu : {flow_type}")
 
 
 def create_automations():
