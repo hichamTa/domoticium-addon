@@ -1224,6 +1224,47 @@ def on_local_connect(client, userdata, flags, reason_code, properties):
     log("[local] Connecté Mosquitto — souscrit zigbee2mqtt/# et ha/#")
 
 
+def _handle_ha_command(payload: bytes):
+    """Exécute une commande ha/command reçue via MQTT : crée/supprime un script HA."""
+    try:
+        data = json.loads(payload.decode())
+    except Exception as e:
+        warn(f"[ha/command] JSON invalide : {e}")
+        return
+
+    cmd_type   = data.get("type", "")
+    object_id  = data.get("object_id", "")
+
+    if not object_id:
+        warn(f"[ha/command] object_id manquant : {data}")
+        return
+
+    if cmd_type == "script_upsert":
+        script_cfg = {
+            "alias":    data.get("alias", object_id),
+            "icon":     data.get("icon", "mdi:play"),
+            "sequence": data.get("sequence", []),
+            "mode":     "single",
+        }
+        r = ha_post(f"/api/config/script/config/{object_id}", script_cfg)
+        if r.ok:
+            ha_post("/api/services/script/reload", {})
+            log(f"[ha/command] Script HA créé/mis à jour : {object_id}")
+        else:
+            warn(f"[ha/command] Erreur création script {object_id} : {r.status_code} {r.text[:200]}")
+
+    elif cmd_type == "script_delete":
+        r = requests.delete(f"{API}/config/script/config/{object_id}", headers=HDRS, timeout=10)
+        if r.ok:
+            ha_post("/api/services/script/reload", {})
+            log(f"[ha/command] Script HA supprimé : {object_id}")
+        else:
+            warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
+
+    else:
+        warn(f"[ha/command] Type inconnu : {cmd_type}")
+
+
 def on_local_message(client, userdata, msg):
     """Messages reçus depuis Mosquitto local → relay vers EMQX Cloud."""
     global _z2m_online
@@ -1251,6 +1292,11 @@ def on_local_message(client, userdata, msg):
     # ── Relay Z2M états local → EMQX : zigbee2mqtt/X → {prefix}/zigbee2mqtt/X ─
     if topic.startswith("zigbee2mqtt/"):
         _cloud_client.publish(f"{SITE_PREFIX}/{topic}", payload, qos=1)
+        return
+
+    # ── Commandes ha/command → scripts HA (ne pas relayer vers le cloud) ────────
+    if topic == f"{SITE_PREFIX}/ha/command":
+        threading.Thread(target=_handle_ha_command, args=(payload,), daemon=True).start()
         return
 
     # ── Relay HA état stream local → EMQX : {prefix}/ha/X → {prefix}/ha/X ────
