@@ -1246,9 +1246,10 @@ def _handle_ha_command(payload: bytes):
             "sequence": data.get("sequence", []),
             "mode":     "single",
         }
-        r = ha_post(f"/api/config/script/config/{object_id}", script_cfg)
+        # ha_post préfixe déjà http://supervisor/core/api → pas de /api/ dans le path
+        r = ha_post(f"/config/script/config/{object_id}", script_cfg)
         if r.ok:
-            ha_post("/api/services/script/reload", {})
+            ha_post("/services/script/reload", {})
             log(f"[ha/command] Script HA créé/mis à jour : {object_id}")
         else:
             warn(f"[ha/command] Erreur création script {object_id} : {r.status_code} {r.text[:200]}")
@@ -1256,7 +1257,7 @@ def _handle_ha_command(payload: bytes):
     elif cmd_type == "script_delete":
         r = requests.delete(f"{API}/config/script/config/{object_id}", headers=HDRS, timeout=10)
         if r.ok:
-            ha_post("/api/services/script/reload", {})
+            ha_post("/services/script/reload", {})
             log(f"[ha/command] Script HA supprimé : {object_id}")
         else:
             warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
