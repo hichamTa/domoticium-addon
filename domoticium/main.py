@@ -983,9 +983,9 @@ def handle_matter_commission(client, msg):
     threading.Thread(target=_do, daemon=True).start()
 
 
-def on_connect(client, userdata, flags, rc):
-    if rc != 0:
-        warn(f"Connexion MQTT échouée (rc={rc})")
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code.is_failure:
+        warn(f"Connexion MQTT échouée ({reason_code})")
         return
     topics = [
         (f"{SITE_PREFIX}/cameras/+/configure", 1),
@@ -1011,8 +1011,8 @@ def run_bridge():
     client.tls_set()
     client.on_connect    = on_connect
     client.on_message    = on_message
-    client.on_disconnect = lambda c, u, rc: (
-        warn(f"Déconnexion MQTT (rc={rc}) — reconnexion…") if rc != 0 else None
+    client.on_disconnect = lambda c, u, df, rc, props: (
+        warn(f"Déconnexion MQTT ({rc}) — reconnexion…") if rc.is_failure else None
     )
     while True:
         try:
@@ -1042,7 +1042,8 @@ def _dict_to_yaml(d, indent=0):
         elif v is None:
             lines.append(f"{pad}{k}:")
         else:
-            lines.append(f"{pad}{k}: {v}")
+            escaped = str(v).replace('\\', '\\\\').replace('"', '\\"')
+            lines.append(f'{pad}{k}: "{escaped}"')
     return "\n".join(lines) + "\n"
 
 
