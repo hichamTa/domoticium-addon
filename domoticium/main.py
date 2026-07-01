@@ -828,13 +828,18 @@ def create_automations():
             "alias": "Domoticium — Camera Status Reporter",
             "description": "Notifie l'API quand une caméra change d'état",
             "mode": "parallel", "max": 10,
-            "trigger": [
-                {"platform": "state", "entity_id": "camera.*", "to": "unavailable"},
-                {"platform": "state", "entity_id": "camera.*", "from": "unavailable"},
+            "trigger": [{"platform": "event", "event_type": "state_changed"}],
+            "condition": [
+                {"condition": "template",
+                 "value_template": "{{ trigger.event.data.entity_id.startswith('camera.') }}"},
+                {"condition": "template",
+                 "value_template": "{{ trigger.event.data.old_state is not none and trigger.event.data.new_state is not none }}"},
+                {"condition": "template",
+                 "value_template": "{{ trigger.event.data.old_state.state != trigger.event.data.new_state.state }}"},
             ],
             "action": [{"service": "rest_command.domoticium_camera_status", "data": {
-                "ha_entity_id": "{{ trigger.entity_id }}",
-                "online": "{{ trigger.to_state.state != 'unavailable' }}",
+                "ha_entity_id": "{{ trigger.event.data.entity_id }}",
+                "online": "{{ trigger.event.data.new_state.state != 'unavailable' }}",
             }}],
         },
     ]
