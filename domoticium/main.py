@@ -877,29 +877,33 @@ def write_rest_commands():
     creds = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
     p = SITE_PREFIX
 
+    # Le fichier NE doit PAS contenir la clé "rest_command:" — elle est dans configuration.yaml.
+    # Format correct HA : configuration.yaml → "rest_command: !include domoticium_rest_commands.yaml"
     content = (
-        "rest_command:\n"
-        "  domoticium_camera_status:\n"
-        f'    url: "{APP_URL}/api/webhooks/pi/camera-status"\n'
-        "    method: POST\n"
-        "    headers:\n"
-        '      Content-Type: "application/json"\n'
-        f'      Authorization: "Basic {creds}"\n'
-        "    payload: "
+        "domoticium_camera_status:\n"
+        f'  url: "{APP_URL}/api/webhooks/pi/camera-status"\n'
+        "  method: POST\n"
+        "  headers:\n"
+        '    Content-Type: "application/json"\n'
+        f'    Authorization: "Basic {creds}"\n'
+        "  payload: "
         f"'{{\"siteId\":\"{p}\",\"haEntityId\":\"{{{{ ha_entity_id }}}}\",\"online\":{{{{ online }}}}}}'\n"
-        '    content_type: "application/json"\n'
-        "  domoticium_heartbeat:\n"
-        f'    url: "{APP_URL}/api/webhooks/pi/heartbeat"\n'
-        "    method: POST\n"
-        "    headers:\n"
-        '      Content-Type: "application/json"\n'
-        f'      Authorization: "Basic {creds}"\n'
-        f"    payload: '{{\"siteId\":\"{p}\"}}'\n"
-        '    content_type: "application/json"\n'
+        '  content_type: "application/json"\n'
+        "domoticium_heartbeat:\n"
+        f'  url: "{APP_URL}/api/webhooks/pi/heartbeat"\n'
+        "  method: POST\n"
+        "  headers:\n"
+        '    Content-Type: "application/json"\n'
+        f'    Authorization: "Basic {creds}"\n'
+        f"  payload: '{{\"siteId\":\"{p}\"}}'\n"
+        '  content_type: "application/json"\n'
     )
 
     rest_file = "/homeassistant/domoticium_rest_commands.yaml"
-    include   = "!include domoticium_rest_commands.yaml"
+    # Format correct : clé + include sur la même ligne
+    new_include = "rest_command: !include domoticium_rest_commands.yaml"
+    # Ancienne forme incorrecte (include nu) à migrer si présente
+    old_include = "!include domoticium_rest_commands.yaml"
     main_cfg  = "/homeassistant/configuration.yaml"
 
     with open(rest_file, "w") as f:
@@ -907,9 +911,16 @@ def write_rest_commands():
 
     with open(main_cfg) as f:
         existing = f.read()
-    if include not in existing:
-        with open(main_cfg, "a") as f:
-            f.write(f"\n{include}\n")
+
+    if new_include not in existing:
+        # Remplacer l'ancienne forme bare si présente, sinon ajouter en fin de fichier
+        if old_include in existing:
+            existing = existing.replace(old_include, new_include)
+            with open(main_cfg, "w") as f:
+                f.write(existing)
+        else:
+            with open(main_cfg, "a") as f:
+                f.write(f"\n{new_include}\n")
 
     log("✓ rest_commands configuré")
 
