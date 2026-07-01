@@ -185,7 +185,7 @@ def setup_mosquitto():
     r = sup_post(f"/addons/{MOSQUITTO_SLUG}/options", {
         "options": {
             "logins": [{"username": MOSQUITTO_USER, "password": MOSQUITTO_PASS}],
-            "customize": {"active": False},
+            "customize": {"active": False, "folder": "mosquitto"},
         }
     })
     if r.ok:
