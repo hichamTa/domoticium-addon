@@ -204,13 +204,19 @@ def install_zigbee2mqtt():
 
     z2m_dir = "/homeassistant/zigbee2mqtt"
     os.makedirs(z2m_dir, exist_ok=True)
+    yaml_content = _dict_to_yaml(z2m_config)
     with open(f"{z2m_dir}/configuration.yaml", "w") as f:
-        f.write(_dict_to_yaml(z2m_config))
+        f.write(yaml_content)
+    safe_yaml = yaml_content.replace(PI_PASS, "***")
+    log(f"[diag] Z2M config écrite ({z2m_dir}/configuration.yaml) :\n{safe_yaml}")
+    log(f"[diag] PI_USER={PI_USER!r} len(PI_PASS)={len(PI_PASS)}")
     log("✓ Configuration Zigbee2MQTT écrite")
 
-    sup_post(f"/addons/{Z2M_SLUG}/options", {
+    r = sup_post(f"/addons/{Z2M_SLUG}/options", {
         "options": {"data_path": "/config/zigbee2mqtt"}
     })
+    if not r.ok:
+        warn(f"[diag] Z2M options: {r.status_code} {r.text[:120]}")
 
     r = sup_post(f"/addons/{Z2M_SLUG}/restart")
     if r.ok:
