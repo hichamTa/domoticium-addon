@@ -196,7 +196,12 @@ def install_zigbee2mqtt():
             "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
         },
         "serial": serial_cfg,
-        "homeassistant": False,
+        # Discovery MQTT préfixé par site_prefix pour l'isolation multi-tenant.
+        # Le pi user EMQX n'a accès qu'à {site_prefix}/# ; homeassistant/# serait refusé.
+        "homeassistant": {
+            "discovery_topic": f"{SITE_PREFIX}/homeassistant",
+            "status_topic": f"{SITE_PREFIX}/homeassistant/status",
+        },
         "permit_join": False,
         "advanced": {"log_level": "info", "network_key": "GENERATE"},
         "frontend": {"port": 8099},
@@ -840,6 +845,25 @@ def create_automations():
     ha_post("/services/automation/reload")
 
 
+def configure_mqtt_discovery_prefix():
+    """Écrit le discovery_prefix MQTT dans configuration.yaml de HA.
+    Nécessaire pour que HA écoute les messages Z2M sur {site_prefix}/homeassistant/#
+    au lieu du préfixe par défaut 'homeassistant/'.
+    """
+    main_cfg = "/homeassistant/configuration.yaml"
+    marker   = f"# domoticium-mqtt-discovery"
+    line     = f"{marker}\nmqtt:\n  discovery_prefix: \"{SITE_PREFIX}/homeassistant\"\n"
+
+    with open(main_cfg) as f:
+        existing = f.read()
+    if marker not in existing:
+        with open(main_cfg, "a") as f:
+            f.write(f"\n{line}")
+        log(f"✓ MQTT discovery_prefix configuré ({SITE_PREFIX}/homeassistant)")
+    else:
+        log("✓ MQTT discovery_prefix déjà configuré")
+
+
 def write_rest_commands():
     log("── rest_commands ─────────────────────────────")
     creds = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
@@ -882,6 +906,7 @@ def run_setup():
     configure_mqtt()
 
     install_zigbee2mqtt()
+    configure_mqtt_discovery_prefix()
 
     # À valider après Zigbee2MQTT
     # install_matter_server()
