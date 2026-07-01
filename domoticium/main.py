@@ -1006,7 +1006,7 @@ def on_message(client, userdata, msg):
 def run_bridge():
     _load_cameras()
     start_cloudflared()
-    client = mqtt.Client(client_id="domoticium-addon", clean_session=True)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-addon", clean_session=True)
     client.username_pw_set(PI_USER, PI_PASS)
     client.tls_set()
     client.on_connect    = on_connect
