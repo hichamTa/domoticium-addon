@@ -813,12 +813,15 @@ def create_automations():
         {
             "id": "domoticium_heartbeat",
             "alias": "Domoticium — Heartbeat",
-            "description": "Publie un heartbeat toutes les 30 secondes",
+            "description": "Publie un heartbeat toutes les 30 secondes (MQTT + API)",
             "mode": "single",
             "trigger": [{"platform": "time_pattern", "seconds": "/30"}],
-            "action": [{"service": "mqtt.publish", "data": {
-                "topic": f"{p}/ha/heartbeat", "payload": "1", "retain": False,
-            }}],
+            "action": [
+                {"service": "mqtt.publish", "data": {
+                    "topic": f"{p}/ha/heartbeat", "payload": "1", "retain": False,
+                }},
+                {"service": "rest_command.domoticium_heartbeat"},
+            ],
         },
         {
             "id": "domoticium_camera_status",
@@ -879,6 +882,14 @@ def write_rest_commands():
         f'      Authorization: "Basic {creds}"\n'
         "    payload: "
         f"'{{\"siteId\":\"{p}\",\"haEntityId\":\"{{{{ ha_entity_id }}}}\",\"online\":{{{{ online }}}}}}'\n"
+        '    content_type: "application/json"\n'
+        "  domoticium_heartbeat:\n"
+        f'    url: "{APP_URL}/api/webhooks/pi/heartbeat"\n'
+        "    method: POST\n"
+        "    headers:\n"
+        '      Content-Type: "application/json"\n'
+        f'      Authorization: "Basic {creds}"\n'
+        f"    payload: '{{\"siteId\":\"{p}\"}}'\n"
         '    content_type: "application/json"\n'
     )
 
