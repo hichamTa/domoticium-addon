@@ -1104,9 +1104,18 @@ def on_message(client, userdata, msg):
         handle_matter_commission(client, msg)
 
 
+def _heartbeat_loop():
+    """Envoie un heartbeat au webhook toutes les 30 secondes directement depuis le add-on."""
+    time.sleep(10)  # premier appel rapide au démarrage
+    while True:
+        call_heartbeat_api()
+        time.sleep(30)
+
+
 def run_bridge():
     _load_cameras()
     start_cloudflared()
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-addon", clean_session=True)
     client.username_pw_set(PI_USER, PI_PASS)
     client.tls_set()
