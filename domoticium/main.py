@@ -1264,6 +1264,28 @@ def _handle_ha_command(payload: bytes):
         else:
             warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
 
+    elif cmd_type == "automation_upsert":
+        auto_cfg = {
+            "alias":   data.get("alias", object_id),
+            "trigger": data.get("trigger", []),
+            "action":  data.get("action", []),
+            "mode":    "single",
+        }
+        r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
+        if r.ok:
+            ha_post("/services/automation/reload", {})
+            log(f"[ha/command] Automation HA créée/mise à jour : {object_id}")
+        else:
+            warn(f"[ha/command] Erreur création automation {object_id} : {r.status_code} {r.text[:200]}")
+
+    elif cmd_type == "automation_delete":
+        r = requests.delete(f"{API}/config/automation/config/{object_id}", headers=HDRS, timeout=10)
+        if r.ok:
+            ha_post("/services/automation/reload", {})
+            log(f"[ha/command] Automation HA supprimée : {object_id}")
+        else:
+            warn(f"[ha/command] Erreur suppression automation {object_id} : {r.status_code} {r.text[:200]}")
+
     else:
         warn(f"[ha/command] Type inconnu : {cmd_type}")
 
