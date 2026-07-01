@@ -913,8 +913,8 @@ def run_setup():
     # if INSTALL_THREAD_ROUTER:
     #     install_thread_border_router()
     # install_frigate()
-    # create_automations()
-    # write_rest_commands()
+    create_automations()
+    write_rest_commands()
 
     ha_post("/services/homeassistant/reload_all")
     with open(SETUP_DONE, "w") as f:
