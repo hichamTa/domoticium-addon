@@ -1204,10 +1204,12 @@ def on_message(client, userdata, msg):
 
 
 def _heartbeat_loop():
-    """Envoie un heartbeat au webhook toutes les 30 secondes directement depuis le add-on."""
+    """Envoie un heartbeat toutes les 30 secondes : webhook API + MQTT cloud (→ haOnline navigateur)."""
     time.sleep(10)  # premier appel rapide au démarrage
     while True:
         call_heartbeat_api()
+        if _cloud_client:
+            _cloud_client.publish(f"{SITE_PREFIX}/ha/heartbeat", "1", qos=1)
         time.sleep(30)
 
 
