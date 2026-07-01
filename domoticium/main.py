@@ -1065,13 +1065,19 @@ def handle_matter_commission(client, msg):
     threading.Thread(target=_do, daemon=True).start()
 
 
+_z2m_online: bool | None = None  # état Z2M courant, None = inconnu
+
+
 def call_heartbeat_api():
-    """Reçu heartbeat MQTT de HA → met à jour last_heartbeat_at en DB via webhook."""
+    """Envoie le heartbeat (+ état Z2M courant) au webhook API."""
     creds = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
+    payload: dict = {"siteId": SITE_PREFIX}
+    if _z2m_online is not None:
+        payload["z2mOnline"] = _z2m_online
     try:
         r = requests.post(
             f"{APP_URL}/api/webhooks/pi/heartbeat",
-            json={"siteId": SITE_PREFIX},
+            json=payload,
             headers={"Authorization": f"Basic {creds}", "Content-Type": "application/json"},
             timeout=10,
         )
@@ -1089,14 +1095,24 @@ def on_connect(client, userdata, flags, reason_code, properties):
         (f"{SITE_PREFIX}/cameras/+/configure", 1),
         (f"{SITE_PREFIX}/matter/commission/start", 1),
         (f"{SITE_PREFIX}/ha/heartbeat", 1),
+        (f"{SITE_PREFIX}/zigbee2mqtt/bridge/state", 1),
     ]
     client.subscribe(topics)
-    log(f"Service actif — souscrit à {SITE_PREFIX}/cameras/#, /matter/#, /ha/heartbeat")
+    log(f"Service actif — souscrit à {SITE_PREFIX}/cameras/#, /matter/#, /ha/heartbeat, /z2m/bridge/state")
 
 
 def on_message(client, userdata, msg):
+    global _z2m_online
     parts = msg.topic.split("/")
     if len(parts) >= 3 and parts[1] == "ha" and parts[2] == "heartbeat":
+        threading.Thread(target=call_heartbeat_api, daemon=True).start()
+    elif len(parts) >= 3 and parts[1] == "zigbee2mqtt" and parts[2] == "bridge" and len(parts) >= 4 and parts[3] == "state":
+        try:
+            payload = json.loads(msg.payload.decode())
+            online = payload.get("state") == "online"
+        except Exception:
+            online = msg.payload.decode().strip() == "online"
+        _z2m_online = online
         threading.Thread(target=call_heartbeat_api, daemon=True).start()
     elif len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
         handle_camera_configure(client, msg)
