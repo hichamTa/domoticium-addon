@@ -11,7 +11,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, json, os, subprocess, sys, threading, time
+import base64, json, os, secrets, subprocess, sys, threading, time
 import paho.mqtt.client as mqtt
 import requests
 
@@ -45,14 +45,30 @@ HDRS = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "applicat
 SETUP_DONE   = "/data/.setup_done"
 CAMERAS_FILE = "/data/cameras.json"
 
-Z2M_REPO     = "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt"
-Z2M_SLUG     = "45df7312_zigbee2mqtt"
-MATTER_SLUG  = "core_matter_server"
-THREAD_SLUG  = "core_openthread_border_router"
-FRIGATE_REPO = "https://github.com/blakeblackshear/frigate-hass-addons"
-FRIGATE_SLUG = "ccab4aaf_frigate"
+Z2M_REPO       = "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt"
+Z2M_SLUG       = "45df7312_zigbee2mqtt"
+MATTER_SLUG    = "core_matter_server"
+THREAD_SLUG    = "core_openthread_border_router"
+FRIGATE_REPO   = "https://github.com/blakeblackshear/frigate-hass-addons"
+FRIGATE_SLUG   = "ccab4aaf_frigate"
+MOSQUITTO_SLUG = "core_mosquitto"
+MOSQUITTO_USER = "domoticium"
+
+# ── Mot de passe Mosquitto — généré une fois, persisté dans /data/ ─────────────
+_MOSQUITTO_PASS_FILE = "/data/mosquitto_pass"
+if os.path.exists(_MOSQUITTO_PASS_FILE):
+    with open(_MOSQUITTO_PASS_FILE) as _f:
+        MOSQUITTO_PASS = _f.read().strip()
+else:
+    MOSQUITTO_PASS = secrets.token_hex(16)
+    with open(_MOSQUITTO_PASS_FILE, "w") as _f:
+        _f.write(MOSQUITTO_PASS)
 
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
+
+# Références aux deux clients MQTT (cloud EMQX + local Mosquitto)
+_cloud_client: mqtt.Client | None = None
+_local_client: mqtt.Client | None = None
 
 
 def log(msg):  print(f"[domoticium] {msg}", flush=True)
@@ -148,6 +164,43 @@ def wait_for_ha():
     sys.exit(1)
 
 
+# ── Mosquitto ─────────────────────────────────────────────────────────────────
+
+def setup_mosquitto():
+    """Installe Mosquitto (si absent) et crée le user dédié Domoticium."""
+    log("── Mosquitto ────────────────────────────────")
+
+    if not _is_addon_installed(MOSQUITTO_SLUG):
+        log("Installation de Mosquitto…")
+        r = sup_post(f"/store/addons/{MOSQUITTO_SLUG}/install")
+        if r.ok:
+            log("✓ Mosquitto installé")
+            time.sleep(5)
+        else:
+            warn(f"✗ Installation Mosquitto : {r.status_code} {r.text[:100]}")
+            return
+    else:
+        log("Mosquitto déjà installé")
+
+    r = sup_post(f"/addons/{MOSQUITTO_SLUG}/options", {
+        "options": {
+            "logins": [{"username": MOSQUITTO_USER, "password": MOSQUITTO_PASS}],
+            "customize": {"active": False},
+        }
+    })
+    if r.ok:
+        log(f"✓ Mosquitto configuré (user: {MOSQUITTO_USER})")
+    else:
+        warn(f"✗ Mosquitto options : {r.status_code} {r.text[:150]}")
+
+    r = sup_post(f"/addons/{MOSQUITTO_SLUG}/restart")
+    if r.ok:
+        log("✓ Mosquitto redémarré")
+        time.sleep(4)  # laisser le broker démarrer avant que Z2M s'y connecte
+    else:
+        warn(f"✗ Mosquitto restart : {r.status_code} {r.text[:100]}")
+
+
 # ── Zigbee2MQTT ───────────────────────────────────────────────────────────────
 
 def install_zigbee2mqtt():
@@ -190,17 +243,18 @@ def install_zigbee2mqtt():
 
     z2m_config = {
         "mqtt": {
-            "server": f"mqtts://{EMQX_HOST}:8883",
-            "username": PI_USER,  # Z2M v2 : 'username' (ex 'user' en v1)
-            "password": PI_PASS,
-            "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
+            # Z2M → Mosquitto local (offline-first).
+            # Notre add-on relaie ensuite vers EMQX Cloud en phase 2.
+            "server": "mqtt://core-mosquitto:1883",
+            "username": MOSQUITTO_USER,
+            "password": MOSQUITTO_PASS,
+            "base_topic": "zigbee2mqtt",  # topic standard (sans préfixe site)
         },
         "serial": serial_cfg,
-        # Discovery MQTT préfixé par site_prefix pour l'isolation multi-tenant.
-        # Le pi user EMQX n'a accès qu'à {site_prefix}/# ; homeassistant/# serait refusé.
+        # Discovery standard homeassistant/ — HA MQTT integration écoute ce préfixe.
         "homeassistant": {
-            "discovery_topic": f"{SITE_PREFIX}/homeassistant",
-            "status_topic": f"{SITE_PREFIX}/homeassistant/status",
+            "discovery_topic": "homeassistant",
+            "status_topic":    "homeassistant/status",
         },
         "permit_join": False,
         "advanced": {"log_level": "info", "network_key": "GENERATE"},
@@ -229,17 +283,15 @@ def install_zigbee2mqtt():
                 "log": False,
             },
             "mqtt": {
-                "server": f"mqtts://{EMQX_HOST}:8883",
-                "user": PI_USER,
-                "password": PI_PASS,
-                "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
+                "server": "mqtt://core-mosquitto:1883",
+                "user": MOSQUITTO_USER,
+                "password": MOSQUITTO_PASS,
+                "base_topic": "zigbee2mqtt",
             },
             "serial": serial_opts,
-            # L'user EMQX pi_{prefix} n'a accès qu'à {site_prefix}/#.
-            # HA discovery s'abonne à homeassistant/# → refusé par EMQX ACL.
-            # On désactive ici pour éviter l'erreur ; les états remontent via EMQX
-            # directement vers l'app web sans passer par les entités HA.
-            "homeassistant": False,
+            # homeassistant: True → Z2M publie la discovery sur homeassistant/
+            # HA MQTT integration (sur Mosquitto local) détecte les entités Zigbee.
+            "homeassistant": True,
         }
     })
     if r.ok:
@@ -645,10 +697,11 @@ def _mqtt_is_done(result):
     return False
 
 
-def _build_mqtt_broker_payload(schema: list) -> dict:
+def _build_mqtt_broker_payload(schema: list, local: bool = False) -> dict:
     """
     Construit le payload pour chaque étape du flow MQTT HA en lisant le data_schema.
-    Gère le step broker (credentials) et les steps TLS/options avancées.
+    local=True  → Mosquitto local (core-mosquitto:1883, pas de TLS)
+    local=False → EMQX Cloud (port 8883, TLS obligatoire)
     Si schema vide → étape de confirmation sans champ → payload {}.
     """
     if not schema:
@@ -659,48 +712,47 @@ def _build_mqtt_broker_payload(schema: list) -> dict:
     payload = {}
 
     # ── Credentials broker ────────────────────────────────────────────────────
-    # HA utilise 'broker' (CONF_BROKER) depuis toujours ; 'host' dans certaines versions.
     for k in ("broker", "host", "server", "hostname"):
         if k in schema_names:
-            payload[k] = EMQX_HOST
+            payload[k] = "core-mosquitto" if local else EMQX_HOST
             break
 
     if "port" in schema_names:
-        payload["port"] = 8883
+        payload["port"] = 1883 if local else 8883
 
     for k in ("username", "user"):
         if k in schema_names:
-            payload[k] = PI_USER
+            payload[k] = MOSQUITTO_USER if local else PI_USER
             break
 
     for k in ("password", "pass"):
         if k in schema_names:
-            payload[k] = PI_PASS
+            payload[k] = MOSQUITTO_PASS if local else PI_PASS
             break
 
-    # ── TLS via options avancées ──────────────────────────────────────────────
+    if local:
+        # Mosquitto local — pas de TLS, pas d'options avancées
+        return payload
+
+    # ── TLS EMQX Cloud (local=False) ─────────────────────────────────────────
     # EMQX Cloud Serverless n'expose que le port 8883 (TLS obligatoire).
     # Sans advanced_options=True, HA tente une connexion TCP plain → cannot_connect.
-    # Avec advanced_options=True, HA ouvre le formulaire TLS (certificate, tls_insecure…).
     if "advanced_options" in schema_names:
         payload["advanced_options"] = True
 
-    # Step TLS/avancé (affiché après advanced_options=True)
-    # Le nom du champ qui active la vérification CA a changé selon les versions HA :
-    # 'certificate' (anciennes versions) ou 'set_ca_cert' (HA 2025.x, confirmé par logs).
-    # Sans ce champ = "off" par défaut → HA tente une connexion SANS TLS même sur port 8883.
+    # Le nom du champ CA a changé selon les versions HA :
+    # 'certificate' (anciennes) ou 'set_ca_cert' (HA 2025.x).
     for k in ("certificate", "set_ca_cert"):
         if k in schema_names:
-            # "auto" = utiliser les CAs système (EMQX Cloud a un certificat Let's Encrypt valide)
-            payload[k] = "auto"
+            payload[k] = "auto"  # CAs système — EMQX a un cert Let's Encrypt valide
     if "tls_insecure" in schema_names:
-        payload["tls_insecure"] = False  # vérification stricte du certificat
+        payload["tls_insecure"] = False
 
     return payload
 
 
 def configure_mqtt():
-    log("── MQTT ─────────────────────────────────────")
+    log("── MQTT (Mosquitto local) ───────────────────")
 
     # Vérifier si MQTT est déjà actif
     svc_resp = requests.get(f"{API}/services", headers=HDRS, timeout=10)
@@ -712,7 +764,7 @@ def configure_mqtt():
         except Exception:
             pass
 
-    log(f"Configuration MQTT → {EMQX_HOST}:8883…")
+    log("Configuration MQTT → core-mosquitto:1883…")
     flow_resp = ha_post("/config/config_entries/flow", {"handler": "mqtt"})
     if not flow_resp.ok:
         warn(f"Flow MQTT impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
@@ -753,7 +805,7 @@ def configure_mqtt():
         if errors:
             warn(f"[MQTT] Erreurs dans le formulaire : {errors}")
 
-        payload = _build_mqtt_broker_payload(schema)
+        payload = _build_mqtt_broker_payload(schema, local=True)
         log(f"[MQTT] Payload envoyé : {payload}")
 
         ok, flow = _mqtt_submit(flow_id, payload, f"form step={step_id}")
@@ -853,23 +905,34 @@ def create_automations():
     ha_post("/services/automation/reload")
 
 
-def configure_mqtt_discovery_prefix():
-    """Écrit le discovery_prefix MQTT dans configuration.yaml de HA.
-    Nécessaire pour que HA écoute les messages Z2M sur {site_prefix}/homeassistant/#
-    au lieu du préfixe par défaut 'homeassistant/'.
+def remove_legacy_mqtt_discovery_prefix():
+    """Supprime l'ancien bloc custom discovery_prefix si présent (écrit par les versions < 1.6.0).
+    Z2M utilise maintenant le préfixe standard 'homeassistant' — pas besoin de surcharge.
     """
     main_cfg = "/homeassistant/configuration.yaml"
-    marker   = f"# domoticium-mqtt-discovery"
-    line     = f"{marker}\nmqtt:\n  discovery_prefix: \"{SITE_PREFIX}/homeassistant\"\n"
-
-    with open(main_cfg) as f:
-        existing = f.read()
-    if marker not in existing:
-        with open(main_cfg, "a") as f:
-            f.write(f"\n{line}")
-        log(f"✓ MQTT discovery_prefix configuré ({SITE_PREFIX}/homeassistant)")
-    else:
-        log("✓ MQTT discovery_prefix déjà configuré")
+    marker   = "# domoticium-mqtt-discovery"
+    try:
+        with open(main_cfg) as f:
+            content = f.read()
+        if marker not in content:
+            return
+        # Supprimer le bloc de 3 lignes : commentaire + clé mqtt + discovery_prefix
+        lines = content.splitlines(keepends=True)
+        cleaned = []
+        skip_next = 0
+        for line in lines:
+            if skip_next > 0:
+                skip_next -= 1
+                continue
+            if marker in line:
+                skip_next = 2  # sauter "mqtt:" et "  discovery_prefix: ..."
+                continue
+            cleaned.append(line)
+        with open(main_cfg, "w") as f:
+            f.writelines(cleaned)
+        log("✓ Ancien discovery_prefix non-standard supprimé de configuration.yaml")
+    except Exception as e:
+        warn(f"remove_legacy_mqtt_discovery_prefix: {e}")
 
 
 def write_rest_commands():
@@ -929,11 +992,17 @@ def run_setup():
     wait_for_ha()
     log("═══ Début de la configuration Domoticium ═══")
 
-    # ── MQTT uniquement le temps de valider la connexion ─────────────────────
+    # 1. Mosquitto local d'abord — Z2M et HA MQTT integration en dépendent
+    setup_mosquitto()
+
+    # 2. HA MQTT integration → Mosquitto local
     configure_mqtt()
 
+    # 3. Z2M → Mosquitto local
     install_zigbee2mqtt()
-    configure_mqtt_discovery_prefix()
+
+    # 4. Supprimer l'ancien discovery_prefix non-standard (migration v1.5 → v1.6)
+    remove_legacy_mqtt_discovery_prefix()
 
     # À valider après Zigbee2MQTT
     # install_matter_server()
@@ -1089,32 +1158,42 @@ def call_heartbeat_api():
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code.is_failure:
-        warn(f"Connexion MQTT échouée ({reason_code})")
+        warn(f"[cloud] Connexion EMQX échouée ({reason_code})")
         return
+    p = SITE_PREFIX
     topics = [
-        (f"{SITE_PREFIX}/cameras/+/configure", 1),
-        (f"{SITE_PREFIX}/matter/commission/start", 1),
-        (f"{SITE_PREFIX}/ha/heartbeat", 1),
-        (f"{SITE_PREFIX}/zigbee2mqtt/bridge/state", 1),
+        (f"{p}/cameras/+/configure", 1),        # commande ajout/suppression caméra
+        (f"{p}/matter/commission/start", 1),    # jumelage Matter
+        (f"{p}/zigbee2mqtt/+/set", 1),          # commandes Z2M cloud→local
+        (f"{p}/ha/command", 1),                 # service HA cloud→local
     ]
     client.subscribe(topics)
-    log(f"Service actif — souscrit à {SITE_PREFIX}/cameras/#, /matter/#, /ha/heartbeat, /z2m/bridge/state")
+    log(f"[cloud] Connecté EMQX — souscrit à {p}/cameras/+/configure, /matter/+, /zigbee2mqtt/+/set, /ha/command")
 
 
 def on_message(client, userdata, msg):
-    global _z2m_online
+    """Messages reçus depuis EMQX Cloud (commandes venant de l'app web)."""
     parts = msg.topic.split("/")
-    if len(parts) >= 3 and parts[1] == "ha" and parts[2] == "heartbeat":
-        threading.Thread(target=call_heartbeat_api, daemon=True).start()
-    elif len(parts) >= 3 and parts[1] == "zigbee2mqtt" and parts[2] == "bridge" and len(parts) >= 4 and parts[3] == "state":
-        try:
-            payload = json.loads(msg.payload.decode())
-            online = payload.get("state") == "online"
-        except Exception:
-            online = msg.payload.decode().strip() == "online"
-        _z2m_online = online
-        threading.Thread(target=call_heartbeat_api, daemon=True).start()
-    elif len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
+    if len(parts) < 2:
+        return
+
+    # ── Relay commandes Z2M cloud → local Mosquitto ──────────────────────────
+    # {prefix}/zigbee2mqtt/{device}/set → zigbee2mqtt/{device}/set
+    if parts[1] == "zigbee2mqtt" and parts[-1] in ("set", "get"):
+        local_topic = "/".join(parts[1:])  # retire le prefix site
+        if _local_client:
+            _local_client.publish(local_topic, msg.payload, qos=1)
+        return
+
+    # ── Relay commandes HA cloud → local Mosquitto ────────────────────────────
+    # {prefix}/ha/command → {prefix}/ha/command (même topic, broker différent)
+    if len(parts) >= 3 and parts[1] == "ha" and parts[2] == "command":
+        if _local_client:
+            _local_client.publish(msg.topic, msg.payload, qos=1)
+        return
+
+    # ── Autres commandes locales ──────────────────────────────────────────────
+    if len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
         handle_camera_configure(client, msg)
     elif len(parts) >= 4 and parts[1] == "matter" and parts[2] == "commission" and parts[3] == "start":
         handle_matter_commission(client, msg)
@@ -1128,24 +1207,98 @@ def _heartbeat_loop():
         time.sleep(30)
 
 
-def run_bridge():
-    _load_cameras()
-    start_cloudflared()
-    threading.Thread(target=_heartbeat_loop, daemon=True).start()
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-addon", clean_session=True)
-    client.username_pw_set(PI_USER, PI_PASS)
-    client.tls_set()
-    client.on_connect    = on_connect
-    client.on_message    = on_message
-    client.on_disconnect = lambda c, u, df, rc, props: (
-        warn(f"Déconnexion MQTT ({rc}) — reconnexion…") if rc.is_failure else None
+def on_local_connect(client, userdata, flags, reason_code, properties):
+    if reason_code.is_failure:
+        warn(f"[local] Connexion Mosquitto échouée ({reason_code})")
+        return
+    p = SITE_PREFIX
+    topics = [
+        ("zigbee2mqtt/#", 1),       # tous les messages Z2M (états + bridge/state)
+        (f"{p}/ha/#", 1),           # état stream HA (publié par automation State Stream)
+    ]
+    client.subscribe(topics)
+    log("[local] Connecté Mosquitto — souscrit zigbee2mqtt/# et ha/#")
+
+
+def on_local_message(client, userdata, msg):
+    """Messages reçus depuis Mosquitto local → relay vers EMQX Cloud."""
+    global _z2m_online
+    topic   = msg.topic
+    payload = msg.payload
+
+    # ── Z2M bridge/state → mise à jour statut Z2M ────────────────────────────
+    if topic == "zigbee2mqtt/bridge/state":
+        try:
+            data   = json.loads(payload.decode())
+            online = data.get("state") == "online"
+        except Exception:
+            online = payload.decode().strip() == "online"
+        _z2m_online = online
+        threading.Thread(target=call_heartbeat_api, daemon=True).start()
+        return  # pas besoin de relayer bridge/state vers le cloud
+
+    # ── Pas de relay des commandes /set et /get (sens inverse) ───────────────
+    if topic.endswith("/set") or topic.endswith("/get"):
+        return
+
+    if not _cloud_client:
+        return
+
+    # ── Relay Z2M états local → EMQX : zigbee2mqtt/X → {prefix}/zigbee2mqtt/X ─
+    if topic.startswith("zigbee2mqtt/"):
+        _cloud_client.publish(f"{SITE_PREFIX}/{topic}", payload, qos=1)
+        return
+
+    # ── Relay HA état stream local → EMQX : {prefix}/ha/X → {prefix}/ha/X ────
+    if topic.startswith(f"{SITE_PREFIX}/ha/"):
+        _cloud_client.publish(topic, payload, qos=1)
+        return
+
+
+def run_local_bridge():
+    """Thread permanent : connexion à Mosquitto local + relay vers EMQX Cloud."""
+    global _local_client
+    _local_client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        client_id="domoticium-local-bridge",
+        clean_session=True,
+    )
+    _local_client.username_pw_set(MOSQUITTO_USER, MOSQUITTO_PASS)
+    _local_client.on_connect    = on_local_connect
+    _local_client.on_message    = on_local_message
+    _local_client.on_disconnect = lambda c, u, df, rc, props: (
+        warn(f"[local] Déconnexion Mosquitto ({rc}) — reconnexion…") if rc.is_failure else None
     )
     while True:
         try:
-            client.connect(EMQX_HOST, 8883, keepalive=60)
-            client.loop_forever()
+            _local_client.connect("core-mosquitto", 1883, keepalive=60)
+            _local_client.loop_forever()
         except Exception as e:
-            warn(f"MQTT : {e} — retry dans 10s")
+            warn(f"[local] Mosquitto : {e} — retry dans 10s")
+            time.sleep(10)
+
+
+def run_bridge():
+    global _cloud_client
+    _load_cameras()
+    start_cloudflared()
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    threading.Thread(target=run_local_bridge, daemon=True).start()
+
+    _cloud_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-cloud-bridge", clean_session=True)
+    _cloud_client.username_pw_set(PI_USER, PI_PASS)
+    _cloud_client.tls_set()
+    _cloud_client.on_connect    = on_connect
+    _cloud_client.on_message    = on_message
+    _cloud_client.on_disconnect = lambda c, u, df, rc, props: (
+        warn(f"[cloud] Déconnexion EMQX ({rc}) — reconnexion…") if rc.is_failure else None
+    )
+    while True:
+        try:
+            _cloud_client.connect(EMQX_HOST, 8883, keepalive=60)
+            _cloud_client.loop_forever()
+        except Exception as e:
+            warn(f"[cloud] EMQX : {e} — retry dans 10s")
             time.sleep(10)
 
 
