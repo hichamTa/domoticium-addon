@@ -230,6 +230,11 @@ def install_zigbee2mqtt():
                 "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
             },
             "serial": serial_opts,
+            # L'user EMQX pi_{prefix} n'a accès qu'à {site_prefix}/#.
+            # HA discovery s'abonne à homeassistant/# → refusé par EMQX ACL.
+            # On désactive ici pour éviter l'erreur ; les états remontent via EMQX
+            # directement vers l'app web sans passer par les entités HA.
+            "homeassistant": False,
         }
     })
     if r.ok:
