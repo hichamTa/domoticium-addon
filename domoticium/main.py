@@ -1065,6 +1065,22 @@ def handle_matter_commission(client, msg):
     threading.Thread(target=_do, daemon=True).start()
 
 
+def call_heartbeat_api():
+    """Reçu heartbeat MQTT de HA → met à jour last_heartbeat_at en DB via webhook."""
+    creds = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
+    try:
+        r = requests.post(
+            f"{APP_URL}/api/webhooks/pi/heartbeat",
+            json={"siteId": SITE_PREFIX},
+            headers={"Authorization": f"Basic {creds}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            warn(f"Heartbeat API {r.status_code}: {r.text[:120]}")
+    except Exception as e:
+        warn(f"Heartbeat API: {e}")
+
+
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code.is_failure:
         warn(f"Connexion MQTT échouée ({reason_code})")
@@ -1072,14 +1088,17 @@ def on_connect(client, userdata, flags, reason_code, properties):
     topics = [
         (f"{SITE_PREFIX}/cameras/+/configure", 1),
         (f"{SITE_PREFIX}/matter/commission/start", 1),
+        (f"{SITE_PREFIX}/ha/heartbeat", 1),
     ]
     client.subscribe(topics)
-    log(f"Service actif — souscrit à {SITE_PREFIX}/cameras/#, /matter/#")
+    log(f"Service actif — souscrit à {SITE_PREFIX}/cameras/#, /matter/#, /ha/heartbeat")
 
 
 def on_message(client, userdata, msg):
     parts = msg.topic.split("/")
-    if len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
+    if len(parts) >= 3 and parts[1] == "ha" and parts[2] == "heartbeat":
+        threading.Thread(target=call_heartbeat_api, daemon=True).start()
+    elif len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
         handle_camera_configure(client, msg)
     elif len(parts) >= 4 and parts[1] == "matter" and parts[2] == "commission" and parts[3] == "start":
         handle_matter_commission(client, msg)
