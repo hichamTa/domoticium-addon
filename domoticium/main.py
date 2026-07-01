@@ -182,9 +182,13 @@ def setup_mosquitto():
     else:
         log("Mosquitto déjà installé")
 
+    # Le schéma Mosquitto exige tous les champs, même ceux avec des valeurs par défaut.
     r = sup_post(f"/addons/{MOSQUITTO_SLUG}/options", {
         "options": {
             "logins": [{"username": MOSQUITTO_USER, "password": MOSQUITTO_PASS}],
+            "require_certificate": False,
+            "certfile": "fullchain.pem",
+            "keyfile": "privkey.pem",
             "customize": {"active": False, "folder": "mosquitto"},
         }
     })
@@ -1271,7 +1275,9 @@ def run_local_bridge():
     )
     while True:
         try:
-            _local_client.connect("core-mosquitto", 1883, keepalive=60)
+            # host_network: true → namespace réseau hôte, "core-mosquitto" non résolvable.
+            # Mosquitto mappe son port 1883 sur l'hôte → 127.0.0.1 est accessible.
+            _local_client.connect("127.0.0.1", 1883, keepalive=60)
             _local_client.loop_forever()
         except Exception as e:
             warn(f"[local] Mosquitto : {e} — retry dans 10s")
