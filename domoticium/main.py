@@ -204,19 +204,38 @@ def install_zigbee2mqtt():
 
     z2m_dir = "/homeassistant/zigbee2mqtt"
     os.makedirs(z2m_dir, exist_ok=True)
-    yaml_content = _dict_to_yaml(z2m_config)
     with open(f"{z2m_dir}/configuration.yaml", "w") as f:
-        f.write(yaml_content)
-    safe_yaml = yaml_content.replace(PI_PASS, "***")
-    log(f"[diag] Z2M config écrite ({z2m_dir}/configuration.yaml) :\n{safe_yaml}")
-    log(f"[diag] PI_USER={PI_USER!r} len(PI_PASS)={len(PI_PASS)}")
+        f.write(_dict_to_yaml(z2m_config))
     log("✓ Configuration Zigbee2MQTT écrite")
 
+    # Les options du Z2M add-on ont PRIORITÉ sur configuration.yaml (cf. DOCS Z2M).
+    # Le startup script écrase les champs MQTT avec les valeurs des options —
+    # il faut donc passer les credentials ici, pas seulement dans le YAML.
+    # Note : le schéma add-on utilise 'user' (pas 'username') pour le champ MQTT.
+    serial_opts: dict = {"port": zigbee_port, "adapter": ZIGBEE_ADAPTER_TYPE} if NETWORK_MODE else {"port": zigbee_port}
     r = sup_post(f"/addons/{Z2M_SLUG}/options", {
-        "options": {"data_path": "/config/zigbee2mqtt"}
+        "options": {
+            "data_path": "/config/zigbee2mqtt",
+            "socat": {
+                "enabled": False,
+                "master": "pty,raw,echo=0",
+                "slave": "tcp-listen:8485,keepalive,nodelay,reuseaddr,keepidle=1,keepintvl=1,keepcnt=5",
+                "options": "",
+                "log": False,
+            },
+            "mqtt": {
+                "server": f"mqtts://{EMQX_HOST}:8883",
+                "user": PI_USER,
+                "password": PI_PASS,
+                "base_topic": f"{SITE_PREFIX}/zigbee2mqtt",
+            },
+            "serial": serial_opts,
+        }
     })
-    if not r.ok:
-        warn(f"[diag] Z2M options: {r.status_code} {r.text[:120]}")
+    if r.ok:
+        log("✓ Options Zigbee2MQTT appliquées")
+    else:
+        warn(f"✗ Z2M options: {r.status_code} {r.text[:150]}")
 
     r = sup_post(f"/addons/{Z2M_SLUG}/restart")
     if r.ok:
