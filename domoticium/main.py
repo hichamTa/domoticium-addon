@@ -1334,10 +1334,10 @@ def _handle_ha_command(payload: bytes):
         if not name:
             warn("[ha/command] create_area: name manquant")
             return
+        log(f"[ha/command] create_area → POST /config/area_registry name='{name}'")
         r = ha_post("/config/area_registry", {"name": name})
-        if r.ok:
-            log(f"[ha/command] Area HA créée : '{name}'")
-        else:
+        log(f"[ha/command] create_area ← HTTP {r.status_code} : {r.text[:200]}")
+        if not r.ok:
             warn(f"[ha/command] Erreur création area '{name}' : {r.status_code} {r.text[:200]}")
 
     elif cmd_type == "rename_area":
