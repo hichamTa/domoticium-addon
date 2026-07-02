@@ -1314,8 +1314,13 @@ def on_local_message(client, userdata, msg):
         threading.Thread(target=call_heartbeat_api, daemon=True).start()
         return  # pas besoin de relayer bridge/state vers le cloud
 
-    # ── Pas de relay des commandes /set et /get (sens inverse) ───────────────
-    if topic.endswith("/set") or topic.endswith("/get"):
+    # ── Pas de relay des commandes (sens cloud→local uniquement) ─────────────
+    # /set, /get : commandes device → ne pas reboucler vers EMQX
+    # bridge/request/+ : permit_join, restart… → le cloud bridge les injecte sur
+    #   Mosquitto ; le local bridge les reçoit aussi car abonné à zigbee2mqtt/#.
+    #   Sans ce filtre, ils repartiraient vers EMQX → cloud bridge les reinjecterait
+    #   sur Mosquitto → boucle infinie.
+    if topic.endswith("/set") or topic.endswith("/get") or "/bridge/request/" in topic:
         return
 
     if not _cloud_client:
