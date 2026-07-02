@@ -1415,9 +1415,9 @@ def _sync_devices_to_app(devices_list):
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
             timeout=30,
         )
-        _LOGGER.info(f"[devices-sync] HTTP {r.status_code} — {len(devices_list)} devices, réponse: {r.text[:120]}")
+        log(f"[devices-sync] HTTP {r.status_code} — {len(devices_list)} devices, réponse: {r.text[:120]}")
     except Exception as e:
-        _LOGGER.warning(f"[devices-sync] {e}")
+        warn(f"[devices-sync] {e}")
 
 
 def _sync_matter_device_to_app(node_id, name, vendor_name, product_name, device_type):
@@ -1436,9 +1436,9 @@ def _sync_matter_device_to_app(node_id, name, vendor_name, product_name, device_
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
             timeout=30,
         )
-        _LOGGER.info(f"[devices-sync/matter] HTTP {r.status_code} — node {node_id}")
+        log(f"[devices-sync/matter] HTTP {r.status_code} — node {node_id}")
     except Exception as e:
-        _LOGGER.warning(f"[devices-sync/matter] {e}")
+        warn(f"[devices-sync/matter] {e}")
 
 
 def on_local_message(client, userdata, msg):
@@ -1468,7 +1468,7 @@ def on_local_message(client, userdata, msg):
                     target=_sync_devices_to_app, args=(devices_list,), daemon=True
                 ).start()
         except Exception as exc:
-            _LOGGER.warning(f"[devices-sync] parse error: {exc}")
+            warn(f"[devices-sync] parse error: {exc}")
         # Le relay vers EMQX se fait en fin de fonction (pas de return ici)
 
     # ── Pas de relay des commandes (sens cloud→local uniquement) ─────────────
