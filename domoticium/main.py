@@ -1166,13 +1166,15 @@ def on_connect(client, userdata, flags, reason_code, properties):
         return
     p = SITE_PREFIX
     topics = [
-        (f"{p}/cameras/+/configure", 1),        # commande ajout/suppression caméra
-        (f"{p}/matter/commission/start", 1),    # jumelage Matter
-        (f"{p}/zigbee2mqtt/+/set", 1),          # commandes Z2M cloud→local
-        (f"{p}/ha/command", 1),                 # service HA cloud→local
+        (f"{p}/cameras/+/configure", 1),           # commande ajout/suppression caméra
+        (f"{p}/matter/commission/start", 1),       # jumelage Matter
+        (f"{p}/zigbee2mqtt/+/set", 1),             # commandes device Z2M cloud→local
+        (f"{p}/zigbee2mqtt/+/get", 1),             # lecture état device Z2M cloud→local
+        (f"{p}/zigbee2mqtt/bridge/request/+", 1), # permit_join, restart, etc.
+        (f"{p}/ha/command", 1),                    # service HA cloud→local
     ]
     client.subscribe(topics)
-    log(f"[cloud] Connecté EMQX — souscrit à {p}/cameras/+/configure, /matter/+, /zigbee2mqtt/+/set, /ha/command")
+    log(f"[cloud] Connecté EMQX — souscrit à {p}/zigbee2mqtt/+/set|get, bridge/request/+, /cameras/+/configure, /matter/+, /ha/command")
 
 
 def on_message(client, userdata, msg):
@@ -1182,11 +1184,16 @@ def on_message(client, userdata, msg):
         return
 
     # ── Relay commandes Z2M cloud → local Mosquitto ──────────────────────────
-    # {prefix}/zigbee2mqtt/{device}/set → zigbee2mqtt/{device}/set
-    if parts[1] == "zigbee2mqtt" and parts[-1] in ("set", "get"):
+    # {prefix}/zigbee2mqtt/{device}/set|get → zigbee2mqtt/{device}/set|get
+    # {prefix}/zigbee2mqtt/bridge/request/+ → zigbee2mqtt/bridge/request/+
+    if parts[1] == "zigbee2mqtt" and (
+        parts[-1] in ("set", "get")
+        or (len(parts) >= 4 and parts[2] == "bridge" and parts[3] == "request")
+    ):
         local_topic = "/".join(parts[1:])  # retire le prefix site
         if _local_client:
             _local_client.publish(local_topic, msg.payload, qos=1)
+            log(f"[cloud→local] Relay Z2M : {local_topic}")
         return
 
     # ── Relay commandes HA cloud → local Mosquitto ────────────────────────────
