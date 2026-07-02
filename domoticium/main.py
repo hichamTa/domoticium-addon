@@ -1235,65 +1235,171 @@ def on_local_connect(client, userdata, flags, reason_code, properties):
     log("[local] Connecté Mosquitto — souscrit zigbee2mqtt/# et ha/#")
 
 
+def _get_ha_areas():
+    """Retourne la liste des areas HA [{area_id, name, ...}]."""
+    try:
+        r = requests.get(f"{API}/config/area_registry", headers=HDRS, timeout=10)
+        if r.ok:
+            data = r.json()
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        warn(f"[ha/command] Erreur get areas : {e}")
+    return []
+
+
+def _get_ha_device_id(entity_id=None, ieee_address=None):
+    """Retourne le device_id HA depuis entity_id ou ieee_address Z2M."""
+    try:
+        r = requests.get(f"{API}/config/entity_registry", headers=HDRS, timeout=10)
+        if r.ok:
+            entities = r.json() if isinstance(r.json(), list) else []
+            if entity_id:
+                e = next((x for x in entities if x.get("entity_id") == entity_id), None)
+                if e and e.get("device_id"):
+                    return e["device_id"]
+            if ieee_address:
+                # Z2M génère l'unique_id à partir de l'ieee_address
+                e = next((x for x in entities if ieee_address in (x.get("unique_id") or "")), None)
+                if e and e.get("device_id"):
+                    return e["device_id"]
+    except Exception as e:
+        warn(f"[ha/command] Erreur entity registry : {e}")
+    return None
+
+
 def _handle_ha_command(payload: bytes):
-    """Exécute une commande ha/command reçue via MQTT : crée/supprime un script HA."""
+    """Exécute une commande ha/command reçue via MQTT."""
     try:
         data = json.loads(payload.decode())
     except Exception as e:
         warn(f"[ha/command] JSON invalide : {e}")
         return
 
-    cmd_type   = data.get("type", "")
-    object_id  = data.get("object_id", "")
+    cmd_type  = data.get("type", "")
+    object_id = data.get("object_id", "")
 
-    if not object_id:
-        warn(f"[ha/command] object_id manquant : {data}")
-        return
+    # ── Scripts / Automations (nécessitent object_id) ────────────────────────
+    if cmd_type in ("script_upsert", "script_delete", "automation_upsert", "automation_delete"):
+        if not object_id:
+            warn(f"[ha/command] object_id manquant pour {cmd_type} : {data}")
+            return
 
-    if cmd_type == "script_upsert":
-        script_cfg = {
-            "alias":    data.get("alias", object_id),
-            "icon":     data.get("icon", "mdi:play"),
-            "sequence": data.get("sequence", []),
-            "mode":     "single",
-        }
-        # ha_post préfixe déjà http://supervisor/core/api → pas de /api/ dans le path
-        r = ha_post(f"/config/script/config/{object_id}", script_cfg)
+        if cmd_type == "script_upsert":
+            script_cfg = {
+                "alias":    data.get("alias", object_id),
+                "icon":     data.get("icon", "mdi:play"),
+                "sequence": data.get("sequence", []),
+                "mode":     "single",
+            }
+            r = ha_post(f"/config/script/config/{object_id}", script_cfg)
+            if r.ok:
+                ha_post("/services/script/reload", {})
+                log(f"[ha/command] Script HA créé/mis à jour : {object_id}")
+            else:
+                warn(f"[ha/command] Erreur script {object_id} : {r.status_code} {r.text[:200]}")
+
+        elif cmd_type == "script_delete":
+            r = requests.delete(f"{API}/config/script/config/{object_id}", headers=HDRS, timeout=10)
+            if r.ok:
+                ha_post("/services/script/reload", {})
+                log(f"[ha/command] Script HA supprimé : {object_id}")
+            else:
+                warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
+
+        elif cmd_type == "automation_upsert":
+            auto_cfg = {
+                "alias":   data.get("alias", object_id),
+                "trigger": data.get("trigger", []),
+                "action":  data.get("action", []),
+                "mode":    "single",
+            }
+            r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
+            if r.ok:
+                ha_post("/services/automation/reload", {})
+                log(f"[ha/command] Automation HA créée/mise à jour : {object_id}")
+            else:
+                warn(f"[ha/command] Erreur automation {object_id} : {r.status_code} {r.text[:200]}")
+
+        elif cmd_type == "automation_delete":
+            r = requests.delete(f"{API}/config/automation/config/{object_id}", headers=HDRS, timeout=10)
+            if r.ok:
+                ha_post("/services/automation/reload", {})
+                log(f"[ha/command] Automation HA supprimée : {object_id}")
+            else:
+                warn(f"[ha/command] Erreur suppression automation {object_id} : {r.status_code} {r.text[:200]}")
+
+    # ── Areas (pièces) ───────────────────────────────────────────────────────
+    elif cmd_type == "create_area":
+        name = data.get("name", "")
+        if not name:
+            warn("[ha/command] create_area: name manquant")
+            return
+        r = ha_post("/config/area_registry", {"name": name})
         if r.ok:
-            ha_post("/services/script/reload", {})
-            log(f"[ha/command] Script HA créé/mis à jour : {object_id}")
+            log(f"[ha/command] Area HA créée : '{name}'")
         else:
-            warn(f"[ha/command] Erreur création script {object_id} : {r.status_code} {r.text[:200]}")
+            warn(f"[ha/command] Erreur création area '{name}' : {r.status_code} {r.text[:200]}")
 
-    elif cmd_type == "script_delete":
-        r = requests.delete(f"{API}/config/script/config/{object_id}", headers=HDRS, timeout=10)
+    elif cmd_type == "rename_area":
+        old_name = data.get("name", "")
+        new_name = data.get("new_name", "")
+        if not old_name or not new_name:
+            warn("[ha/command] rename_area: name et new_name requis")
+            return
+        areas = _get_ha_areas()
+        area  = next((a for a in areas if a.get("name") == old_name), None)
+        if not area:
+            ha_post("/config/area_registry", {"name": new_name})
+            log(f"[ha/command] rename_area: '{old_name}' non trouvée — créée sous '{new_name}'")
+            return
+        r = requests.put(
+            f"{API}/config/area_registry/{area['area_id']}",
+            json={"name": new_name}, headers=HDRS, timeout=10
+        )
         if r.ok:
-            ha_post("/services/script/reload", {})
-            log(f"[ha/command] Script HA supprimé : {object_id}")
+            log(f"[ha/command] Area HA renommée : '{old_name}' → '{new_name}'")
         else:
-            warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
+            warn(f"[ha/command] Erreur rename area : {r.status_code} {r.text[:200]}")
 
-    elif cmd_type == "automation_upsert":
-        auto_cfg = {
-            "alias":   data.get("alias", object_id),
-            "trigger": data.get("trigger", []),
-            "action":  data.get("action", []),
-            "mode":    "single",
-        }
-        r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
+    elif cmd_type == "delete_area":
+        name = data.get("name", "")
+        if not name:
+            warn("[ha/command] delete_area: name manquant")
+            return
+        areas = _get_ha_areas()
+        area  = next((a for a in areas if a.get("name") == name), None)
+        if not area:
+            log(f"[ha/command] delete_area: area '{name}' non trouvée dans HA (déjà supprimée ?)")
+            return
+        r = requests.delete(f"{API}/config/area_registry/{area['area_id']}", headers=HDRS, timeout=10)
         if r.ok:
-            ha_post("/services/automation/reload", {})
-            log(f"[ha/command] Automation HA créée/mise à jour : {object_id}")
+            log(f"[ha/command] Area HA supprimée : '{name}'")
         else:
-            warn(f"[ha/command] Erreur création automation {object_id} : {r.status_code} {r.text[:200]}")
+            warn(f"[ha/command] Erreur suppression area '{name}' : {r.status_code} {r.text[:200]}")
 
-    elif cmd_type == "automation_delete":
-        r = requests.delete(f"{API}/config/automation/config/{object_id}", headers=HDRS, timeout=10)
+    elif cmd_type == "set_device_area":
+        entity_id   = data.get("entity_id")  or None
+        ieee_address = data.get("ieee_address") or None
+        area_name   = data.get("area_name")  or None
+
+        device_id = _get_ha_device_id(entity_id=entity_id, ieee_address=ieee_address)
+        if not device_id:
+            warn(f"[ha/command] set_device_area: device non trouvé (entity={entity_id}, ieee={ieee_address})")
+            return
+
+        area_id = None
+        if area_name:
+            areas  = _get_ha_areas()
+            area   = next((a for a in areas if a.get("name") == area_name), None)
+            area_id = area["area_id"] if area else None
+            if not area_id:
+                warn(f"[ha/command] set_device_area: area '{area_name}' non trouvée — device non assigné")
+
+        r = ha_post("/config/device_registry/update", {"device_id": device_id, "area_id": area_id})
         if r.ok:
-            ha_post("/services/automation/reload", {})
-            log(f"[ha/command] Automation HA supprimée : {object_id}")
+            log(f"[ha/command] Device area mis à jour : {entity_id or ieee_address} → {area_name or 'aucune'}")
         else:
-            warn(f"[ha/command] Erreur suppression automation {object_id} : {r.status_code} {r.text[:200]}")
+            warn(f"[ha/command] Erreur set_device_area : {r.status_code} {r.text[:200]}")
 
     else:
         warn(f"[ha/command] Type inconnu : {cmd_type}")
