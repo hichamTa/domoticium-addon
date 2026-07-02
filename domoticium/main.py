@@ -1117,6 +1117,8 @@ def handle_matter_commission(client, msg):
                 client.publish(result_topic,
                                json.dumps({"requestId": request_id, "success": True}),
                                qos=1)
+                # Note : HA ne retourne pas le node_id Matter dans la réponse.
+                # La sync Matter se fera via un futur endpoint HA Matter API.
             else:
                 try:
                     err_msg = resp.json().get("message", f"HTTP {resp.status_code}")
@@ -1297,6 +1299,42 @@ def _handle_ha_command(payload: bytes):
         warn(f"[ha/command] Type inconnu : {cmd_type}")
 
 
+def _sync_devices_to_app(devices_list):
+    """Background thread : envoie la liste bridge/devices au backend pour upsert auto."""
+    try:
+        auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
+        r = requests.post(
+            f"{APP_URL}/api/webhooks/pi/devices-sync",
+            json={"siteId": SITE_PREFIX, "source": "zigbee", "devices": devices_list},
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        _LOGGER.info(f"[devices-sync] HTTP {r.status_code} — {len(devices_list)} devices, réponse: {r.text[:120]}")
+    except Exception as e:
+        _LOGGER.warning(f"[devices-sync] {e}")
+
+
+def _sync_matter_device_to_app(node_id, name, vendor_name, product_name, device_type):
+    """Background thread : enregistre un device Matter dans le backend après commissioning."""
+    try:
+        auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
+        r = requests.post(
+            f"{APP_URL}/api/webhooks/pi/devices-sync",
+            json={
+                "siteId": SITE_PREFIX,
+                "source": "matter",
+                "devices": [{"node_id": node_id, "name": name,
+                              "vendor_name": vendor_name, "product_name": product_name,
+                              "device_type": device_type}],
+            },
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        _LOGGER.info(f"[devices-sync/matter] HTTP {r.status_code} — node {node_id}")
+    except Exception as e:
+        _LOGGER.warning(f"[devices-sync/matter] {e}")
+
+
 def on_local_message(client, userdata, msg):
     """Messages reçus depuis Mosquitto local → relay vers EMQX Cloud."""
     global _z2m_online
@@ -1313,6 +1351,19 @@ def on_local_message(client, userdata, msg):
         _z2m_online = online
         threading.Thread(target=call_heartbeat_api, daemon=True).start()
         return  # pas besoin de relayer bridge/state vers le cloud
+
+    # ── Z2M bridge/devices → auto-registration dans Supabase ─────────────────
+    # On relaie quand même vers EMQX pour que le navigateur voie les features.
+    if topic == "zigbee2mqtt/bridge/devices":
+        try:
+            devices_list = json.loads(payload.decode())
+            if isinstance(devices_list, list):
+                threading.Thread(
+                    target=_sync_devices_to_app, args=(devices_list,), daemon=True
+                ).start()
+        except Exception as exc:
+            _LOGGER.warning(f"[devices-sync] parse error: {exc}")
+        # Le relay vers EMQX se fait en fin de fonction (pas de return ici)
 
     # ── Pas de relay des commandes (sens cloud→local uniquement) ─────────────
     # /set, /get : commandes device → ne pas reboucler vers EMQX
