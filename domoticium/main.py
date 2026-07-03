@@ -865,18 +865,19 @@ def _build_mqtt_broker_payload(schema: list, local: bool = False) -> dict:
     return payload
 
 
-def configure_mqtt():
+def configure_mqtt(force: bool = False):
     log("── MQTT (Mosquitto local) ───────────────────")
 
-    # Vérifier si MQTT est déjà actif
-    svc_resp = requests.get(f"{API}/services", headers=HDRS, timeout=10)
-    if svc_resp.ok:
-        try:
-            if any(s.get("domain") == "mqtt" for s in svc_resp.json()):
-                log("MQTT déjà configuré et actif")
-                return
-        except Exception:
-            pass
+    # Vérifier si MQTT est déjà actif (sauf si force=True après suppression de l'entrée)
+    if not force:
+        svc_resp = requests.get(f"{API}/services", headers=HDRS, timeout=10)
+        if svc_resp.ok:
+            try:
+                if any(s.get("domain") == "mqtt" for s in svc_resp.json()):
+                    log("MQTT déjà configuré et actif")
+                    return
+            except Exception:
+                pass
 
     log("Configuration MQTT → core-mosquitto:1883…")
     flow_resp = ha_post("/config/config_entries/flow", {"handler": "mqtt"})
@@ -1255,6 +1256,63 @@ _z2m_online: bool | None = None  # état Z2M courant, None = inconnu
 # ── Sync omnipresente App → HA ────────────────────────────────────────────────
 _sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: reconnexion)
 _first_connect   = True               # distingue démarrage initial vs reconnexion
+_mqtt_broker_checked = False          # flag one-shot pour _check_and_fix_mqtt_broker
+
+
+def _check_and_fix_mqtt_broker():
+    """Vérifie que l'intégration MQTT HA pointe sur Mosquitto local.
+    Lit core.config_entries pour obtenir le broker réel (pas de WebSocket public pour ça).
+    Si le broker est EMQX ou autre, supprime l'entrée et reconfigure vers Mosquitto.
+    Appelé une seule fois au démarrage du service bridge."""
+    global _mqtt_broker_checked
+    if _mqtt_broker_checked:
+        return
+    _mqtt_broker_checked = True
+
+    log("[mqtt-check] Vérification broker MQTT HA…")
+    storage_path = "/homeassistant/.storage/core.config_entries"
+    try:
+        with open(storage_path) as f:
+            storage = json.load(f)
+    except Exception as e:
+        warn(f"[mqtt-check] Impossible de lire core.config_entries : {e}")
+        return
+
+    entries = storage.get("data", {}).get("entries", [])
+    mqtt_entries = [e for e in entries if e.get("domain") == "mqtt"]
+
+    if not mqtt_entries:
+        log("[mqtt-check] Aucune intégration MQTT dans HA — configure_mqtt() lancé")
+        configure_mqtt()
+        return
+
+    for entry in mqtt_entries:
+        data    = entry.get("data", {})
+        broker  = str(data.get("broker") or data.get("host") or "").strip()
+        port    = int(data.get("port") or 1883)
+        eid     = entry.get("entry_id", "")
+        state   = entry.get("state", "?")
+        log(f"[mqtt-check] HA MQTT : broker={broker!r} port={port} state={state}")
+
+        is_mosquitto = (
+            "mosquitto" in broker.lower()
+            or broker in ("127.0.0.1", "localhost", "")
+            or (port == 1883 and (not broker or EMQX_HOST not in broker))
+        )
+
+        if is_mosquitto:
+            log("[mqtt-check] ✓ Mosquitto local confirmé — Z2M discovery devrait fonctionner")
+        else:
+            warn(f"[mqtt-check] ⚠ HA MQTT sur {broker!r}:{port} ≠ Mosquitto → suppression + reconfiguration")
+            # Supprimer l'entrée incorrecte via WebSocket HA
+            if eid:
+                del_res = _ha_ws_call("config_entries/delete", entry_id=eid)
+                log(f"[mqtt-check] Suppression : {del_res}")
+                time.sleep(4)
+            configure_mqtt(force=True)
+            log("[mqtt-check] ✓ MQTT reconfiguré → attente 10s pour Z2M discovery + traitement HA")
+            time.sleep(10)
+        break
 
 
 def _sync_areas_batch(rooms: list, devices: list):
@@ -1817,6 +1875,8 @@ def run_bridge():
     global _cloud_client
     _load_cameras()
     start_cloudflared()
+    # Vérification broker MQTT HA en arrière-plan (ne bloque pas le démarrage)
+    threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     threading.Thread(target=_ha_sync_loop,   daemon=True).start()
     threading.Thread(target=run_local_bridge, daemon=True).start()
