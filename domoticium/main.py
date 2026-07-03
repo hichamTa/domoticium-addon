@@ -83,6 +83,100 @@ def sup_post(path, data=None):
 def ha_post(path, data=None):
     return requests.post(f"{API}{path}", headers=HDRS, json=data or {}, timeout=15)
 
+
+# ── WebSocket HA (nécessaire pour area_registry / entity_registry / device_registry) ──
+# L'API REST HA n'expose pas ces registres ; seul le WebSocket les supporte.
+
+def _ws_recv_exact(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError(f"Socket fermé ({len(buf)}/{n} octets)")
+        buf += chunk
+    return buf
+
+
+def _ha_ws_call(cmd_type: str, **params):
+    """
+    Appel synchrone à l'API WebSocket HA via le Supervisor.
+    Retourne le message résultat {"success": bool, "result": ...} ou None.
+    """
+    import socket as _socket
+    import os as _os
+    try:
+        s = _socket.create_connection(("supervisor", 80), timeout=15)
+
+        # Handshake HTTP → WebSocket
+        key = base64.b64encode(_os.urandom(16)).decode()
+        s.sendall((
+            "GET /core/websocket HTTP/1.1\r\n"
+            "Host: supervisor\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            resp += s.recv(4096)
+        if b"101" not in resp:
+            raise ConnectionError(f"Handshake refusé: {resp[:80]}")
+
+        def ws_recv():
+            while True:
+                h = _ws_recv_exact(s, 2)
+                opcode = h[0] & 0x0F
+                length = h[1] & 0x7F
+                if length == 126:
+                    length = struct.unpack(">H", _ws_recv_exact(s, 2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", _ws_recv_exact(s, 8))[0]
+                if h[1] & 0x80:
+                    mask = _ws_recv_exact(s, 4)
+                raw = _ws_recv_exact(s, length)
+                if h[1] & 0x80:
+                    raw = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
+                if opcode == 0x09:   # ping → pong
+                    pong = bytes([0x8A, 0x80, 0, 0, 0, 0])
+                    s.sendall(pong)
+                    continue
+                if opcode == 0x08:   # close
+                    raise ConnectionError("WS close frame")
+                return json.loads(raw.decode())
+
+        def ws_send(data: dict):
+            payload = json.dumps(data).encode()
+            mask = _os.urandom(4)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            l = len(payload)
+            if l < 126:
+                header = bytes([0x81, 0x80 | l])
+            elif l < 65536:
+                header = bytes([0x81, 0xFE]) + struct.pack(">H", l)
+            else:
+                header = bytes([0x81, 0xFF]) + struct.pack(">Q", l)
+            s.sendall(header + mask + masked)
+
+        # Auth
+        msg = ws_recv()
+        if msg.get("type") != "auth_required":
+            raise Exception(f"auth_required attendu, reçu: {msg.get('type')}")
+        ws_send({"type": "auth", "access_token": SUPERVISOR_TOKEN})
+        msg = ws_recv()
+        if msg.get("type") != "auth_ok":
+            raise Exception(f"Auth WS échouée: {msg}")
+
+        # Commande
+        ws_send({"id": 1, "type": cmd_type, **params})
+        result = ws_recv()
+        s.close()
+        return result
+
+    except Exception as exc:
+        warn(f"[ha_ws] {cmd_type}: {exc}")
+        return None
+
 def _sup_repos():
     """Retourne la liste des URLs de dépôts depuis le Supervisor.
     Gère le format HA Supervisor : {"result":"ok","data":{"repositories":[...]}}.
@@ -1236,34 +1330,29 @@ def on_local_connect(client, userdata, flags, reason_code, properties):
 
 
 def _get_ha_areas():
-    """Retourne la liste des areas HA [{area_id, name, ...}]."""
-    try:
-        r = requests.get(f"{API}/config/area_registry", headers=HDRS, timeout=10)
-        if r.ok:
-            data = r.json()
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        warn(f"[ha/command] Erreur get areas : {e}")
+    """Retourne la liste des areas HA via WebSocket [{area_id, name, ...}]."""
+    result = _ha_ws_call("config/area_registry/list")
+    if result and result.get("success"):
+        return result.get("result", [])
+    warn(f"[ha/command] _get_ha_areas échoué: {result}")
     return []
 
 
 def _get_ha_device_id(entity_id=None, ieee_address=None):
-    """Retourne le device_id HA depuis entity_id ou ieee_address Z2M."""
-    try:
-        r = requests.get(f"{API}/config/entity_registry", headers=HDRS, timeout=10)
-        if r.ok:
-            entities = r.json() if isinstance(r.json(), list) else []
-            if entity_id:
-                e = next((x for x in entities if x.get("entity_id") == entity_id), None)
-                if e and e.get("device_id"):
-                    return e["device_id"]
-            if ieee_address:
-                # Z2M génère l'unique_id à partir de l'ieee_address
-                e = next((x for x in entities if ieee_address in (x.get("unique_id") or "")), None)
-                if e and e.get("device_id"):
-                    return e["device_id"]
-    except Exception as e:
-        warn(f"[ha/command] Erreur entity registry : {e}")
+    """Retourne le device_id HA depuis entity_id ou ieee_address Z2M (WebSocket)."""
+    result = _ha_ws_call("config/entity_registry/list")
+    if not result or not result.get("success"):
+        warn(f"[ha/command] entity registry inaccessible: {result}")
+        return None
+    entities = result.get("result", [])
+    if entity_id:
+        e = next((x for x in entities if x.get("entity_id") == entity_id), None)
+        if e and e.get("device_id"):
+            return e["device_id"]
+    if ieee_address:
+        e = next((x for x in entities if ieee_address in (x.get("unique_id") or "")), None)
+        if e and e.get("device_id"):
+            return e["device_id"]
     return None
 
 
@@ -1328,17 +1417,17 @@ def _handle_ha_command(payload: bytes):
             else:
                 warn(f"[ha/command] Erreur suppression automation {object_id} : {r.status_code} {r.text[:200]}")
 
-    # ── Areas (pièces) ───────────────────────────────────────────────────────
+    # ── Areas (pièces) — WebSocket HA uniquement (pas d'API REST pour area_registry) ──
     elif cmd_type == "create_area":
         name = data.get("name", "")
         if not name:
             warn("[ha/command] create_area: name manquant")
             return
-        log(f"[ha/command] create_area → POST /config/area_registry name='{name}'")
-        r = ha_post("/config/area_registry", {"name": name})
-        log(f"[ha/command] create_area ← HTTP {r.status_code} : {r.text[:200]}")
-        if not r.ok:
-            warn(f"[ha/command] Erreur création area '{name}' : {r.status_code} {r.text[:200]}")
+        result = _ha_ws_call("config/area_registry/create", name=name)
+        if result and result.get("success"):
+            log(f"[ha/command] Area HA créée : '{name}'")
+        else:
+            warn(f"[ha/command] Erreur création area '{name}' : {result}")
 
     elif cmd_type == "rename_area":
         old_name = data.get("name", "")
@@ -1349,17 +1438,14 @@ def _handle_ha_command(payload: bytes):
         areas = _get_ha_areas()
         area  = next((a for a in areas if a.get("name") == old_name), None)
         if not area:
-            ha_post("/config/area_registry", {"name": new_name})
+            result = _ha_ws_call("config/area_registry/create", name=new_name)
             log(f"[ha/command] rename_area: '{old_name}' non trouvée — créée sous '{new_name}'")
             return
-        r = requests.put(
-            f"{API}/config/area_registry/{area['area_id']}",
-            json={"name": new_name}, headers=HDRS, timeout=10
-        )
-        if r.ok:
+        result = _ha_ws_call("config/area_registry/update", area_id=area["area_id"], name=new_name)
+        if result and result.get("success"):
             log(f"[ha/command] Area HA renommée : '{old_name}' → '{new_name}'")
         else:
-            warn(f"[ha/command] Erreur rename area : {r.status_code} {r.text[:200]}")
+            warn(f"[ha/command] Erreur rename area : {result}")
 
     elif cmd_type == "delete_area":
         name = data.get("name", "")
@@ -1369,18 +1455,18 @@ def _handle_ha_command(payload: bytes):
         areas = _get_ha_areas()
         area  = next((a for a in areas if a.get("name") == name), None)
         if not area:
-            log(f"[ha/command] delete_area: area '{name}' non trouvée dans HA (déjà supprimée ?)")
+            log(f"[ha/command] delete_area: area '{name}' non trouvée dans HA")
             return
-        r = requests.delete(f"{API}/config/area_registry/{area['area_id']}", headers=HDRS, timeout=10)
-        if r.ok:
+        result = _ha_ws_call("config/area_registry/delete", area_id=area["area_id"])
+        if result and result.get("success"):
             log(f"[ha/command] Area HA supprimée : '{name}'")
         else:
-            warn(f"[ha/command] Erreur suppression area '{name}' : {r.status_code} {r.text[:200]}")
+            warn(f"[ha/command] Erreur suppression area '{name}' : {result}")
 
     elif cmd_type == "set_device_area":
-        entity_id   = data.get("entity_id")  or None
+        entity_id    = data.get("entity_id")    or None
         ieee_address = data.get("ieee_address") or None
-        area_name   = data.get("area_name")  or None
+        area_name    = data.get("area_name")    or None
 
         device_id = _get_ha_device_id(entity_id=entity_id, ieee_address=ieee_address)
         if not device_id:
@@ -1389,17 +1475,17 @@ def _handle_ha_command(payload: bytes):
 
         area_id = None
         if area_name:
-            areas  = _get_ha_areas()
-            area   = next((a for a in areas if a.get("name") == area_name), None)
+            areas   = _get_ha_areas()
+            area    = next((a for a in areas if a.get("name") == area_name), None)
             area_id = area["area_id"] if area else None
             if not area_id:
-                warn(f"[ha/command] set_device_area: area '{area_name}' non trouvée — device non assigné")
+                warn(f"[ha/command] set_device_area: area '{area_name}' non trouvée")
 
-        r = ha_post("/config/device_registry/update", {"device_id": device_id, "area_id": area_id})
-        if r.ok:
+        result = _ha_ws_call("config/device_registry/update", device_id=device_id, area_id=area_id)
+        if result and result.get("success"):
             log(f"[ha/command] Device area mis à jour : {entity_id or ieee_address} → {area_name or 'aucune'}")
         else:
-            warn(f"[ha/command] Erreur set_device_area : {r.status_code} {r.text[:200]}")
+            warn(f"[ha/command] Erreur set_device_area : {result}")
 
     else:
         warn(f"[ha/command] Type inconnu : {cmd_type}")
