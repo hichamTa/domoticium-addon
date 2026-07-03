@@ -1500,7 +1500,7 @@ def _ha_sync_loop():
         except Exception as e:
             warn(f"[sync] Erreur inattendue : {e}")
         # Attend 5 min OU un déclenchement immédiat (reconnexion EMQX, etc.)
-        _sync_requested.wait(timeout=300)
+        _sync_requested.wait(timeout=30)
         _sync_requested.clear()
 
 
