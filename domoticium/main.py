@@ -1571,7 +1571,9 @@ def on_local_message(client, userdata, msg):
 
     # ── Relay Z2M états local → EMQX : zigbee2mqtt/X → {prefix}/zigbee2mqtt/X ─
     if topic.startswith("zigbee2mqtt/"):
-        _cloud_client.publish(f"{SITE_PREFIX}/{topic}", payload, qos=1)
+        # bridge/devices retenu sur EMQX → le navigateur le reçoit à chaque reconnexion
+        retain = (topic == "zigbee2mqtt/bridge/devices")
+        _cloud_client.publish(f"{SITE_PREFIX}/{topic}", payload, qos=1, retain=retain)
         return
 
     # ── Commandes ha/command → scripts HA (ne pas relayer vers le cloud) ────────
