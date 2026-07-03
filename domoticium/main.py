@@ -11,7 +11,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, json, os, secrets, subprocess, sys, threading, time
+import base64, json, os, secrets, socket, struct, subprocess, sys, threading, time
 import paho.mqtt.client as mqtt
 import requests
 
