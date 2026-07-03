@@ -1283,21 +1283,26 @@ def _sync_areas_batch(rooms: list, devices: list):
                 existing_areas[a.get("name", "")] = a.get("area_id", "")
         log(f"[sync] Areas HA existantes : {list(existing_areas)}")
 
-        # 2. Lire le registre des entités HA (une seule fois)
-        res = call("config/entity_registry/list")
-        did_by_entity: dict[str, str] = {}  # entity_id → device_id
-        did_by_uid:    dict[str, str] = {}  # unique_id  → device_id
+        # 2. Lire le registre des DEVICES HA (plus fiable que entity_registry pour Z2M)
+        # Les devices Z2M ont des identifiers comme ["mqtt", "zigbee2mqtt_0x8c8b48..."]
+        # qui contiennent l'adresse IEEE — entity unique_id peut utiliser le friendly_name.
+        res = call("config/device_registry/list")
+        did_by_entity: dict[str, str] = {}  # entity_id → device_id (non utilisé ici)
+        did_by_uid:    dict[str, str] = {}  # valeur identifier (contient ieee) → device_id
         if res and res.get("success"):
-            for e in res.get("result", []):
-                did = e.get("device_id")
+            for dev in res.get("result", []):
+                did = dev.get("id")
                 if not did:
                     continue
-                eid = e.get("entity_id", "")
-                uid = e.get("unique_id", "")
-                if eid:
-                    did_by_entity[eid] = did
-                if uid:
-                    did_by_uid[uid] = did
+                for identifier in dev.get("identifiers", []):
+                    if isinstance(identifier, (list, tuple)) and len(identifier) >= 2:
+                        did_by_uid[str(identifier[1])] = did
+                for conn in dev.get("connections", []):
+                    if isinstance(conn, (list, tuple)) and len(conn) >= 2:
+                        did_by_uid[str(conn[1])] = did
+        if not did_by_uid:
+            log("[sync] ⚠ Device registry HA vide — Z2M discovery pas encore reçue par HA"
+                " (sera réessayé au prochain cycle)")
 
         # 3. Créer les areas manquantes
         for room in rooms:
@@ -1322,18 +1327,21 @@ def _sync_areas_batch(rooms: list, devices: list):
             area_name = (d.get("area_name")    or "").strip()
             area_id   = existing_areas.get(area_name) if area_name else None
 
-            # Résoudre le device_id HA
-            device_id = did_by_entity.get(entity_id) if entity_id else None
-            if not device_id and ieee:
-                # Les unique_ids Z2M contiennent l'adresse IEEE (ex: "0xABC_state", "0xABC_power")
-                for uid, did in did_by_uid.items():
-                    if ieee in uid:
+            # Résoudre le device_id HA via les identifiers du device registry
+            # Les identifiers Z2M ont la forme "zigbee2mqtt_0x8c8b48..." → l'ieee est dedans
+            device_id = None
+            if ieee:
+                ieee_lower = ieee.lower()
+                for id_val, did in did_by_uid.items():
+                    if ieee_lower in id_val.lower():
                         device_id = did
                         break
 
             if not device_id:
-                warn(f"[sync] Device non trouvé dans HA (ieee={ieee or '?'}, entity={entity_id or '?'})"
-                     " — Z2M discovery incomplète, sera retentée au prochain cycle")
+                sample = list(did_by_uid.keys())[:6]
+                warn(f"[sync] Device non trouvé dans HA (ieee={ieee or '?'})"
+                     f" — identifiers connus: {sample}"
+                     " — sera retentée au prochain cycle")
                 continue
 
             if not area_id:
@@ -1378,6 +1386,12 @@ def _sync_all_to_ha():
     autos   = state.get("automation_commands", [])
 
     log(f"[sync] Début : {len(rooms)} pièces, {len(devices)} assignations, {len(scenes)} scènes, {len(autos)} automations")
+
+    # Déclencher Z2M pour republier ses discovery messages HA → HA peuple son device registry.
+    # Envoyé EN PREMIER pour laisser à Z2M le temps de répondre pendant qu'on sync scènes/autos.
+    if _local_client:
+        _local_client.publish("homeassistant/status", "online", qos=1)
+        log("[sync] homeassistant/status online → Z2M republiera les discovery HA")
 
     # Scènes + automations via REST HA (rapide, pas de WebSocket)
     for scene in scenes:
