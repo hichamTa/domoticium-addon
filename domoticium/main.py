@@ -97,18 +97,16 @@ def _ws_recv_exact(sock, n: int) -> bytes:
     return buf
 
 
-def _ha_ws_call(cmd_type: str, **params):
+def _ha_ws_connect():
+    """Ouvre et authentifie une session WebSocket HA.
+    Retourne (ws_send, ws_recv, ws_close) ou (None, None, None) en cas d'erreur.
+    ws_send(data: dict) — inclure {"id": N} dans data.
+    ws_recv() → dict.
     """
-    Appel synchrone à l'API WebSocket HA via le Supervisor.
-    Retourne le message résultat {"success": bool, "result": ...} ou None.
-    """
-    import socket as _socket
-    import os as _os
     try:
-        s = _socket.create_connection(("supervisor", 80), timeout=15)
+        s = socket.create_connection(("supervisor", 80), timeout=15)
 
-        # Handshake HTTP → WebSocket
-        key = base64.b64encode(_os.urandom(16)).decode()
+        key = base64.b64encode(os.urandom(16)).decode()
         s.sendall((
             "GET /core/websocket HTTP/1.1\r\n"
             "Host: supervisor\r\n"
@@ -117,13 +115,17 @@ def _ha_ws_call(cmd_type: str, **params):
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n\r\n"
         ).encode())
+        # Lire seulement les en-têtes HTTP (jusqu'à \r\n\r\n)
         resp = b""
         while b"\r\n\r\n" not in resp:
-            resp += s.recv(4096)
+            chunk = s.recv(1)
+            if not chunk:
+                raise ConnectionError("Socket fermé pendant handshake")
+            resp += chunk
         if b"101" not in resp:
             raise ConnectionError(f"Handshake refusé: {resp[:80]}")
 
-        def ws_recv():
+        def _recv():
             while True:
                 h = _ws_recv_exact(s, 2)
                 opcode = h[0] & 0x0F
@@ -132,50 +134,64 @@ def _ha_ws_call(cmd_type: str, **params):
                     length = struct.unpack(">H", _ws_recv_exact(s, 2))[0]
                 elif length == 127:
                     length = struct.unpack(">Q", _ws_recv_exact(s, 8))[0]
-                if h[1] & 0x80:
+                mask_bit = h[1] & 0x80
+                if mask_bit:
                     mask = _ws_recv_exact(s, 4)
                 raw = _ws_recv_exact(s, length)
-                if h[1] & 0x80:
+                if mask_bit:
                     raw = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
-                if opcode == 0x09:   # ping → pong
-                    pong = bytes([0x8A, 0x80, 0, 0, 0, 0])
-                    s.sendall(pong)
+                if opcode == 0x09:
+                    s.sendall(bytes([0x8A, 0x80, 0, 0, 0, 0]))
                     continue
-                if opcode == 0x08:   # close
-                    raise ConnectionError("WS close frame")
+                if opcode == 0x08:
+                    raise ConnectionError("WS close frame reçu")
                 return json.loads(raw.decode())
 
-        def ws_send(data: dict):
+        def _send(data: dict):
             payload = json.dumps(data).encode()
-            mask = _os.urandom(4)
-            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-            l = len(payload)
-            if l < 126:
-                header = bytes([0x81, 0x80 | l])
-            elif l < 65536:
-                header = bytes([0x81, 0xFE]) + struct.pack(">H", l)
+            msk = os.urandom(4)
+            masked = bytes(b ^ msk[i % 4] for i, b in enumerate(payload))
+            n = len(payload)
+            if n < 126:
+                header = bytes([0x81, 0x80 | n])
+            elif n < 65536:
+                header = bytes([0x81, 0xFE]) + struct.pack(">H", n)
             else:
-                header = bytes([0x81, 0xFF]) + struct.pack(">Q", l)
-            s.sendall(header + mask + masked)
+                header = bytes([0x81, 0xFF]) + struct.pack(">Q", n)
+            s.sendall(header + msk + masked)
 
-        # Auth
-        msg = ws_recv()
+        # Auth HA
+        msg = _recv()
         if msg.get("type") != "auth_required":
             raise Exception(f"auth_required attendu, reçu: {msg.get('type')}")
-        ws_send({"type": "auth", "access_token": SUPERVISOR_TOKEN})
-        msg = ws_recv()
+        _send({"type": "auth", "access_token": SUPERVISOR_TOKEN})
+        msg = _recv()
         if msg.get("type") != "auth_ok":
             raise Exception(f"Auth WS échouée: {msg}")
 
-        # Commande
-        ws_send({"id": 1, "type": cmd_type, **params})
-        result = ws_recv()
-        s.close()
-        return result
+        return _send, _recv, s.close
 
+    except Exception as exc:
+        warn(f"[ha_ws] Connexion échouée: {exc}")
+        return None, None, None
+
+
+def _ha_ws_call(cmd_type: str, **params):
+    """Appel unique : ouvre une session WS, exécute une commande, ferme. Retourne le résultat ou None."""
+    ws_send, ws_recv, ws_close = _ha_ws_connect()
+    if not ws_send:
+        return None
+    try:
+        ws_send({"id": 1, "type": cmd_type, **params})
+        return ws_recv()
     except Exception as exc:
         warn(f"[ha_ws] {cmd_type}: {exc}")
         return None
+    finally:
+        try:
+            ws_close()
+        except Exception:
+            pass
 
 def _sup_repos():
     """Retourne la liste des URLs de dépôts depuis le Supervisor.
@@ -1241,8 +1257,106 @@ _sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: reconn
 _first_connect   = True               # distingue démarrage initial vs reconnexion
 
 
+def _sync_areas_batch(rooms: list, devices: list):
+    """Crée les areas manquantes et assigne les devices en une seule session WebSocket."""
+    if not rooms and not devices:
+        return
+
+    ws_send, ws_recv, ws_close = _ha_ws_connect()
+    if not ws_send:
+        warn("[sync] Session WebSocket indisponible — sync areas/devices ignorée")
+        return
+
+    try:
+        mid = [0]  # compteur de message mutable dans la closure
+
+        def call(cmd_type, **params):
+            mid[0] += 1
+            ws_send({"id": mid[0], "type": cmd_type, **params})
+            return ws_recv()
+
+        # 1. Lire les areas HA existantes (une seule fois)
+        res = call("config/area_registry/list")
+        existing_areas: dict[str, str] = {}  # name → area_id
+        if res and res.get("success"):
+            for a in res.get("result", []):
+                existing_areas[a.get("name", "")] = a.get("area_id", "")
+        log(f"[sync] Areas HA existantes : {list(existing_areas)}")
+
+        # 2. Lire le registre des entités HA (une seule fois)
+        res = call("config/entity_registry/list")
+        did_by_entity: dict[str, str] = {}  # entity_id → device_id
+        did_by_uid:    dict[str, str] = {}  # unique_id  → device_id
+        if res and res.get("success"):
+            for e in res.get("result", []):
+                did = e.get("device_id")
+                if not did:
+                    continue
+                eid = e.get("entity_id", "")
+                uid = e.get("unique_id", "")
+                if eid:
+                    did_by_entity[eid] = did
+                if uid:
+                    did_by_uid[uid] = did
+
+        # 3. Créer les areas manquantes
+        for room in rooms:
+            name = room["name"]
+            if name in existing_areas:
+                continue  # déjà présente, rien à faire
+            res = call("config/area_registry/create", name=name)
+            if res and res.get("success"):
+                existing_areas[name] = res.get("result", {}).get("area_id", "")
+                log(f"[sync] Area créée : '{name}'")
+            else:
+                err = (res or {}).get("error", {}).get("code", "?")
+                if err == "name_exists":
+                    log(f"[sync] Area '{name}' déjà présente (conflit résolu)")
+                else:
+                    warn(f"[sync] Erreur création area '{name}' : {res}")
+
+        # 4. Assigner les devices à leurs areas
+        for d in devices:
+            ieee      = (d.get("ieee_address") or "").strip()
+            entity_id = (d.get("ha_entity_id") or "").strip()
+            area_name = (d.get("area_name")    or "").strip()
+            area_id   = existing_areas.get(area_name) if area_name else None
+
+            # Résoudre le device_id HA
+            device_id = did_by_entity.get(entity_id) if entity_id else None
+            if not device_id and ieee:
+                # Les unique_ids Z2M contiennent l'adresse IEEE (ex: "0xABC_state", "0xABC_power")
+                for uid, did in did_by_uid.items():
+                    if ieee in uid:
+                        device_id = did
+                        break
+
+            if not device_id:
+                warn(f"[sync] Device non trouvé dans HA (ieee={ieee or '?'}, entity={entity_id or '?'})"
+                     " — Z2M discovery incomplète, sera retentée au prochain cycle")
+                continue
+
+            if not area_id:
+                warn(f"[sync] Area '{area_name}' inconnue pour le device {ieee or entity_id}")
+                continue
+
+            res = call("config/device_registry/update", device_id=device_id, area_id=area_id)
+            if res and res.get("success"):
+                log(f"[sync] Device {ieee or entity_id} → area '{area_name}' ✓")
+            else:
+                warn(f"[sync] Erreur assignation {ieee or entity_id} → '{area_name}': {res}")
+
+    except Exception as e:
+        warn(f"[sync] Erreur batch areas : {e}")
+    finally:
+        try:
+            ws_close()
+        except Exception:
+            pass
+
+
 def _sync_all_to_ha():
-    """Récupère l'état complet depuis l'app et l'applique à HA (idempotent)."""
+    """Récupère l'état complet depuis l'app et l'applique à HA (idempotent, une session WS)."""
     auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
     try:
         r = requests.get(
@@ -1263,45 +1377,37 @@ def _sync_all_to_ha():
     scenes  = state.get("scene_commands", [])
     autos   = state.get("automation_commands", [])
 
-    # 1. Areas HA (idempotent — create_area ne touche pas une area existante)
-    for room in rooms:
-        _handle_ha_command(json.dumps({"type": "create_area", "name": room["name"]}).encode())
+    log(f"[sync] Début : {len(rooms)} pièces, {len(devices)} assignations, {len(scenes)} scènes, {len(autos)} automations")
 
-    # 2. Assignation devices → areas
-    for d in devices:
-        _handle_ha_command(json.dumps({
-            "type":         "set_device_area",
-            "ieee_address": d.get("ieee_address"),
-            "entity_id":    d.get("ha_entity_id"),
-            "area_name":    d["area_name"],
-        }).encode())
-
-    # 3. Scènes → scripts HA (upsert idempotent)
+    # Scènes + automations via REST HA (rapide, pas de WebSocket)
     for scene in scenes:
         _handle_ha_command(json.dumps(scene).encode())
-
-    # 4. Automations → automations HA (upsert idempotent)
     for auto in autos:
         _handle_ha_command(json.dumps(auto).encode())
 
-    # 5. Demander à Z2M de republier bridge/devices → déclenche devices-sync webhook
-    #    → met à jour vendor/model/features/z2m_name en DB sans redémarrer Z2M
+    # Areas + device assignments en une seule session WebSocket
+    _sync_areas_batch(rooms, devices)
+
+    # Demander à Z2M de republier bridge/devices → devices-sync webhook
+    # → vendor/model/features/z2m_name mis à jour sans redémarrer Z2M
     if _local_client:
         _local_client.publish("zigbee2mqtt/bridge/request/devices", "", qos=1)
+        log("[sync] bridge/request/devices publié → Z2M va republier bridge/devices")
 
-    log(f"[sync] ✓ {len(rooms)} pièces · {len(devices)} assignations · {len(scenes)} scènes · {len(autos)} automations")
+    log("[sync] ✓ Terminé")
 
 
 def _ha_sync_loop():
     """Thread de fond : synchronise l'app avec HA toutes les 5 minutes.
     Se déclenche immédiatement sur reconnexion EMQX (via _sync_requested)."""
-    time.sleep(90)  # attente initiale : HA + EMQX + Z2M ont le temps de démarrer
+    log("[sync] Thread de sync démarré — premier sync dans 30s")
+    time.sleep(30)  # laisser HA + EMQX s'initialiser
     while True:
         try:
             _sync_all_to_ha()
         except Exception as e:
-            warn(f"[sync] Erreur : {e}")
-        # Attend 5 min OU un déclenchement immédiat (reconnexion, etc.)
+            warn(f"[sync] Erreur inattendue : {e}")
+        # Attend 5 min OU un déclenchement immédiat (reconnexion EMQX, etc.)
         _sync_requested.wait(timeout=300)
         _sync_requested.clear()
 
