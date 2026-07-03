@@ -1261,8 +1261,8 @@ _mqtt_broker_checked = False          # flag one-shot pour _check_and_fix_mqtt_b
 
 def _check_and_fix_mqtt_broker():
     """Vérifie que l'intégration MQTT HA pointe sur Mosquitto local.
-    Lit core.config_entries pour obtenir le broker réel (pas de WebSocket public pour ça).
-    Si le broker est EMQX ou autre, supprime l'entrée et reconfigure vers Mosquitto.
+    Lit core.config_entries pour obtenir le broker réel.
+    Si EMQX ou autre → modifie directement le fichier storage + restart HA Core.
     Appelé une seule fois au démarrage du service bridge."""
     global _mqtt_broker_checked
     if _mqtt_broker_checked:
@@ -1287,31 +1287,51 @@ def _check_and_fix_mqtt_broker():
         return
 
     for entry in mqtt_entries:
-        data    = entry.get("data", {})
-        broker  = str(data.get("broker") or data.get("host") or "").strip()
-        port    = int(data.get("port") or 1883)
-        eid     = entry.get("entry_id", "")
-        state   = entry.get("state", "?")
+        data   = entry.get("data", {})
+        broker = str(data.get("broker") or data.get("host") or "").strip()
+        port   = int(data.get("port") or 1883)
+        state  = entry.get("state", "?")
         log(f"[mqtt-check] HA MQTT : broker={broker!r} port={port} state={state}")
 
         is_mosquitto = (
             "mosquitto" in broker.lower()
             or broker in ("127.0.0.1", "localhost", "")
-            or (port == 1883 and (not broker or EMQX_HOST not in broker))
+            or (port == 1883 and EMQX_HOST not in broker)
         )
 
         if is_mosquitto:
-            log("[mqtt-check] ✓ Mosquitto local confirmé — Z2M discovery devrait fonctionner")
+            log("[mqtt-check] ✓ Mosquitto local confirmé — Z2M discovery OK")
         else:
-            warn(f"[mqtt-check] ⚠ HA MQTT sur {broker!r}:{port} ≠ Mosquitto → suppression + reconfiguration")
-            # Supprimer l'entrée incorrecte via WebSocket HA
-            if eid:
-                del_res = _ha_ws_call("config_entries/delete", entry_id=eid)
-                log(f"[mqtt-check] Suppression : {del_res}")
-                time.sleep(4)
-            configure_mqtt(force=True)
-            log("[mqtt-check] ✓ MQTT reconfiguré → attente 10s pour Z2M discovery + traitement HA")
-            time.sleep(10)
+            warn(f"[mqtt-check] ⚠ MQTT sur {broker!r}:{port} (EMQX) → correction storage + restart HA")
+            # Modifier l'entrée directement dans le fichier storage (homeassistant_config:rw)
+            entry["data"] = {
+                "broker":   "core-mosquitto",
+                "port":     1883,
+                "username": MOSQUITTO_USER,
+                "password": MOSQUITTO_PASS,
+            }
+            # S'assurer que la discovery est activée dans les options
+            opts = entry.setdefault("options", {})
+            opts["discovery"]        = True
+            opts["discovery_prefix"] = "homeassistant"
+            try:
+                with open(storage_path, "w") as f:
+                    json.dump(storage, f, indent=4)
+                log("[mqtt-check] ✓ core.config_entries corrigé → core-mosquitto:1883")
+            except Exception as e:
+                warn(f"[mqtt-check] Erreur écriture storage : {e}")
+                break
+            # Restart HA Core pour appliquer (notre add-on continue de tourner)
+            log("[mqtt-check] Restart HA Core pour appliquer le broker Mosquitto…")
+            try:
+                r = requests.post(
+                    f"{SUP}/homeassistant/restart",
+                    headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+                    timeout=60,
+                )
+                log(f"[mqtt-check] Restart HA : {r.status_code} — Z2M discovery sera active au redémarrage")
+            except Exception as e:
+                warn(f"[mqtt-check] Erreur restart HA : {e}")
         break
 
 
