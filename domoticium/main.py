@@ -1236,6 +1236,75 @@ def handle_matter_commission(client, msg):
 
 _z2m_online: bool | None = None  # état Z2M courant, None = inconnu
 
+# ── Sync omnipresente App → HA ────────────────────────────────────────────────
+_sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: reconnexion)
+_first_connect   = True               # distingue démarrage initial vs reconnexion
+
+
+def _sync_all_to_ha():
+    """Récupère l'état complet depuis l'app et l'applique à HA (idempotent)."""
+    auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
+    try:
+        r = requests.get(
+            f"{APP_URL}/api/webhooks/pi/sync-state?siteId={SITE_PREFIX}",
+            headers={"Authorization": f"Basic {auth}"},
+            timeout=15,
+        )
+        if not r.ok:
+            warn(f"[sync] sync-state HTTP {r.status_code}: {r.text[:100]}")
+            return
+        state = r.json()
+    except Exception as e:
+        warn(f"[sync] Impossible de récupérer sync-state: {e}")
+        return
+
+    rooms   = state.get("rooms", [])
+    devices = state.get("device_assignments", [])
+    scenes  = state.get("scene_commands", [])
+    autos   = state.get("automation_commands", [])
+
+    # 1. Areas HA (idempotent — create_area ne touche pas une area existante)
+    for room in rooms:
+        _handle_ha_command(json.dumps({"type": "create_area", "name": room["name"]}).encode())
+
+    # 2. Assignation devices → areas
+    for d in devices:
+        _handle_ha_command(json.dumps({
+            "type":         "set_device_area",
+            "ieee_address": d.get("ieee_address"),
+            "entity_id":    d.get("ha_entity_id"),
+            "area_name":    d["area_name"],
+        }).encode())
+
+    # 3. Scènes → scripts HA (upsert idempotent)
+    for scene in scenes:
+        _handle_ha_command(json.dumps(scene).encode())
+
+    # 4. Automations → automations HA (upsert idempotent)
+    for auto in autos:
+        _handle_ha_command(json.dumps(auto).encode())
+
+    # 5. Demander à Z2M de republier bridge/devices → déclenche devices-sync webhook
+    #    → met à jour vendor/model/features/z2m_name en DB sans redémarrer Z2M
+    if _local_client:
+        _local_client.publish("zigbee2mqtt/bridge/request/devices", "", qos=1)
+
+    log(f"[sync] ✓ {len(rooms)} pièces · {len(devices)} assignations · {len(scenes)} scènes · {len(autos)} automations")
+
+
+def _ha_sync_loop():
+    """Thread de fond : synchronise l'app avec HA toutes les 5 minutes.
+    Se déclenche immédiatement sur reconnexion EMQX (via _sync_requested)."""
+    time.sleep(90)  # attente initiale : HA + EMQX + Z2M ont le temps de démarrer
+    while True:
+        try:
+            _sync_all_to_ha()
+        except Exception as e:
+            warn(f"[sync] Erreur : {e}")
+        # Attend 5 min OU un déclenchement immédiat (reconnexion, etc.)
+        _sync_requested.wait(timeout=300)
+        _sync_requested.clear()
+
 
 def call_heartbeat_api():
     """Envoie le heartbeat (+ état Z2M courant) au webhook API."""
@@ -1257,6 +1326,7 @@ def call_heartbeat_api():
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
+    global _first_connect
     if reason_code.is_failure:
         warn(f"[cloud] Connexion EMQX échouée ({reason_code})")
         return
@@ -1271,6 +1341,17 @@ def on_connect(client, userdata, flags, reason_code, properties):
     ]
     client.subscribe(topics)
     log(f"[cloud] Connecté EMQX — souscrit à {p}/zigbee2mqtt/+/set|get, bridge/request/+, /cameras/+/configure, /matter/+, /ha/command")
+
+    # Sur reconnexion (pas au premier démarrage), déclencher un sync immédiat
+    # pour rattraper les changements faits pendant la déconnexion.
+    if _first_connect:
+        _first_connect = False
+    else:
+        log("[sync] Reconnexion EMQX détectée — sync immédiate dans 10s")
+        def _delayed_sync():
+            time.sleep(10)
+            _sync_requested.set()
+        threading.Thread(target=_delayed_sync, daemon=True).start()
 
 
 def on_message(client, userdata, msg):
@@ -1617,6 +1698,7 @@ def run_bridge():
     _load_cameras()
     start_cloudflared()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    threading.Thread(target=_ha_sync_loop,   daemon=True).start()
     threading.Thread(target=run_local_bridge, daemon=True).start()
 
     _cloud_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-cloud-bridge", clean_session=True)
