@@ -1934,8 +1934,9 @@ def _ensure_matter_server():
         log("[matter] Open Thread Border Router absent — installation automatique…")
         install_thread_border_router()
     elif not _is_addon_running(THREAD_SLUG):
-        log("[matter] OTBR installé mais arrêté — démarrage…")
-        _start_addon(THREAD_SLUG, "Open Thread Border Router")
+        # Reconfigure les options ET redémarre (start seul échoue si options invalides)
+        log("[matter] OTBR installé mais arrêté — reconfiguration et démarrage…")
+        install_thread_border_router()
     else:
         log("[matter] Open Thread Border Router en cours d'exécution ✓")
 
