@@ -1,1 +1,32 @@
+# Addon repo — seul domoticium/ est versionné
+# Tout le reste (web app, pi-ha, docs, logos…) est ignoré
+
+# Dossiers du projet hors addon
+web/
+pi-ha/
+pi/
+pi-deploy/
+vps/
+domoticium-app/
+.claude/
+
+# Fichiers système / éditeurs
+.DS_Store
+*.command
+*.docx
+*.png
+
+# Fichiers de config locale
+.env.local
+settings.local.json
 .vercel
+
+# Documentation commerciale / logos
+COMMERCIAL.md
+DOMOTICIUM_DESIGN_PHILOSOPHY.md
+LOGOS_COMMERCIAUX_GUIDE.md
+LOGO_CONCEPTS_GUIDE.md
+SUPERVISION_OPTIMISEE.md
+Admin_vs_Technicien_Domotique.md
+domoticium_logo_philosophy.md
+CLAUDE.md
