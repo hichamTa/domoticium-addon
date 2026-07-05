@@ -527,7 +527,18 @@ def install_thread_border_router():
             log(f"✓ Configuration Thread Border Router ({device_label}) [{label}]")
             options_ok = True
             break
-        warn(f"[OTBR] {label} → {r.status_code}: {r.text[:200]}")
+        err_text = r.text[:300]
+        # OTBR valide les devices contre le matériel Thread physiquement présent.
+        # socket:// n'est pas accepté — il faut un dongle USB Thread branché sur la machine HA.
+        if "does not exist in OpenThread Border Router" in err_text:
+            warn(
+                f"[OTBR] Le device '{device_label}' n'est pas reconnu par OTBR.\n"
+                f"       OTBR n'accepte que les dongles USB Thread branchés localement.\n"
+                f"       Matter over WiFi/Ethernet fonctionne sans OTBR.\n"
+                f"       Pour Matter over Thread : brancher un dongle USB Thread sur la machine HA."
+            )
+            return
+        warn(f"[OTBR] {label} → {r.status_code}: {err_text}")
 
     if not options_ok:
         warn(f"✗ Impossible de configurer OTBR via Supervisor API — device={device_label}")
