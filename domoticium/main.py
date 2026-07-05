@@ -1119,11 +1119,9 @@ def run_setup():
     # 4. Supprimer l'ancien discovery_prefix non-standard (migration v1.5 → v1.6)
     remove_legacy_mqtt_discovery_prefix()
 
-    # À valider après Zigbee2MQTT
-    # install_matter_server()
-    # if INSTALL_THREAD_ROUTER:
-    #     install_thread_border_router()
-    # install_frigate()
+    install_matter_server()
+    install_thread_border_router()
+    # install_frigate()  — caméras via go2rtc addon HA
     create_automations()
     write_rest_commands()
 
@@ -1232,7 +1230,15 @@ def handle_matter_commission(client, msg):
                 # La sync Matter se fera via un futur endpoint HA Matter API.
             else:
                 try:
-                    err_msg = resp.json().get("message", f"HTTP {resp.status_code}")
+                    body = resp.json()
+                    err_msg = (
+                        body.get("message")
+                        or body.get("description")
+                        or body.get("code")
+                        or f"HTTP {resp.status_code}"
+                    )
+                    if resp.status_code in (400, 404) and not body.get("message"):
+                        err_msg = "Service Matter introuvable dans HA — Matter Server démarré ?"
                 except Exception:
                     err_msg = f"HTTP {resp.status_code}"
                 warn(f"Matter commission {resp.status_code}: {resp.text[:200]}")
@@ -1891,10 +1897,27 @@ def run_local_bridge():
             time.sleep(10)
 
 
+def _ensure_matter_server():
+    """Installe Matter Server + OTBR s'ils sont absents — toujours, sans option de config."""
+    if not _is_addon_installed(MATTER_SLUG):
+        log("[matter] Matter Server absent — installation automatique…")
+        install_matter_server()
+    else:
+        log("[matter] Matter Server déjà installé ✓")
+
+    if not _is_addon_installed(THREAD_SLUG):
+        log("[matter] Open Thread Border Router absent — installation automatique…")
+        install_thread_border_router()
+    else:
+        log("[matter] Open Thread Border Router déjà installé ✓")
+
+
 def run_bridge():
     global _cloud_client
     _load_cameras()
     start_cloudflared()
+    # Installe Matter Server si absent (ex : setup fait avant activation Matter)
+    threading.Thread(target=_ensure_matter_server, daemon=True).start()
     # Vérification broker MQTT HA en arrière-plan (ne bloque pas le démarrage)
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
