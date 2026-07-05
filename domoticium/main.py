@@ -495,6 +495,7 @@ def install_thread_border_router():
 
     # Lire le schéma réel + options actuelles pour diagnostiquer les formats acceptés
     schema_keys = None
+    otbr_device_options = []  # valeurs autorisées pour le champ 'device'
     try:
         info = sup_get(f"/addons/{THREAD_SLUG}/info")
         if info.ok:
@@ -503,11 +504,21 @@ def install_thread_border_router():
                 data = data.get("data", data)
             schema = data.get("schema", {})
             options_current = data.get("options", {})
-            log(f"[OTBR] Schéma brut : {str(schema)[:400]}")
+            log(f"[OTBR] Schéma complet : {str(schema)[:2000]}")
             log(f"[OTBR] Options actuelles : {options_current}")
-            if isinstance(schema, dict) and schema:
-                schema_keys = set(schema.keys())
+            # Le schema OTBR est une liste de champs, pas un dict
+            if isinstance(schema, list):
+                schema_keys = set()
+                for field in schema:
+                    if isinstance(field, dict) and field.get("name"):
+                        fname = field["name"]
+                        schema_keys.add(fname)
+                        if fname == "device" and isinstance(field.get("options"), list):
+                            otbr_device_options = field["options"]
                 log(f"[OTBR] Champs schema : {sorted(schema_keys)}")
+                log(f"[OTBR] Devices autorisés : {otbr_device_options}")
+            elif isinstance(schema, dict) and schema:
+                schema_keys = set(schema.keys())
     except Exception as e:
         warn(f"[OTBR] Lecture schéma : {e}")
 
@@ -517,7 +528,16 @@ def install_thread_border_router():
     else:
         filtered = base_options
 
-    # Tentatives avec plusieurs formats de device_label
+    # Si le schema liste des devices autorisés et que socket:// n'en fait pas partie,
+    # OTBR ne supporte pas les coordinateurs réseau via l'API Supervisor.
+    if otbr_device_options and device_label not in otbr_device_options:
+        warn(
+            f"[OTBR] Le device '{device_label}' n'est pas dans les options autorisées : {otbr_device_options}\n"
+            f"       Le schéma OTBR ne liste que des ports série locaux.\n"
+            f"       Vérification si un champ réseau existe dans le schéma : {sorted(schema_keys or [])}"
+        )
+        # Continuer quand même avec les tentatives — peut-être qu'un autre champ du schema accepte le réseau
+
     spinel_label = f"spinel+hdlc+uart://{device_label}" if device_label.startswith("socket://") else device_label
     attempts = [
         ("options filtrées",    {"options": filtered}),
