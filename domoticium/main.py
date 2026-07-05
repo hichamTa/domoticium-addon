@@ -468,10 +468,11 @@ def install_thread_border_router():
         log("Open Thread Border Router déjà installé")
 
     if NETWORK_MODE:
-        network_device = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
-        device_label = network_device
-        log(f"Mode réseau PoE — coordinateur Thread : {network_device}")
-        # network_device = champ OTBR pour coordinateurs réseau (string libre)
+        # socat attend TCP:<host>:<port> — pas socket://host:port
+        network_device = f"{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
+        device_label = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
+        log(f"Mode réseau PoE — coordinateur Thread : {device_label} (network_device={network_device})")
+        # network_device = champ OTBR pour coordinateurs réseau (string libre, passé à socat)
         # device = port série requis par le schema, mis à /dev/ttyS0 par défaut (inutilisé en réseau)
         base_options = {
             "network_device": network_device,
