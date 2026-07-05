@@ -568,21 +568,33 @@ def install_thread_border_router():
     else:
         warn(f"✗ {r.status_code} Thread Border Router restart : {r.text[:150]}")
 
-    time.sleep(3)
+    time.sleep(5)
     flow = ha_post("/config/config_entries/flow", {"handler": "otbr"})
+    log(f"[OTBR] flow init → {flow.status_code}: {flow.text[:400]}")
     if flow.ok:
         result = flow.json()
-        if result.get("type") == "create_entry":
+        flow_type = result.get("type")
+        flow_id   = result.get("flow_id")
+        step_id   = result.get("step_id")
+        if flow_type == "create_entry":
             log("✓ Intégration OTBR (Thread) activée dans HA")
-        elif result.get("flow_id"):
+        elif flow_id:
+            # Selon le step, soumettre l'URL de l'API OTBR (port 8081 par défaut)
+            step_payload: dict = {}
+            if step_id in ("user", None) or "url" in str(result.get("data_schema", "")):
+                step_payload = {"url": "http://localhost:8081"}
+            log(f"[OTBR] step_id={step_id!r} → payload={step_payload}")
             r2 = requests.post(
-                f"{API}/config/config_entries/flow/{result['flow_id']}",
-                headers=HDRS, json={}, timeout=10
+                f"{API}/config/config_entries/flow/{flow_id}",
+                headers=HDRS, json=step_payload, timeout=10
             )
-            mark = "✓" if r2.ok else "? (à valider dans HA)"
-            log(f"{mark} Intégration OTBR (Thread)")
+            log(f"[OTBR] flow step → {r2.status_code}: {r2.text[:400]}")
+            if r2.ok and r2.json().get("type") == "create_entry":
+                log("✓ Intégration OTBR (Thread) activée dans HA")
+            else:
+                warn(f"[OTBR] Intégration non finalisée — {r2.status_code}: {r2.text[:200]}")
     else:
-        log("Intégration Thread : à activer si besoin dans Paramètres → Intégrations")
+        log(f"[OTBR] Flow non démarré ({flow.status_code}) — intégration déjà active ou à vérifier")
 
 
 def _detect_thread_adapter():
