@@ -1897,19 +1897,47 @@ def run_local_bridge():
             time.sleep(10)
 
 
+def _is_addon_running(slug: str) -> bool:
+    """Retourne True si l'addon est installé ET en état 'started'."""
+    try:
+        r = sup_get(f"/addons/{slug}/info")
+        if not r.ok:
+            return False
+        body = r.json()
+        data = body.get("data", body) if isinstance(body, dict) else {}
+        return data.get("state") == "started"
+    except Exception:
+        return False
+
+
+def _start_addon(slug: str, label: str) -> None:
+    """Démarre un addon arrêté via l'API Supervisor."""
+    r = sup_post(f"/addons/{slug}/start")
+    if r.ok:
+        log(f"[matter] {label} démarré ✓")
+    else:
+        warn(f"[matter] Impossible de démarrer {label}: {r.status_code} {r.text[:100]}")
+
+
 def _ensure_matter_server():
-    """Installe Matter Server + OTBR s'ils sont absents — toujours, sans option de config."""
+    """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
         log("[matter] Matter Server absent — installation automatique…")
         install_matter_server()
+    elif not _is_addon_running(MATTER_SLUG):
+        log("[matter] Matter Server installé mais arrêté — démarrage…")
+        _start_addon(MATTER_SLUG, "Matter Server")
     else:
-        log("[matter] Matter Server déjà installé ✓")
+        log("[matter] Matter Server en cours d'exécution ✓")
 
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
         install_thread_border_router()
+    elif not _is_addon_running(THREAD_SLUG):
+        log("[matter] OTBR installé mais arrêté — démarrage…")
+        _start_addon(THREAD_SLUG, "Open Thread Border Router")
     else:
-        log("[matter] Open Thread Border Router déjà installé ✓")
+        log("[matter] Open Thread Border Router en cours d'exécution ✓")
 
 
 def run_bridge():
