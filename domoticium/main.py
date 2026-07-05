@@ -1975,12 +1975,29 @@ def _ensure_matter_server():
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
         install_thread_border_router()
-    elif not _is_addon_running(THREAD_SLUG):
-        # Reconfigure les options ET redémarre (start seul échoue si options invalides)
-        log("[matter] OTBR installé mais arrêté — reconfiguration et démarrage…")
-        install_thread_border_router()
     else:
-        log("[matter] Open Thread Border Router en cours d'exécution ✓")
+        # Vérifier que les options actuelles sont correctes (network_device peut être périmé)
+        needs_reconfig = not _is_addon_running(THREAD_SLUG)
+        if NETWORK_MODE and not needs_reconfig:
+            try:
+                info = sup_get(f"/addons/{THREAD_SLUG}/info")
+                if info.ok:
+                    data = info.json()
+                    if isinstance(data, dict):
+                        data = data.get("data", data)
+                    current_nd = data.get("options", {}).get("network_device", "")
+                    expected_nd = f"{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
+                    if current_nd != expected_nd:
+                        log(f"[matter] OTBR network_device incorrect ({current_nd!r} → {expected_nd!r}) — reconfiguration…")
+                        needs_reconfig = True
+            except Exception as e:
+                warn(f"[matter] Lecture options OTBR : {e}")
+
+        if needs_reconfig:
+            log("[matter] OTBR — reconfiguration et redémarrage…")
+            install_thread_border_router()
+        else:
+            log("[matter] Open Thread Border Router en cours d'exécution ✓")
 
 
 def run_bridge():
