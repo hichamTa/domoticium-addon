@@ -493,7 +493,7 @@ def install_thread_border_router():
             "autoflash_firmware": True,
         }
 
-    # Lire le schéma réel pour n'envoyer que les champs acceptés par cette version
+    # Lire le schéma réel + options actuelles pour diagnostiquer les formats acceptés
     schema_keys = None
     try:
         info = sup_get(f"/addons/{THREAD_SLUG}/info")
@@ -502,9 +502,12 @@ def install_thread_border_router():
             if isinstance(data, dict):
                 data = data.get("data", data)
             schema = data.get("schema", {})
+            options_current = data.get("options", {})
+            log(f"[OTBR] Schéma brut : {str(schema)[:400]}")
+            log(f"[OTBR] Options actuelles : {options_current}")
             if isinstance(schema, dict) and schema:
                 schema_keys = set(schema.keys())
-                log(f"[OTBR] Schéma : {sorted(schema_keys)}")
+                log(f"[OTBR] Champs schema : {sorted(schema_keys)}")
     except Exception as e:
         warn(f"[OTBR] Lecture schéma : {e}")
 
@@ -514,11 +517,13 @@ def install_thread_border_router():
     else:
         filtered = base_options
 
-    # 3 tentatives : schéma filtré → device seul → options à plat (sans wrapper)
+    # Tentatives avec plusieurs formats de device_label
+    spinel_label = f"spinel+hdlc+uart://{device_label}" if device_label.startswith("socket://") else device_label
     attempts = [
-        ("options filtrées", {"options": filtered}),
-        ("device seul",      {"options": {"device": device_label}}),
-        ("sans wrapper",     base_options),
+        ("options filtrées",    {"options": filtered}),
+        ("spinel+hdlc+uart://", {"options": {"device": spinel_label}}),
+        ("device seul",         {"options": {"device": device_label}}),
+        ("sans wrapper",        base_options),
     ]
     options_ok = False
     for label, body in attempts:
@@ -527,17 +532,7 @@ def install_thread_border_router():
             log(f"✓ Configuration Thread Border Router ({device_label}) [{label}]")
             options_ok = True
             break
-        err_text = r.text[:300]
-        # OTBR valide les devices contre le matériel Thread physiquement présent.
-        # socket:// n'est pas accepté — il faut un dongle USB Thread branché sur la machine HA.
-        if "does not exist in OpenThread Border Router" in err_text:
-            warn(
-                f"[OTBR] Le device '{device_label}' n'est pas reconnu par OTBR.\n"
-                f"       OTBR n'accepte que les dongles USB Thread branchés localement.\n"
-                f"       Matter over WiFi/Ethernet fonctionne sans OTBR.\n"
-                f"       Pour Matter over Thread : brancher un dongle USB Thread sur la machine HA."
-            )
-            return
+        err_text = r.text[:600]
         warn(f"[OTBR] {label} → {r.status_code}: {err_text}")
 
     if not options_ok:
