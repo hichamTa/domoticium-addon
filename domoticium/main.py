@@ -468,13 +468,19 @@ def install_thread_border_router():
         log("Open Thread Border Router déjà installé")
 
     if NETWORK_MODE:
-        device_label = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
-        log(f"Mode réseau PoE — coordinateur Thread : {device_label}")
+        network_device = f"socket://{COORDINATOR_HOST}:{COORDINATOR_THREAD_PORT}"
+        device_label = network_device
+        log(f"Mode réseau PoE — coordinateur Thread : {network_device}")
+        # network_device = champ OTBR pour coordinateurs réseau (string libre)
+        # device = port série requis par le schema, mis à /dev/ttyS0 par défaut (inutilisé en réseau)
         base_options = {
-            "device": device_label,
-            "baudrate": 460800,
+            "network_device": network_device,
+            "device": "/dev/ttyS0",
+            "baudrate": "460800",
             "flow_control": False,
-            "autoflash_firmware": False,
+            "firewall": True,
+            "nat64": False,
+            "otbr_log_level": "notice",
         }
     else:
         thread_port = THREAD_ADAPTER
@@ -536,14 +542,11 @@ def install_thread_border_router():
             f"       Le schéma OTBR ne liste que des ports série locaux.\n"
             f"       Vérification si un champ réseau existe dans le schéma : {sorted(schema_keys or [])}"
         )
-        # Continuer quand même avec les tentatives — peut-être qu'un autre champ du schema accepte le réseau
+        pass  # on continue avec les tentatives
 
-    spinel_label = f"spinel+hdlc+uart://{device_label}" if device_label.startswith("socket://") else device_label
     attempts = [
-        ("options filtrées",    {"options": filtered}),
-        ("spinel+hdlc+uart://", {"options": {"device": spinel_label}}),
-        ("device seul",         {"options": {"device": device_label}}),
-        ("sans wrapper",        base_options),
+        ("network_device + device=/dev/ttyS0", {"options": filtered}),
+        ("network_device seul",                {"options": {"network_device": device_label}}),
     ]
     options_ok = False
     for label, body in attempts:
