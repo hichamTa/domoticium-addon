@@ -1247,9 +1247,96 @@ def handle_camera_configure(client, msg):
         warn(f"Camera configure: {e}")
 
 
+def _matter_commission_ws(code: str, timeout_s: int = 120):
+    """Commission via HA WebSocket matter/commission_with_code.
+    En HA 2025+, cette commande n'est plus un service REST.
+    Retourne (success: bool, detail: str).
+    """
+    s = None
+    try:
+        s = socket.create_connection(("supervisor", 80), timeout=30)
+        key = base64.b64encode(os.urandom(16)).decode()
+        s.sendall((
+            "GET /core/websocket HTTP/1.1\r\nHost: supervisor\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            resp += s.recv(1)
+        if b"101" not in resp:
+            return False, f"WS handshake échoué: {resp[:60]}"
+
+        s.settimeout(timeout_s)
+
+        def _recv():
+            while True:
+                h = _ws_recv_exact(s, 2)
+                opcode = h[0] & 0x0F
+                length = h[1] & 0x7F
+                if length == 126:
+                    length = struct.unpack(">H", _ws_recv_exact(s, 2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", _ws_recv_exact(s, 8))[0]
+                mask_bit = h[1] & 0x80
+                if mask_bit:
+                    mask_b = _ws_recv_exact(s, 4)
+                raw = _ws_recv_exact(s, length)
+                if mask_bit:
+                    raw = bytes(b ^ mask_b[i % 4] for i, b in enumerate(raw))
+                if opcode == 0x09:
+                    s.sendall(bytes([0x8A, 0x80, 0, 0, 0, 0]))
+                    continue
+                if opcode == 0x08:
+                    raise ConnectionError("WS close frame")
+                return json.loads(raw.decode())
+
+        def _send(data: dict):
+            payload = json.dumps(data).encode()
+            msk = os.urandom(4)
+            masked = bytes(b ^ msk[i % 4] for i, b in enumerate(payload))
+            n = len(payload)
+            if n < 126:
+                hdr = bytes([0x81, 0x80 | n])
+            elif n < 65536:
+                hdr = bytes([0x81, 0xFE]) + struct.pack(">H", n)
+            else:
+                hdr = bytes([0x81, 0xFF]) + struct.pack(">Q", n)
+            s.sendall(hdr + msk + masked)
+
+        # Auth HA
+        if _recv().get("type") != "auth_required":
+            return False, "auth_required non reçu"
+        _send({"type": "auth", "access_token": SUPERVISOR_TOKEN})
+        if _recv().get("type") != "auth_ok":
+            return False, "Auth WS échouée"
+
+        # Commission
+        _send({"id": 1, "type": "matter/commission_with_code", "code": code})
+        log("[matter-ws] Commande envoyée — attente du résultat (max 120s)…")
+        while True:
+            msg = _recv()
+            if msg.get("id") == 1 and msg.get("type") == "result":
+                if msg.get("success"):
+                    return True, str(msg.get("result", ""))
+                err = msg.get("error", {})
+                return False, f"{err.get('code','?')}: {err.get('message', str(err))}"
+
+    except socket.timeout:
+        return False, f"Timeout {timeout_s}s — device introuvable ou hors portée"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
 def handle_matter_commission(client, msg):
     """
-    Commissionne un device Matter via HA.
+    Commissionne un device Matter via HA WebSocket.
     Topic   : {prefix}/matter/commission/start
     Payload : {"requestId": "...", "code": "12345678"}
     """
@@ -1263,41 +1350,18 @@ def handle_matter_commission(client, msg):
                 raise ValueError("Code PIN manquant")
 
             log(f"Matter commission {(request_id or '?')[:8]}… code={code}")
-
-            # Diagnostic : lister les services Matter disponibles dans HA
-            try:
-                svc_r = ha_get("/services")
-                if svc_r.ok:
-                    for dom in svc_r.json():
-                        if dom.get("domain") == "matter":
-                            matter_services = list(dom.get("services", {}).keys())
-                            log(f"[matter] Services HA disponibles: {matter_services}")
-                            break
-                    else:
-                        warn("[matter] Domain 'matter' absent de /api/services")
-            except Exception as e:
-                warn(f"[matter] diagnostic services: {e}")
-
-            resp = ha_post("/services/matter/commission_with_code", {"code": code})
-
+            success, detail = _matter_commission_ws(code)
             result_topic = f"{SITE_PREFIX}/matter/commission/status/{request_id}"
-            if resp.status_code in (200, 201, 204):
-                log("✓ Matter commission réussie")
+            if success:
+                log(f"✓ Matter commission réussie — node={detail}")
                 client.publish(result_topic,
                                json.dumps({"requestId": request_id, "success": True}),
                                qos=1)
             else:
-                # Log complet pour diagnostic
-                warn(f"Matter commission {resp.status_code}: headers={dict(resp.headers)} body={resp.text[:500]}")
-                try:
-                    body = resp.json()
-                    err_msg = (body.get("message") or body.get("description")
-                               or body.get("code") or f"HTTP {resp.status_code}")
-                except Exception:
-                    err_msg = f"HTTP {resp.status_code}"
+                warn(f"Matter commission échouée: {detail}")
                 client.publish(result_topic,
                                json.dumps({"requestId": request_id, "success": False,
-                                           "error": err_msg}),
+                                           "error": detail}),
                                qos=1)
         except Exception as exc:
             warn(f"Matter commission: {exc}")
