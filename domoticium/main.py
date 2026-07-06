@@ -1966,26 +1966,43 @@ def _start_addon(slug: str, label: str) -> None:
 
 def _ensure_matter_integration():
     """S'assure que l'intégration Matter est enregistrée dans HA (config entry).
-    Crée le config entry si absent — sans lui, matter.commission_with_code n'existe pas.
-    Si déjà configuré, HA retourne type=abort reason=single_instance_allowed (sans effet).
+    Le flow Matter sur Supervisor a 2 étapes :
+      1. POST {"handler":"matter"} → type=form, step_id=on_supervisor
+      2. POST {"use_addon":true}   → type=create_entry
+    Si déjà configuré → type=abort reason=single_instance_allowed (idempotent).
     """
-    try:
-        flow = ha_post("/config/config_entries/flow", {"handler": "matter"})
-        if not flow.ok:
-            warn(f"[matter] Intégration Matter flow: {flow.status_code} {flow.text[:100]}")
-            return
-        result = flow.json()
-        ftype  = result.get("type")
+    def _handle_result(result, step):
+        ftype = result.get("type")
         if ftype == "create_entry":
             log("[matter] ✓ Intégration Matter activée dans HA")
-        elif ftype == "abort":
+            return True
+        if ftype == "abort":
             reason = result.get("reason", "?")
             if reason in ("single_instance_allowed", "already_configured"):
                 log("[matter] ✓ Intégration Matter déjà configurée")
             else:
-                warn(f"[matter] Intégration Matter flow abort: {reason}")
-        else:
-            log(f"[matter] Intégration Matter flow: type={ftype} {result}")
+                warn(f"[matter] Intégration Matter abort (step {step}): {reason}")
+            return True
+        return False  # besoin d'une autre étape
+
+    try:
+        r1 = ha_post("/config/config_entries/flow", {"handler": "matter"})
+        if not r1.ok:
+            warn(f"[matter] Intégration Matter step1: {r1.status_code} {r1.text[:100]}")
+            return
+        res1 = r1.json()
+        if _handle_result(res1, 1):
+            return
+
+        # Étape on_supervisor : HA demande "use_addon" (booléen, défaut True)
+        flow_id  = res1.get("flow_id")
+        step_id  = res1.get("step_id", "?")
+        log(f"[matter] Intégration Matter étape '{step_id}' → soumission use_addon=true")
+        r2 = ha_post(f"/config/config_entries/flow/{flow_id}", {"use_addon": True})
+        if not r2.ok:
+            warn(f"[matter] Intégration Matter step2: {r2.status_code} {r2.text[:100]}")
+            return
+        _handle_result(r2.json(), 2)
     except Exception as e:
         warn(f"[matter] _ensure_matter_integration: {e}")
 
