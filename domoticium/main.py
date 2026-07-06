@@ -1247,17 +1247,58 @@ def handle_camera_configure(client, msg):
         warn(f"Camera configure: {e}")
 
 
+def _matter_ws_frames(s):
+    """Retourne (recv, send) pour un WebSocket déjà handshake."""
+    def _recv():
+        while True:
+            h = _ws_recv_exact(s, 2)
+            opcode = h[0] & 0x0F
+            length = h[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", _ws_recv_exact(s, 2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", _ws_recv_exact(s, 8))[0]
+            mask_bit = h[1] & 0x80
+            if mask_bit:
+                mask_b = _ws_recv_exact(s, 4)
+            raw = _ws_recv_exact(s, length)
+            if mask_bit:
+                raw = bytes(b ^ mask_b[i % 4] for i, b in enumerate(raw))
+            if opcode == 0x09:   # ping → pong
+                s.sendall(bytes([0x8A, 0x80, 0, 0, 0, 0]))
+                continue
+            if opcode == 0x08:
+                raise ConnectionError("WS close frame")
+            return json.loads(raw.decode())
+
+    def _send(data: dict):
+        payload = json.dumps(data).encode()
+        msk = os.urandom(4)
+        masked = bytes(b ^ msk[i % 4] for i, b in enumerate(payload))
+        n = len(payload)
+        if n < 126:
+            hdr = bytes([0x81, 0x80 | n])
+        elif n < 65536:
+            hdr = bytes([0x81, 0xFE]) + struct.pack(">H", n)
+        else:
+            hdr = bytes([0x81, 0xFF]) + struct.pack(">Q", n)
+        s.sendall(hdr + msk + masked)
+
+    return _recv, _send
+
+
 def _matter_commission_ws(code: str, timeout_s: int = 120):
-    """Commission via HA WebSocket matter/commission_with_code.
-    En HA 2025+, cette commande n'est plus un service REST.
+    """Commission via python-matter-server WebSocket direct (port 5580).
+    HA 2026+ : ni REST ni HA WebSocket ne fonctionnent pour le commissioning.
+    python-matter-server écoute sur localhost:5580/ws (host_network=true).
     Retourne (success: bool, detail: str).
     """
     s = None
     try:
-        s = socket.create_connection(("supervisor", 80), timeout=30)
+        s = socket.create_connection(("localhost", 5580), timeout=15)
         key = base64.b64encode(os.urandom(16)).decode()
         s.sendall((
-            "GET /core/websocket HTTP/1.1\r\nHost: supervisor\r\n"
+            "GET /ws HTTP/1.1\r\nHost: localhost:5580\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         ).encode())
@@ -1265,62 +1306,26 @@ def _matter_commission_ws(code: str, timeout_s: int = 120):
         while b"\r\n\r\n" not in resp:
             resp += s.recv(1)
         if b"101" not in resp:
-            return False, f"WS handshake échoué: {resp[:60]}"
+            return False, f"Matter Server WS handshake échoué: {resp[:80]}"
 
         s.settimeout(timeout_s)
+        _recv, _send = _matter_ws_frames(s)
 
-        def _recv():
-            while True:
-                h = _ws_recv_exact(s, 2)
-                opcode = h[0] & 0x0F
-                length = h[1] & 0x7F
-                if length == 126:
-                    length = struct.unpack(">H", _ws_recv_exact(s, 2))[0]
-                elif length == 127:
-                    length = struct.unpack(">Q", _ws_recv_exact(s, 8))[0]
-                mask_bit = h[1] & 0x80
-                if mask_bit:
-                    mask_b = _ws_recv_exact(s, 4)
-                raw = _ws_recv_exact(s, length)
-                if mask_bit:
-                    raw = bytes(b ^ mask_b[i % 4] for i, b in enumerate(raw))
-                if opcode == 0x09:
-                    s.sendall(bytes([0x8A, 0x80, 0, 0, 0, 0]))
-                    continue
-                if opcode == 0x08:
-                    raise ConnectionError("WS close frame")
-                return json.loads(raw.decode())
+        # python-matter-server envoie un message info à la connexion
+        info = _recv()
+        log(f"[matter-server] Connecté — schema={info.get('schema_version')} sdk={info.get('sdk_version')}")
 
-        def _send(data: dict):
-            payload = json.dumps(data).encode()
-            msk = os.urandom(4)
-            masked = bytes(b ^ msk[i % 4] for i, b in enumerate(payload))
-            n = len(payload)
-            if n < 126:
-                hdr = bytes([0x81, 0x80 | n])
-            elif n < 65536:
-                hdr = bytes([0x81, 0xFE]) + struct.pack(">H", n)
-            else:
-                hdr = bytes([0x81, 0xFF]) + struct.pack(">Q", n)
-            s.sendall(hdr + msk + masked)
+        msg_id = "commission-1"
+        _send({"message_id": msg_id, "command": "commission_with_code",
+               "args": {"code": code, "network_only": False}})
+        log("[matter-server] commission_with_code envoyé — attente résultat (max 120s)…")
 
-        # Auth HA
-        if _recv().get("type") != "auth_required":
-            return False, "auth_required non reçu"
-        _send({"type": "auth", "access_token": SUPERVISOR_TOKEN})
-        if _recv().get("type") != "auth_ok":
-            return False, "Auth WS échouée"
-
-        # Commission
-        _send({"id": 1, "type": "matter/commission_with_code", "code": code})
-        log("[matter-ws] Commande envoyée — attente du résultat (max 120s)…")
         while True:
             msg = _recv()
-            if msg.get("id") == 1 and msg.get("type") == "result":
-                if msg.get("success"):
-                    return True, str(msg.get("result", ""))
-                err = msg.get("error", {})
-                return False, f"{err.get('code','?')}: {err.get('message', str(err))}"
+            if msg.get("message_id") == msg_id:
+                if "error_code" in msg:
+                    return False, f"{msg['error_code']}: {msg.get('details', '')}"
+                return True, str(msg.get("result", ""))
 
     except socket.timeout:
         return False, f"Timeout {timeout_s}s — device introuvable ou hors portée"
@@ -1353,12 +1358,13 @@ def handle_matter_commission(client, msg):
             success, detail = _matter_commission_ws(code)
             result_topic = f"{SITE_PREFIX}/matter/commission/status/{request_id}"
             if success:
-                log(f"✓ Matter commission réussie — node={detail}")
+                log(f"✓ Matter commission réussie — node_id={detail}")
                 client.publish(result_topic,
-                               json.dumps({"requestId": request_id, "success": True}),
+                               json.dumps({"requestId": request_id, "success": True,
+                                           "nodeId": detail}),
                                qos=1)
             else:
-                warn(f"Matter commission échouée: {detail}")
+                warn(f"⚠ Matter commission échouée: {detail}")
                 client.publish(result_topic,
                                json.dumps({"requestId": request_id, "success": False,
                                            "error": detail}),
