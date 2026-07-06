@@ -83,6 +83,9 @@ def sup_post(path, data=None):
 def ha_post(path, data=None):
     return requests.post(f"{API}{path}", headers=HDRS, json=data or {}, timeout=15)
 
+def ha_get(path):
+    return requests.get(f"{API}{path}", headers=HDRS, timeout=15)
+
 
 # ── WebSocket HA (nécessaire pour area_registry / entity_registry / device_registry) ──
 # L'API REST HA n'expose pas ces registres ; seul le WebSocket les supporte.
@@ -1961,6 +1964,32 @@ def _start_addon(slug: str, label: str) -> None:
         warn(f"[matter] Impossible de démarrer {label}: {r.status_code} {r.text[:100]}")
 
 
+def _ensure_matter_integration():
+    """S'assure que l'intégration Matter est enregistrée dans HA (config entry).
+    Crée le config entry si absent — sans lui, matter.commission_with_code n'existe pas.
+    Si déjà configuré, HA retourne type=abort reason=single_instance_allowed (sans effet).
+    """
+    try:
+        flow = ha_post("/config/config_entries/flow", {"handler": "matter"})
+        if not flow.ok:
+            warn(f"[matter] Intégration Matter flow: {flow.status_code} {flow.text[:100]}")
+            return
+        result = flow.json()
+        ftype  = result.get("type")
+        if ftype == "create_entry":
+            log("[matter] ✓ Intégration Matter activée dans HA")
+        elif ftype == "abort":
+            reason = result.get("reason", "?")
+            if reason in ("single_instance_allowed", "already_configured"):
+                log("[matter] ✓ Intégration Matter déjà configurée")
+            else:
+                warn(f"[matter] Intégration Matter flow abort: {reason}")
+        else:
+            log(f"[matter] Intégration Matter flow: type={ftype} {result}")
+    except Exception as e:
+        warn(f"[matter] _ensure_matter_integration: {e}")
+
+
 def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
@@ -1971,6 +2000,9 @@ def _ensure_matter_server():
         _start_addon(MATTER_SLUG, "Matter Server")
     else:
         log("[matter] Matter Server en cours d'exécution ✓")
+    # Même si Matter Server tourne déjà, le config entry HA peut être absent
+    # (premier démarrage où l'addon était déjà installé → install_matter_server() skippé)
+    _ensure_matter_integration()
 
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
