@@ -2094,6 +2094,89 @@ def _ensure_matter_integration():
         warn(f"[matter] _ensure_matter_integration: {e}")
 
 
+def _ensure_esphome_bluetooth_proxy():
+    """Ajoute le coordinateur SLZB comme ESPHome BLE proxy dans HA.
+
+    Déclenché uniquement si le SLZB a été flashé avec le firmware ESPHome
+    (port 6053 ouvert). Si le firmware SLZB original tourne, le port 6053
+    est fermé → la fonction retourne immédiatement sans rien faire.
+
+    Après flash "BT Proxy + Matter-over-Thread" :
+    - Zigbee port 6638 continue de fonctionner (Z2M inchangé)
+    - Thread port 7638 continue de fonctionner (OTBR inchangé)
+    - ESPHome port 6053 expose le BLE proxy pour HA + matter-server
+    """
+    if not COORDINATOR_HOST:
+        return
+
+    # Sonde le port ESPHome (6053) — si fermé, firmware original, rien à faire
+    try:
+        s = socket.create_connection((COORDINATOR_HOST, 6053), timeout=3)
+        s.close()
+    except Exception:
+        return
+
+    log(f"[esphome] ESPHome BLE proxy détecté sur {COORDINATOR_HOST}:6053")
+
+    # Vérifier si déjà intégré dans HA (évite les doublons)
+    r = ha_get("/config/config_entries/entries")
+    if r.ok:
+        for entry in r.json():
+            if entry.get("domain") == "esphome":
+                if entry.get("data", {}).get("host") == COORDINATOR_HOST:
+                    log("[esphome] ✓ BLE proxy SLZB déjà configuré dans HA")
+                    return
+
+    log(f"[esphome] Ajout du SLZB ({COORDINATOR_HOST}) comme ESPHome BLE proxy dans HA…")
+    try:
+        r1 = ha_post("/config/config_entries/flow", {"handler": "esphome"})
+        if not r1.ok:
+            warn(f"[esphome] Création flow échouée: {r1.status_code}")
+            return
+        res1 = r1.json()
+        ftype = res1.get("type")
+
+        if ftype == "create_entry":
+            log("[esphome] ✓ SLZB ESPHome BLE proxy configuré dans HA")
+            return
+        if ftype == "abort":
+            reason = res1.get("reason", "?")
+            if "already" in reason:
+                log("[esphome] ✓ BLE proxy déjà configuré")
+            else:
+                warn(f"[esphome] Flow abort: {reason}")
+            return
+
+        # Étape "user" : soumettre host + port
+        flow_id = res1.get("flow_id")
+        step_id = res1.get("step_id", "?")
+        log(f"[esphome] Flow étape '{step_id}' → soumission host={COORDINATOR_HOST}")
+        r2 = ha_post(f"/config/config_entries/flow/{flow_id}", {
+            "host": COORDINATOR_HOST,
+            "port": 6053,
+        })
+        if not r2.ok:
+            warn(f"[esphome] Soumission host échouée: {r2.status_code} {r2.text[:100]}")
+            return
+        res2 = r2.json()
+        ftype2 = res2.get("type")
+
+        if ftype2 == "create_entry":
+            log("[esphome] ✓ SLZB ajouté comme ESPHome BLE proxy — commissioning Matter via BLE activé ✓")
+        elif ftype2 == "abort":
+            reason2 = res2.get("reason", "?")
+            if "already" in reason2:
+                log("[esphome] ✓ BLE proxy déjà configuré")
+            else:
+                warn(f"[esphome] Flow étape 2 abort: {reason2}")
+        else:
+            # Étape supplémentaire (ex : confirm) — pas de saisie utilisateur attendue
+            warn(f"[esphome] Flow ESPHome inattendu: type={ftype2} step={res2.get('step_id')} — à vérifier dans HA")
+
+    except Exception as e:
+        warn(f"[esphome] _ensure_esphome_bluetooth_proxy: {e}")
+
+
 def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
@@ -2107,6 +2190,8 @@ def _ensure_matter_server():
     # Même si Matter Server tourne déjà, le config entry HA peut être absent
     # (premier démarrage où l'addon était déjà installé → install_matter_server() skippé)
     _ensure_matter_integration()
+    # Si le SLZB a été flashé ESPHome (BLE proxy), l'ajouter automatiquement dans HA
+    _ensure_esphome_bluetooth_proxy()
 
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
