@@ -1287,10 +1287,11 @@ def _matter_ws_frames(s):
     return _recv, _send
 
 
-def _matter_commission_ws(code: str, timeout_s: int = 120):
-    """Commission via python-matter-server WebSocket direct (port 5580).
+def _matter_commission_ws(code: str, timeout_s: int = 200):
+    """Commission via matter-server WebSocket direct (port 5580).
     HA 2026+ : ni REST ni HA WebSocket ne fonctionnent pour le commissioning.
-    python-matter-server écoute sur localhost:5580/ws (host_network=true).
+    matter-server écoute sur localhost:5580/ws (host_network=true).
+    matter-server met ~180s pour répondre (discovery PASE + retry) — timeout 200s.
     Retourne (success: bool, detail: str).
     """
     s = None
@@ -1311,14 +1312,14 @@ def _matter_commission_ws(code: str, timeout_s: int = 120):
         s.settimeout(timeout_s)
         _recv, _send = _matter_ws_frames(s)
 
-        # python-matter-server envoie un message info à la connexion
+        # matter-server envoie un message info à la connexion
         info = _recv()
         log(f"[matter-server] Connecté — schema={info.get('schema_version')} sdk={info.get('sdk_version')}")
 
         msg_id = "commission-1"
         _send({"message_id": msg_id, "command": "commission_with_code",
                "args": {"code": code, "network_only": False}})
-        log("[matter-server] commission_with_code envoyé — attente résultat (max 120s)…")
+        log(f"[matter-server] commission_with_code envoyé — attente résultat (max {timeout_s}s)…")
 
         while True:
             msg = _recv()
@@ -1335,7 +1336,7 @@ def _matter_commission_ws(code: str, timeout_s: int = 120):
                 return True, str(msg.get("result", ""))
 
     except socket.timeout:
-        return False, f"Timeout {timeout_s}s — device introuvable ou hors portée"
+        return False, f"Timeout {timeout_s}s — device pas en mode jumelage (discriminator attendu: vérifier reset d'usine)"
     except Exception as e:
         return False, str(e)
     finally:
