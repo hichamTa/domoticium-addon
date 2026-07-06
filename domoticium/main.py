@@ -1328,9 +1328,10 @@ def _matter_commission_ws(code: str, timeout_s: int = 200):
             # matter-server peut utiliser messageId (camelCase) ou message_id (snake_case)
             mid = msg.get("message_id") or msg.get("messageId")
             if mid == msg_id:
-                if "error_code" in msg or msg.get("errorCode"):
-                    err = msg.get("error_code") or msg.get("errorCode") or msg.get("details", "")
-                    return False, str(err)
+                if "error_code" in msg or "errorCode" in msg:
+                    # error_code est un entier ; le vrai message est dans details
+                    details = msg.get("details") or msg.get("message") or str(msg.get("error_code") or msg.get("errorCode", ""))
+                    return False, details
                 if "error" in msg:
                     return False, str(msg["error"])
                 return True, str(msg.get("result", ""))
