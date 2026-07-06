@@ -2097,9 +2097,10 @@ def _ensure_matter_integration():
 def _ensure_esphome_bluetooth_proxy():
     """Ajoute le coordinateur SLZB comme ESPHome BLE proxy dans HA.
 
-    Déclenché uniquement si le SLZB a été flashé avec le firmware ESPHome
-    (port 6053 ouvert). Si le firmware SLZB original tourne, le port 6053
-    est fermé → la fonction retourne immédiatement sans rien faire.
+    Deux cas :
+    - SLZB firmware original : port 6053 fermé. On vérifie quand même si
+      l'intégration ESPHome a été ajoutée manuellement dans HA (mDNS discovery).
+    - SLZB flashé ESPHome : port 6053 ouvert → ajout automatique si absent.
 
     Après flash "BT Proxy + Matter-over-Thread" :
     - Zigbee port 6638 continue de fonctionner (Z2M inchangé)
@@ -2109,23 +2110,40 @@ def _ensure_esphome_bluetooth_proxy():
     if not COORDINATOR_HOST:
         return
 
-    # Sonde le port ESPHome (6053) — si fermé, firmware original, rien à faire
+    # Sonde le port ESPHome (6053)
+    port_open = False
     try:
         s = socket.create_connection((COORDINATOR_HOST, 6053), timeout=3)
         s.close()
+        port_open = True
+        log(f"[esphome] ESPHome BLE proxy détecté sur {COORDINATOR_HOST}:6053")
     except Exception:
-        return
+        pass
 
-    log(f"[esphome] ESPHome BLE proxy détecté sur {COORDINATOR_HOST}:6053")
-
-    # Vérifier si déjà intégré dans HA (évite les doublons)
+    # Vérifier si déjà intégré dans HA — match sur IP ou hostname contenant l'IP.
+    # HA peut avoir ajouté l'intégration via mDNS discovery (host = hostname.local)
+    # ou via notre flow (host = IP directe).
     r = ha_get("/config/config_entries/entries")
     if r.ok:
         for entry in r.json():
             if entry.get("domain") == "esphome":
-                if entry.get("data", {}).get("host") == COORDINATOR_HOST:
-                    log("[esphome] ✓ BLE proxy SLZB déjà configuré dans HA")
+                host = entry.get("data", {}).get("host", "")
+                # Match si l'entrée correspond à notre coordinateur (IP directe ou hostname)
+                if host == COORDINATOR_HOST or COORDINATOR_HOST in host:
+                    log(f"[esphome] ✓ BLE proxy SLZB déjà configuré dans HA (host={host})")
                     return
+        # Pas encore dans HA — log selon l'état du port
+        if not port_open:
+            warn(
+                f"[esphome] Port 6053 non accessible sur {COORDINATOR_HOST} et aucune "
+                f"intégration ESPHome trouvée. Si le SLZB a été flashé ESPHome, "
+                f"ajouter manuellement l'intégration dans HA (Paramètres → Intégrations "
+                f"→ Découvertes) puis redémarrer l'add-on."
+            )
+            return
+
+    if not port_open:
+        return
 
     log(f"[esphome] Ajout du SLZB ({COORDINATOR_HOST}) comme ESPHome BLE proxy dans HA…")
     try:
@@ -2170,7 +2188,6 @@ def _ensure_esphome_bluetooth_proxy():
             else:
                 warn(f"[esphome] Flow étape 2 abort: {reason2}")
         else:
-            # Étape supplémentaire (ex : confirm) — pas de saisie utilisateur attendue
             warn(f"[esphome] Flow ESPHome inattendu: type={ftype2} step={res2.get('step_id')} — à vérifier dans HA")
 
     except Exception as e:
