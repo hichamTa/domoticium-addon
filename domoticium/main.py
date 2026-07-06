@@ -1263,6 +1263,21 @@ def handle_matter_commission(client, msg):
                 raise ValueError("Code PIN manquant")
 
             log(f"Matter commission {(request_id or '?')[:8]}… code={code}")
+
+            # Diagnostic : lister les services Matter disponibles dans HA
+            try:
+                svc_r = ha_get("/services")
+                if svc_r.ok:
+                    for dom in svc_r.json():
+                        if dom.get("domain") == "matter":
+                            matter_services = list(dom.get("services", {}).keys())
+                            log(f"[matter] Services HA disponibles: {matter_services}")
+                            break
+                    else:
+                        warn("[matter] Domain 'matter' absent de /api/services")
+            except Exception as e:
+                warn(f"[matter] diagnostic services: {e}")
+
             resp = ha_post("/services/matter/commission_with_code", {"code": code})
 
             result_topic = f"{SITE_PREFIX}/matter/commission/status/{request_id}"
@@ -1271,22 +1286,15 @@ def handle_matter_commission(client, msg):
                 client.publish(result_topic,
                                json.dumps({"requestId": request_id, "success": True}),
                                qos=1)
-                # Note : HA ne retourne pas le node_id Matter dans la réponse.
-                # La sync Matter se fera via un futur endpoint HA Matter API.
             else:
+                # Log complet pour diagnostic
+                warn(f"Matter commission {resp.status_code}: headers={dict(resp.headers)} body={resp.text[:500]}")
                 try:
                     body = resp.json()
-                    err_msg = (
-                        body.get("message")
-                        or body.get("description")
-                        or body.get("code")
-                        or f"HTTP {resp.status_code}"
-                    )
-                    if resp.status_code in (400, 404) and not body.get("message"):
-                        err_msg = "Service Matter introuvable dans HA — Matter Server démarré ?"
+                    err_msg = (body.get("message") or body.get("description")
+                               or body.get("code") or f"HTTP {resp.status_code}")
                 except Exception:
                     err_msg = f"HTTP {resp.status_code}"
-                warn(f"Matter commission {resp.status_code}: {resp.text[:200]}")
                 client.publish(result_topic,
                                json.dumps({"requestId": request_id, "success": False,
                                            "error": err_msg}),
