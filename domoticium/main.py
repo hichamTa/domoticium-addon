@@ -1322,9 +1322,16 @@ def _matter_commission_ws(code: str, timeout_s: int = 120):
 
         while True:
             msg = _recv()
-            if msg.get("message_id") == msg_id:
-                if "error_code" in msg:
-                    return False, f"{msg['error_code']}: {msg.get('details', '')}"
+            # Log tous les messages pour diagnostic (camelCase vs snake_case)
+            log(f"[matter-server] msg: {json.dumps(msg)[:300]}")
+            # matter-server peut utiliser messageId (camelCase) ou message_id (snake_case)
+            mid = msg.get("message_id") or msg.get("messageId")
+            if mid == msg_id:
+                if "error_code" in msg or msg.get("errorCode"):
+                    err = msg.get("error_code") or msg.get("errorCode") or msg.get("details", "")
+                    return False, str(err)
+                if "error" in msg:
+                    return False, str(msg["error"])
                 return True, str(msg.get("result", ""))
 
     except socket.timeout:
