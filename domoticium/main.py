@@ -1260,7 +1260,7 @@ def handle_matter_commission(client, msg):
                 raise ValueError("Code PIN manquant")
 
             log(f"Matter commission {(request_id or '?')[:8]}… code={code}")
-            resp = ha_post("/services/matter/commission", {"code": code})
+            resp = ha_post("/services/matter/commission_with_code", {"code": code})
 
             result_topic = f"{SITE_PREFIX}/matter/commission/status/{request_id}"
             if resp.status_code in (200, 201, 204):
