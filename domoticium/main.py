@@ -2121,9 +2121,15 @@ def _ensure_esphome_bluetooth_proxy():
                 return
 
     # 2. Flow de découverte mDNS en attente ? → confirmation automatique
+    # Les flows mDNS (source=zeroconf) peuvent ne pas apparaître dans l'API Supervisor.
+    # On log tous les handlers pour diagnostic, et on tente la confirmation si trouvé.
     rf = ha_get("/config/config_entries/flow")
     if rf.ok:
-        for flow in rf.json():
+        flows = rf.json()
+        handlers = [f.get("handler") for f in flows] if flows else []
+        if handlers:
+            log(f"[esphome] Flows en attente : {handlers}")
+        for flow in flows:
             if flow.get("handler") == "esphome":
                 flow_id = flow.get("flow_id")
                 step_id = flow.get("step_id", "?")
@@ -2150,12 +2156,32 @@ def _ensure_esphome_bluetooth_proxy():
                     warn(f"[esphome] Confirmation flow exception: {e}")
                 return
 
-    # 3. Sonde le port 6053 sur COORDINATOR_ESPHOME_HOST
-    # Si l'IP ESPHome diffère de COORDINATOR_HOST (nouvelle adresse DHCP après flash),
-    # renseigner coordinator_esphome_host dans la config de l'add-on.
+    # 3. Résolution mDNS automatique — tente avahi-browse pour trouver l'IP ESPHome
+    # sans que l'utilisateur ait à la renseigner manuellement.
     esphome_host = COORDINATOR_ESPHOME_HOST
+    if not esphome_host or esphome_host == COORDINATOR_HOST:
+        try:
+            result = subprocess.run(
+                ["avahi-browse", "-t", "-r", "-p", "_esphomelib._tcp"],
+                capture_output=True, text=True, timeout=12
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split(";")
+                # Format parseable avahi-browse -p : =;eth0;IPv4;name;type;domain;host;ip;port;...
+                if len(parts) >= 9 and parts[0] == "=":
+                    candidate_ip = parts[7]
+                    candidate_port = int(parts[8]) if parts[8].isdigit() else 6053
+                    log(f"[esphome] mDNS: device ESPHome trouvé à {candidate_ip}:{candidate_port}")
+                    esphome_host = candidate_ip
+                    break
+        except FileNotFoundError:
+            pass  # avahi-browse absent du container
+        except Exception as e:
+            log(f"[esphome] mDNS scan: {e}")
+
+    # 4. Sonde le port 6053 sur l'IP trouvée (mDNS ou coordinator_esphome_host)
     if not esphome_host:
-        warn("[esphome] coordinator_host non défini — impossible de sonder le port 6053")
+        warn("[esphome] Aucun device ESPHome trouvé (mDNS vide, coordinator_esphome_host non renseigné)")
         return
 
     try:
