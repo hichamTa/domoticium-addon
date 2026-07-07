@@ -2073,9 +2073,19 @@ def _ensure_matter_integration():
         return False  # besoin d'une autre étape
 
     try:
-        r1 = ha_post("/config/config_entries/flow", {"handler": "matter"})
-        if not r1.ok:
-            warn(f"[matter] Intégration Matter step1: {r1.status_code} {r1.text[:100]}")
+        r1 = None
+        for attempt in range(1, 6):
+            r1 = ha_post("/config/config_entries/flow", {"handler": "matter"})
+            if r1.ok:
+                break
+            if r1.status_code in (502, 503):
+                log(f"[matter] Matter Server pas encore prêt ({r1.status_code}), retry dans 15s (tentative {attempt}/5)…")
+                time.sleep(15)
+            else:
+                warn(f"[matter] Intégration Matter step1: {r1.status_code} {r1.text[:100]}")
+                return
+        if not r1 or not r1.ok:
+            warn(f"[matter] Intégration Matter step1: Matter Server toujours indisponible après 5 tentatives")
             return
         res1 = r1.json()
         if _handle_result(res1, 1):
