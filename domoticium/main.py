@@ -2110,13 +2110,23 @@ def _ensure_bluetooth_integration():
     Retourne True si Bluetooth est disponible (déjà configuré ou ajouté),
     False si aucun adaptateur n'est détecté.
     """
-    # 1. Déjà configuré ?
+    # 1a. Vérifier via /api/config (composants chargés) — check le plus fiable
+    r_cfg = ha_get("/config")
+    if r_cfg.ok:
+        components = r_cfg.json().get("components", [])
+        if "bluetooth" in components:
+            log("[bluetooth] ✓ Intégration Bluetooth active (composant HA chargé)")
+            return True
+
+    # 1b. Vérifier via config entries
     r = ha_get("/config/config_entries/entries")
     if r.ok:
-        for entry in r.json():
-            if "bluetooth" in entry.get("domain", ""):
-                log(f"[bluetooth] ✓ Intégration Bluetooth déjà configurée (domain={entry.get('domain')})")
-                return True
+        domains = [e.get("domain", "") for e in r.json()]
+        bt_entries = [d for d in domains if "bluetooth" in d.lower()]
+        if bt_entries:
+            log(f"[bluetooth] ✓ Intégration Bluetooth déjà configurée ({bt_entries[0]})")
+            return True
+        log(f"[bluetooth] Config entries domains: {sorted(set(d for d in domains if d))[:15]}")
 
     # 2. Flow de découverte en attente (source=usb détecté par HA) ?
     rf = ha_get("/config/config_entries/flow")
