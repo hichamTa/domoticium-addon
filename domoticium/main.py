@@ -2114,8 +2114,8 @@ def _ensure_bluetooth_integration():
     r = ha_get("/config/config_entries/entries")
     if r.ok:
         for entry in r.json():
-            if entry.get("domain") == "bluetooth":
-                log("[bluetooth] ✓ Intégration Bluetooth déjà configurée")
+            if "bluetooth" in entry.get("domain", ""):
+                log(f"[bluetooth] ✓ Intégration Bluetooth déjà configurée (domain={entry.get('domain')})")
                 return True
 
     # 2. Flow de découverte en attente (source=usb détecté par HA) ?
@@ -2157,8 +2157,8 @@ def _ensure_bluetooth_integration():
         return True
     if ftype == "abort":
         reason = res1.get("reason", "?")
-        if "already" in reason:
-            log("[bluetooth] ✓ Bluetooth déjà configuré")
+        if "already" in reason or reason == "single_instance_allowed":
+            log(f"[bluetooth] ✓ Bluetooth déjà configuré ({reason})")
             return True
         log(f"[bluetooth] Adaptateur non disponible (abort: {reason}) — HA charge encore le stack USB")
         return False
