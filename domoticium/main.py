@@ -2065,8 +2065,8 @@ def _ensure_matter_integration():
             return True
         if ftype == "abort":
             reason = result.get("reason", "?")
-            if reason in ("single_instance_allowed", "already_configured"):
-                log("[matter] ✓ Intégration Matter déjà configurée")
+            if reason in ("single_instance_allowed", "already_configured", "reconfiguration_successful"):
+                log(f"[matter] ✓ Intégration Matter configurée ({reason})")
             else:
                 warn(f"[matter] Intégration Matter abort (step {step}): {reason}")
             return True
@@ -2146,7 +2146,7 @@ def _ensure_bluetooth_integration():
     # 3. Tentative de création directe (si HA a déjà détecté l'adaptateur)
     r1 = ha_post("/config/config_entries/flow", {"handler": "bluetooth"})
     if not r1.ok:
-        log("[bluetooth] Aucun adaptateur Bluetooth détecté — brancher le dongle USB")
+        log(f"[bluetooth] Aucun adaptateur Bluetooth détecté ({r1.status_code}) — dongle USB non reconnu par HA")
         return False
 
     res1 = r1.json()
@@ -2160,10 +2160,7 @@ def _ensure_bluetooth_integration():
         if "already" in reason:
             log("[bluetooth] ✓ Bluetooth déjà configuré")
             return True
-        if "no_adapter" in reason or "no_devices_found" in reason:
-            log("[bluetooth] Aucun adaptateur Bluetooth — brancher le dongle USB")
-        else:
-            warn(f"[bluetooth] Flow abort: {reason}")
+        log(f"[bluetooth] Adaptateur non disponible (abort: {reason}) — HA charge encore le stack USB")
         return False
 
     # Étape de confirmation supplémentaire
@@ -2196,14 +2193,14 @@ def _ensure_matter_server():
     _ensure_matter_integration()
 
     # Dongle USB Bluetooth → intégration Bluetooth HA (BLE requis pour commissioning Matter)
-    for attempt in range(1, 4):
+    for attempt in range(1, 6):
         if _ensure_bluetooth_integration():
             break
-        if attempt < 3:
-            log(f"[bluetooth] Dongle non détecté, nouvel essai dans 30s (tentative {attempt}/3)…")
-            time.sleep(30)
+        if attempt < 5:
+            log(f"[bluetooth] Dongle non détecté, nouvel essai dans 60s (tentative {attempt}/5)…")
+            time.sleep(60)
     else:
-        warn("[bluetooth] Intégration Bluetooth non disponible — le commissioning Matter via BLE sera impossible")
+        warn("[bluetooth] Intégration Bluetooth non disponible après 5 tentatives — le commissioning Matter via BLE sera impossible")
 
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
