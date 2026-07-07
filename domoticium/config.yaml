@@ -5,7 +5,7 @@ description: >
   crée les automations MQTT, puis tourne en service pont permanent.
   Supporte les coordinateurs USB et réseau PoE (SLZB-MR4U, SLZB-06…).
   À lancer une seule fois après la création du compte admin HA.
-version: "1.7.36"
+version: "1.7.37"
 slug: "domoticium"
 init: false
 arch:
@@ -28,6 +28,7 @@ options:
   coordinator_host: ""
   coordinator_zigbee_port: 6638
   coordinator_thread_port: 7638
+  coordinator_esphome_host: ""
   zigbee_adapter: "auto"
   zigbee_adapter_type: "ember"
   install_thread_border_router: false
@@ -43,6 +44,7 @@ schema:
   coordinator_host: str
   coordinator_zigbee_port: int
   coordinator_thread_port: int
+  coordinator_esphome_host: str
   zigbee_adapter: str
   zigbee_adapter_type: "list(ember|zstack|zboss|deconz|zigate)"
   install_thread_border_router: bool

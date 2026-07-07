@@ -26,6 +26,9 @@ PI_PASS                 = cfg["pi_password"]
 COORDINATOR_HOST        = cfg.get("coordinator_host", "").strip()   # vide = mode USB
 COORDINATOR_ZIGBEE_PORT = cfg.get("coordinator_zigbee_port", 6638)
 COORDINATOR_THREAD_PORT = cfg.get("coordinator_thread_port", 20108)
+# IP ESPHome BLE proxy (optionnel) — à renseigner si différente de COORDINATOR_HOST
+# (cas fréquent après flash ESPHome : le SLZB obtient une nouvelle IP DHCP)
+COORDINATOR_ESPHOME_HOST = cfg.get("coordinator_esphome_host", "").strip() or COORDINATOR_HOST
 ZIGBEE_ADAPTER          = cfg.get("zigbee_adapter", "auto")
 ZIGBEE_ADAPTER_TYPE     = cfg.get("zigbee_adapter_type", "ember")
 INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
@@ -2108,20 +2111,16 @@ def _ensure_esphome_bluetooth_proxy():
     - Thread port 7638 continue de fonctionner (OTBR inchangé)
     - ESPHome port 6053 expose le BLE proxy pour HA + matter-server
     """
-    if not COORDINATOR_HOST:
-        return
-
-    # 1. Déjà configuré ?
+    # 1. Déjà configuré dans HA ? (n'importe quel host — pas besoin de matcher l'IP)
     r = ha_get("/config/config_entries/entries")
     if r.ok:
         for entry in r.json():
             if entry.get("domain") == "esphome":
-                host = entry.get("data", {}).get("host", "")
+                host = entry.get("data", {}).get("host", "?")
                 log(f"[esphome] ✓ BLE proxy déjà configuré dans HA (host={host})")
                 return
 
-    # 2. Flow de découverte mDNS en attente ? → confirmer automatiquement
-    # HA crée ces flows quand il détecte un device ESPHome sur le réseau local.
+    # 2. Flow de découverte mDNS en attente ? → confirmation automatique
     rf = ha_get("/config/config_entries/flow")
     if rf.ok:
         for flow in rf.json():
@@ -2151,19 +2150,28 @@ def _ensure_esphome_bluetooth_proxy():
                     warn(f"[esphome] Confirmation flow exception: {e}")
                 return
 
-    # 3. Sonde le port 6053 directement (device découvert à COORDINATOR_HOST)
+    # 3. Sonde le port 6053 sur COORDINATOR_ESPHOME_HOST
+    # Si l'IP ESPHome diffère de COORDINATOR_HOST (nouvelle adresse DHCP après flash),
+    # renseigner coordinator_esphome_host dans la config de l'add-on.
+    esphome_host = COORDINATOR_ESPHOME_HOST
+    if not esphome_host:
+        warn("[esphome] coordinator_host non défini — impossible de sonder le port 6053")
+        return
+
     try:
-        s = socket.create_connection((COORDINATOR_HOST, 6053), timeout=3)
+        s = socket.create_connection((esphome_host, 6053), timeout=3)
         s.close()
     except Exception:
         warn(
             f"[esphome] Aucun flow ESPHome en attente et port 6053 non accessible sur "
-            f"{COORDINATOR_HOST}. Si le SLZB a été flashé ESPHome, attendre que HA "
-            f"le découvre via mDNS (redémarrage de l'add-on suffit)."
+            f"{esphome_host}. "
+            f"Si l'IP du SLZB ESPHome a changé après le flash, renseigner "
+            f"'coordinator_esphome_host' dans la config de l'add-on avec la nouvelle IP "
+            f"(visible dans le tableau DHCP du routeur ou dans HA Découvertes)."
         )
         return
 
-    log(f"[esphome] ESPHome BLE proxy détecté sur {COORDINATOR_HOST}:6053 → ajout dans HA…")
+    log(f"[esphome] ESPHome BLE proxy détecté sur {esphome_host}:6053 → ajout dans HA…")
     try:
         r1 = ha_post("/config/config_entries/flow", {"handler": "esphome"})
         if not r1.ok:
@@ -2185,9 +2193,9 @@ def _ensure_esphome_bluetooth_proxy():
 
         flow_id = res1.get("flow_id")
         step_id = res1.get("step_id", "?")
-        log(f"[esphome] Flow étape '{step_id}' → soumission host={COORDINATOR_HOST}")
+        log(f"[esphome] Flow étape '{step_id}' → soumission host={esphome_host}")
         r2 = ha_post(f"/config/config_entries/flow/{flow_id}", {
-            "host": COORDINATOR_HOST,
+            "host": esphome_host,
             "port": 6053,
         })
         if not r2.ok:
