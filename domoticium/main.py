@@ -26,9 +26,6 @@ PI_PASS                 = cfg["pi_password"]
 COORDINATOR_HOST        = cfg.get("coordinator_host", "").strip()   # vide = mode USB
 COORDINATOR_ZIGBEE_PORT = cfg.get("coordinator_zigbee_port", 6638)
 COORDINATOR_THREAD_PORT = cfg.get("coordinator_thread_port", 20108)
-# IP ESPHome BLE proxy (optionnel) — à renseigner si différente de COORDINATOR_HOST
-# (cas fréquent après flash ESPHome : le SLZB obtient une nouvelle IP DHCP)
-COORDINATOR_ESPHOME_HOST = cfg.get("coordinator_esphome_host", "").strip() or COORDINATOR_HOST
 ZIGBEE_ADAPTER          = cfg.get("zigbee_adapter", "auto")
 ZIGBEE_ADAPTER_TYPE     = cfg.get("zigbee_adapter_type", "ember")
 INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
@@ -2097,154 +2094,6 @@ def _ensure_matter_integration():
         warn(f"[matter] _ensure_matter_integration: {e}")
 
 
-def _ensure_esphome_bluetooth_proxy():
-    """Ajoute le coordinateur SLZB comme ESPHome BLE proxy dans HA.
-
-    Trois chemins, dans l'ordre :
-    1. Déjà configuré dans HA → log et sortie.
-    2. HA a découvert le device ESPHome via mDNS (flow en attente dans
-       Découvertes) → confirmation automatique du flow (évite l'action manuelle).
-    3. Port 6053 accessible sur COORDINATOR_HOST → création d'un nouveau flow.
-
-    Après flash "BT Proxy + Matter-over-Thread" :
-    - Zigbee port 6638 continue de fonctionner (Z2M inchangé)
-    - Thread port 7638 continue de fonctionner (OTBR inchangé)
-    - ESPHome port 6053 expose le BLE proxy pour HA + matter-server
-    """
-    # 1. Déjà configuré dans HA ? (n'importe quel host — pas besoin de matcher l'IP)
-    r = ha_get("/config/config_entries/entries")
-    if r.ok:
-        for entry in r.json():
-            if entry.get("domain") == "esphome":
-                host = entry.get("data", {}).get("host", "?")
-                log(f"[esphome] ✓ BLE proxy déjà configuré dans HA (host={host})")
-                return
-
-    # 2. Flow de découverte mDNS en attente ? → confirmation automatique
-    # Les flows mDNS (source=zeroconf) peuvent ne pas apparaître dans l'API Supervisor.
-    # On log tous les handlers pour diagnostic, et on tente la confirmation si trouvé.
-    rf = ha_get("/config/config_entries/flow")
-    if rf.ok:
-        flows = rf.json()
-        handlers = [f.get("handler") for f in flows] if flows else []
-        if handlers:
-            log(f"[esphome] Flows en attente : {handlers}")
-        for flow in flows:
-            if flow.get("handler") == "esphome":
-                flow_id = flow.get("flow_id")
-                step_id = flow.get("step_id", "?")
-                log(f"[esphome] Flow ESPHome découverte détecté (step={step_id}) → confirmation automatique…")
-                try:
-                    rc = ha_post(f"/config/config_entries/flow/{flow_id}", {})
-                    if rc.ok:
-                        res = rc.json()
-                        if res.get("type") == "create_entry":
-                            log("[esphome] ✓ ESPHome BLE proxy ajouté automatiquement — commissioning Matter via BLE activé ✓")
-                            return
-                        elif res.get("type") == "abort":
-                            reason = res.get("reason", "?")
-                            if "already" in reason:
-                                log("[esphome] ✓ BLE proxy déjà configuré (abort/already)")
-                            else:
-                                warn(f"[esphome] Flow confirmation abort: {reason}")
-                            return
-                        else:
-                            warn(f"[esphome] Flow confirmation inattendu: type={res.get('type')} step={res.get('step_id')} — {rc.text[:200]}")
-                    else:
-                        warn(f"[esphome] Confirmation flow échouée: {rc.status_code} {rc.text[:100]}")
-                except Exception as e:
-                    warn(f"[esphome] Confirmation flow exception: {e}")
-                return
-
-    # 3. Résolution mDNS automatique — tente avahi-browse pour trouver l'IP ESPHome
-    # sans que l'utilisateur ait à la renseigner manuellement.
-    esphome_host = COORDINATOR_ESPHOME_HOST
-    if not esphome_host or esphome_host == COORDINATOR_HOST:
-        try:
-            result = subprocess.run(
-                ["avahi-browse", "-t", "-r", "-p", "_esphomelib._tcp"],
-                capture_output=True, text=True, timeout=12
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split(";")
-                # Format parseable avahi-browse -p : =;eth0;IPv4;name;type;domain;host;ip;port;...
-                if len(parts) >= 9 and parts[0] == "=":
-                    candidate_ip = parts[7]
-                    candidate_port = int(parts[8]) if parts[8].isdigit() else 6053
-                    log(f"[esphome] mDNS: device ESPHome trouvé à {candidate_ip}:{candidate_port}")
-                    esphome_host = candidate_ip
-                    break
-        except FileNotFoundError:
-            pass  # avahi-browse absent du container
-        except Exception as e:
-            log(f"[esphome] mDNS scan: {e}")
-
-    # 4. Sonde le port 6053 sur l'IP trouvée (mDNS ou coordinator_esphome_host)
-    if not esphome_host:
-        warn("[esphome] Aucun device ESPHome trouvé (mDNS vide, coordinator_esphome_host non renseigné)")
-        return
-
-    try:
-        s = socket.create_connection((esphome_host, 6053), timeout=3)
-        s.close()
-    except Exception:
-        warn(
-            f"[esphome] Aucun flow ESPHome en attente et port 6053 non accessible sur "
-            f"{esphome_host}. "
-            f"Si l'IP du SLZB ESPHome a changé après le flash, renseigner "
-            f"'coordinator_esphome_host' dans la config de l'add-on avec la nouvelle IP "
-            f"(visible dans le tableau DHCP du routeur ou dans HA Découvertes)."
-        )
-        return
-
-    log(f"[esphome] ESPHome BLE proxy détecté sur {esphome_host}:6053 → ajout dans HA…")
-    try:
-        r1 = ha_post("/config/config_entries/flow", {"handler": "esphome"})
-        if not r1.ok:
-            warn(f"[esphome] Création flow échouée: {r1.status_code}")
-            return
-        res1 = r1.json()
-        ftype = res1.get("type")
-
-        if ftype == "create_entry":
-            log("[esphome] ✓ ESPHome BLE proxy configuré dans HA")
-            return
-        if ftype == "abort":
-            reason = res1.get("reason", "?")
-            if "already" in reason:
-                log("[esphome] ✓ BLE proxy déjà configuré")
-            else:
-                warn(f"[esphome] Flow abort: {reason}")
-            return
-
-        flow_id = res1.get("flow_id")
-        step_id = res1.get("step_id", "?")
-        log(f"[esphome] Flow étape '{step_id}' → soumission host={esphome_host}")
-        r2 = ha_post(f"/config/config_entries/flow/{flow_id}", {
-            "host": esphome_host,
-            "port": 6053,
-        })
-        if not r2.ok:
-            warn(f"[esphome] Soumission host échouée: {r2.status_code} {r2.text[:100]}")
-            return
-        res2 = r2.json()
-        ftype2 = res2.get("type")
-
-        if ftype2 == "create_entry":
-            log("[esphome] ✓ SLZB ajouté comme ESPHome BLE proxy — commissioning Matter via BLE activé ✓")
-        elif ftype2 == "abort":
-            reason2 = res2.get("reason", "?")
-            if "already" in reason2:
-                log("[esphome] ✓ BLE proxy déjà configuré")
-            else:
-                warn(f"[esphome] Flow étape 2 abort: {reason2}")
-        else:
-            warn(f"[esphome] Flow ESPHome inattendu: type={ftype2} step={res2.get('step_id')} — à vérifier dans HA")
-
-    except Exception as e:
-        warn(f"[esphome] _ensure_esphome_bluetooth_proxy: {e}")
-
-
 def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
@@ -2258,8 +2107,6 @@ def _ensure_matter_server():
     # Même si Matter Server tourne déjà, le config entry HA peut être absent
     # (premier démarrage où l'addon était déjà installé → install_matter_server() skippé)
     _ensure_matter_integration()
-    # Si le SLZB a été flashé ESPHome (BLE proxy), l'ajouter automatiquement dans HA
-    _ensure_esphome_bluetooth_proxy()
 
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
