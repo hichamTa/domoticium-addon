@@ -2094,6 +2094,83 @@ def _ensure_matter_integration():
         warn(f"[matter] _ensure_matter_integration: {e}")
 
 
+def _ensure_bluetooth_integration():
+    """Ajoute l'intégration Bluetooth HA si un dongle USB est branché.
+
+    Retourne True si Bluetooth est disponible (déjà configuré ou ajouté),
+    False si aucun adaptateur n'est détecté.
+    """
+    # 1. Déjà configuré ?
+    r = ha_get("/config/config_entries/entries")
+    if r.ok:
+        for entry in r.json():
+            if entry.get("domain") == "bluetooth":
+                log("[bluetooth] ✓ Intégration Bluetooth déjà configurée")
+                return True
+
+    # 2. Flow de découverte en attente (source=usb détecté par HA) ?
+    rf = ha_get("/config/config_entries/flow")
+    if rf.ok:
+        for flow in rf.json():
+            if flow.get("handler") == "bluetooth":
+                flow_id = flow.get("flow_id")
+                log(f"[bluetooth] Flow Bluetooth en attente (step={flow.get('step_id', '?')}) → confirmation…")
+                rc = ha_post(f"/config/config_entries/flow/{flow_id}", {})
+                if rc.ok:
+                    res = rc.json()
+                    if res.get("type") == "create_entry":
+                        log("[bluetooth] ✓ Intégration Bluetooth ajoutée — BLE disponible pour Matter ✓")
+                        return True
+                    elif res.get("type") == "abort":
+                        reason = res.get("reason", "?")
+                        if "already" in reason:
+                            log("[bluetooth] ✓ Bluetooth déjà configuré")
+                            return True
+                        warn(f"[bluetooth] Flow abort: {reason}")
+                    else:
+                        warn(f"[bluetooth] Flow inattendu: {res.get('type')} step={res.get('step_id')}")
+                else:
+                    warn(f"[bluetooth] Confirmation échouée: {rc.status_code}")
+                return False
+
+    # 3. Tentative de création directe (si HA a déjà détecté l'adaptateur)
+    r1 = ha_post("/config/config_entries/flow", {"handler": "bluetooth"})
+    if not r1.ok:
+        log("[bluetooth] Aucun adaptateur Bluetooth détecté — brancher le dongle USB")
+        return False
+
+    res1 = r1.json()
+    ftype = res1.get("type")
+
+    if ftype == "create_entry":
+        log("[bluetooth] ✓ Intégration Bluetooth ajoutée")
+        return True
+    if ftype == "abort":
+        reason = res1.get("reason", "?")
+        if "already" in reason:
+            log("[bluetooth] ✓ Bluetooth déjà configuré")
+            return True
+        if "no_adapter" in reason or "no_devices_found" in reason:
+            log("[bluetooth] Aucun adaptateur Bluetooth — brancher le dongle USB")
+        else:
+            warn(f"[bluetooth] Flow abort: {reason}")
+        return False
+
+    # Étape de confirmation supplémentaire
+    flow_id = res1.get("flow_id")
+    log(f"[bluetooth] Flow étape '{res1.get('step_id', '?')}' → confirmation…")
+    r2 = ha_post(f"/config/config_entries/flow/{flow_id}", {})
+    if r2.ok:
+        res2 = r2.json()
+        if res2.get("type") == "create_entry":
+            log("[bluetooth] ✓ Intégration Bluetooth configurée — BLE disponible pour Matter ✓")
+            return True
+        warn(f"[bluetooth] Flow étape 2 inattendu: {res2.get('type')}")
+    else:
+        warn(f"[bluetooth] Confirmation step 2 échouée: {r2.status_code}")
+    return False
+
+
 def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
@@ -2107,6 +2184,16 @@ def _ensure_matter_server():
     # Même si Matter Server tourne déjà, le config entry HA peut être absent
     # (premier démarrage où l'addon était déjà installé → install_matter_server() skippé)
     _ensure_matter_integration()
+
+    # Dongle USB Bluetooth → intégration Bluetooth HA (BLE requis pour commissioning Matter)
+    for attempt in range(1, 4):
+        if _ensure_bluetooth_integration():
+            break
+        if attempt < 3:
+            log(f"[bluetooth] Dongle non détecté, nouvel essai dans 30s (tentative {attempt}/3)…")
+            time.sleep(30)
+    else:
+        warn("[bluetooth] Intégration Bluetooth non disponible — le commissioning Matter via BLE sera impossible")
 
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
