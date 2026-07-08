@@ -5,7 +5,7 @@ description: >
   crée les automations MQTT, puis tourne en service pont permanent.
   Supporte les coordinateurs USB et réseau PoE (SLZB-MR4U, SLZB-06…).
   À lancer une seule fois après la création du compte admin HA.
-version: "1.7.44"
+version: "1.8.0"
 slug: "domoticium"
 init: false
 arch:
@@ -35,6 +35,9 @@ options:
   app_url: "https://app.domoticium.fr"
   cloudflare_tunnel_token: ""
   force_setup: false
+  emqx_local_host: "127.0.0.1"
+  emqx_local_port: 1884
+  ingest_secret: ""
 schema:
   site_prefix: str
   emqx_host: str
@@ -50,3 +53,6 @@ schema:
   app_url: str
   cloudflare_tunnel_token: str
   force_setup: bool
+  emqx_local_host: str
+  emqx_local_port: int
+  ingest_secret: str

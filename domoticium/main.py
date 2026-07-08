@@ -33,6 +33,9 @@ THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
 APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
 FORCE_SETUP             = cfg.get("force_setup", False)
+EMQX_LOCAL_HOST         = cfg.get("emqx_local_host", "127.0.0.1")
+EMQX_LOCAL_PORT         = int(cfg.get("emqx_local_port", 1884))
+INGEST_SECRET           = cfg.get("ingest_secret", "")
 
 # Mode réseau (PoE) ou USB
 NETWORK_MODE = bool(COORDINATOR_HOST)
@@ -1662,28 +1665,21 @@ def call_heartbeat_api():
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
+    """Connecté à EMQX local — souscrit uniquement aux commandes caméra (reste via HA API)."""
     global _first_connect
     if reason_code.is_failure:
-        warn(f"[cloud] Connexion EMQX échouée ({reason_code})")
+        warn(f"[emqx-local] Connexion échouée ({reason_code})")
         return
     p = SITE_PREFIX
-    topics = [
-        (f"{p}/cameras/+/configure", 1),           # commande ajout/suppression caméra
-        (f"{p}/matter/commission/start", 1),       # jumelage Matter
-        (f"{p}/zigbee2mqtt/+/set", 1),             # commandes device Z2M cloud→local
-        (f"{p}/zigbee2mqtt/+/get", 1),             # lecture état device Z2M cloud→local
-        (f"{p}/zigbee2mqtt/bridge/request/+", 1), # permit_join, restart, etc.
-        (f"{p}/ha/command", 1),                    # service HA cloud→local
-    ]
-    client.subscribe(topics)
-    log(f"[cloud] Connecté EMQX — souscrit à {p}/zigbee2mqtt/+/set|get, bridge/request/+, /cameras/+/configure, /matter/+, /ha/command")
+    # Seules les commandes caméra passent encore par EMQX local.
+    # Les commandes Z2M/Matter/HA arrivent désormais directement via HA API → pas de subscription.
+    client.subscribe([(f"{p}/cameras/+/configure", 1)])
+    log(f"[emqx-local] Connecté — souscrit à {p}/cameras/+/configure")
 
-    # Sur reconnexion (pas au premier démarrage), déclencher un sync immédiat
-    # pour rattraper les changements faits pendant la déconnexion.
     if _first_connect:
         _first_connect = False
     else:
-        log("[sync] Reconnexion EMQX détectée — sync immédiate dans 10s")
+        log("[sync] Reconnexion EMQX local détectée — sync immédiate dans 10s")
         def _delayed_sync():
             time.sleep(10)
             _sync_requested.set()
@@ -1691,41 +1687,137 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
-    """Messages reçus depuis EMQX Cloud (commandes venant de l'app web)."""
+    """Messages reçus depuis EMQX local (commandes caméra uniquement)."""
     parts = msg.topic.split("/")
-    if len(parts) < 2:
-        return
-
-    # ── Relay commandes Z2M cloud → local Mosquitto ──────────────────────────
-    # {prefix}/zigbee2mqtt/{device}/set|get → zigbee2mqtt/{device}/set|get
-    # {prefix}/zigbee2mqtt/bridge/request/+ → zigbee2mqtt/bridge/request/+
-    if parts[1] == "zigbee2mqtt" and (
-        parts[-1] in ("set", "get")
-        or (len(parts) >= 4 and parts[2] == "bridge" and parts[3] == "request")
-    ):
-        local_topic = "/".join(parts[1:])  # retire le prefix site
-        if _local_client:
-            _local_client.publish(local_topic, msg.payload, qos=1)
-            log(f"[cloud→local] Relay Z2M : {local_topic}")
-        return
-
-    # ── Relay commandes HA cloud → local Mosquitto ────────────────────────────
-    # {prefix}/ha/command → {prefix}/ha/command (même topic, broker différent)
-    if len(parts) >= 3 and parts[1] == "ha" and parts[2] == "command":
-        if _local_client:
-            _local_client.publish(msg.topic, msg.payload, qos=1)
-        return
-
-    # ── Autres commandes locales ──────────────────────────────────────────────
     if len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
         handle_camera_configure(client, msg)
-    elif len(parts) >= 4 and parts[1] == "matter" and parts[2] == "commission" and parts[3] == "start":
-        handle_matter_commission(client, msg)
+
+
+def run_ha_ws_bridge():
+    """Thread permanent : écoute HA WebSocket → relaie état_changed + entity_registry vers EMQX local.
+    Remplace les automations HA State Stream et le relay cloud EMQX→local."""
+    # Domaines HA à relayer vers EMQX local (filtre pour réduire le trafic)
+    RELAY_DOMAINS = {
+        "light", "switch", "cover", "lock", "fan", "climate", "sensor",
+        "binary_sensor", "input_boolean", "media_player", "camera",
+        "alarm_control_panel", "scene", "automation",
+    }
+    while True:
+        ws_send, ws_recv, ws_close = _ha_ws_connect()
+        if not ws_send:
+            time.sleep(15)
+            continue
+        try:
+            # Souscrit à state_changed et entity_registry_updated
+            ws_send({"id": 1, "type": "subscribe_events", "event_type": "state_changed"})
+            ws_recv()  # ack subscription
+            ws_send({"id": 2, "type": "subscribe_events", "event_type": "entity_registry_updated"})
+            ws_recv()  # ack subscription
+            log("[ha-ws-bridge] Souscrit à state_changed + entity_registry_updated")
+
+            while True:
+                msg = ws_recv()
+                if msg.get("type") != "event":
+                    continue
+                event = msg.get("event", {})
+                event_type = event.get("event_type")
+                data = event.get("data", {})
+
+                if event_type == "state_changed":
+                    entity_id = data.get("entity_id", "")
+                    domain = entity_id.split(".")[0] if "." in entity_id else ""
+                    if domain not in RELAY_DOMAINS:
+                        continue
+                    new_state = data.get("new_state")
+                    if not new_state:
+                        continue
+
+                    state_val = new_state.get("state", "")
+                    attributes = new_state.get("attributes", {})
+                    obj_id = entity_id.split(".", 1)[1] if "." in entity_id else entity_id
+
+                    if _cloud_client:
+                        # État : texte brut (comme l'ancienne automation State Stream)
+                        _cloud_client.publish(
+                            f"{SITE_PREFIX}/ha/{domain}/{obj_id}/state",
+                            state_val, qos=0
+                        )
+                        # Attributs complets : JSON
+                        if attributes:
+                            _cloud_client.publish(
+                                f"{SITE_PREFIX}/ha/{domain}/{obj_id}/attributes",
+                                json.dumps(attributes), qos=0
+                            )
+
+                    # Persiste en DB via /api/ingest/states (caméras + historique)
+                    if INGEST_SECRET and domain in ("camera", "alarm_control_panel"):
+                        threading.Thread(
+                            target=_post_ingest_state,
+                            args=(entity_id, state_val, attributes),
+                            daemon=True,
+                        ).start()
+
+                elif event_type == "entity_registry_updated":
+                    action = data.get("action")
+                    entity_id = data.get("entity_id") or (data.get("changes", {}) or {}).get("entity_id")
+                    if entity_id and action in ("create", "remove", "update") and INGEST_SECRET:
+                        ha_action = {"create": "added", "remove": "removed", "update": "updated"}.get(action, action)
+                        threading.Thread(
+                            target=_post_ingest_registry,
+                            args=(entity_id, ha_action, data),
+                            daemon=True,
+                        ).start()
+
+        except Exception as e:
+            warn(f"[ha-ws-bridge] Erreur: {e} — reconnexion dans 15s")
+        finally:
+            try:
+                ws_close()
+            except Exception:
+                pass
+        time.sleep(15)
+
+
+def _post_ingest_state(entity_id: str, state: str, attributes: dict):
+    """Appelle /api/ingest/states pour persister un état HA (caméras, alarme)."""
+    try:
+        requests.post(
+            f"{APP_URL}/api/ingest/states",
+            json={
+                "siteSecret": INGEST_SECRET,
+                "siteId": SITE_PREFIX,
+                "entityId": entity_id,
+                "state": state,
+                "attributes": attributes,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        warn(f"[ingest/states] {entity_id}: {e}")
+
+
+def _post_ingest_registry(entity_id: str, action: str, data: dict):
+    """Appelle /api/ingest/registry quand une entité HA est ajoutée/supprimée/renommée."""
+    try:
+        requests.post(
+            f"{APP_URL}/api/ingest/registry",
+            json={
+                "siteSecret": INGEST_SECRET,
+                "siteId": SITE_PREFIX,
+                "action": action,
+                "entityId": entity_id,
+                "friendlyName": data.get("name") or data.get("changes", {}).get("name"),
+                "domain": entity_id.split(".")[0] if "." in entity_id else None,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        warn(f"[ingest/registry] {entity_id}: {e}")
 
 
 def _heartbeat_loop():
-    """Envoie un heartbeat toutes les 30 secondes : webhook API + MQTT cloud (→ haOnline navigateur)."""
-    time.sleep(10)  # premier appel rapide au démarrage
+    """Envoie un heartbeat toutes les 30 secondes : webhook API + EMQX local (→ haOnline navigateur)."""
+    time.sleep(10)
     while True:
         call_heartbeat_api()
         if _cloud_client:
@@ -2244,28 +2336,30 @@ def run_bridge():
     global _cloud_client
     _load_cameras()
     start_cloudflared()
-    # Installe Matter Server si absent (ex : setup fait avant activation Matter)
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
-    # Vérification broker MQTT HA en arrière-plan (ne bloque pas le démarrage)
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     threading.Thread(target=_ha_sync_loop,   daemon=True).start()
     threading.Thread(target=run_local_bridge, daemon=True).start()
+    # Bridge HA WebSocket → EMQX local (remplace le relay cloud + automations State Stream)
+    threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
 
-    _cloud_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-cloud-bridge", clean_session=True)
+    # Connexion à EMQX local (pas de TLS — même Pi, réseau interne)
+    # EMQX local doit être configuré sur EMQX_LOCAL_PORT (1884 par défaut, évite conflit Mosquitto:1883)
+    _cloud_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-emqx-local", clean_session=True)
     _cloud_client.username_pw_set(PI_USER, PI_PASS)
-    _cloud_client.tls_set()
     _cloud_client.on_connect    = on_connect
     _cloud_client.on_message    = on_message
     _cloud_client.on_disconnect = lambda c, u, df, rc, props: (
-        warn(f"[cloud] Déconnexion EMQX ({rc}) — reconnexion…") if rc.is_failure else None
+        warn(f"[emqx-local] Déconnexion ({rc}) — reconnexion…") if rc.is_failure else None
     )
+    log(f"[emqx-local] Connexion à {EMQX_LOCAL_HOST}:{EMQX_LOCAL_PORT} (sans TLS)")
     while True:
         try:
-            _cloud_client.connect(EMQX_HOST, 8883, keepalive=60)
+            _cloud_client.connect(EMQX_LOCAL_HOST, EMQX_LOCAL_PORT, keepalive=60)
             _cloud_client.loop_forever()
         except Exception as e:
-            warn(f"[cloud] EMQX : {e} — retry dans 10s")
+            warn(f"[emqx-local] {e} — retry dans 10s")
             time.sleep(10)
 
 
