@@ -105,11 +105,14 @@ def _ws_recv_exact(sock, n: int) -> bytes:
     return buf
 
 
-def _ha_ws_connect():
+def _ha_ws_connect(long_lived: bool = False):
     """Ouvre et authentifie une session WebSocket HA.
     Retourne (ws_send, ws_recv, ws_close) ou (None, None, None) en cas d'erreur.
     ws_send(data: dict) — inclure {"id": N} dans data.
     ws_recv() → dict.
+    long_lived=True (ex: run_ha_ws_bridge) : retire le timeout après l'auth — sinon le
+    timeout de connexion (15s) s'applique aussi aux recv() suivants, et une simple absence
+    d'événement HA pendant 15s est prise pour une erreur de connexion (reconnexion en boucle).
     """
     try:
         s = socket.create_connection(("supervisor", 80), timeout=15)
@@ -176,6 +179,9 @@ def _ha_ws_connect():
         msg = _recv()
         if msg.get("type") != "auth_ok":
             raise Exception(f"Auth WS échouée: {msg}")
+
+        if long_lived:
+            s.settimeout(None)  # bloquant — le ping/pong WS (déjà géré dans _recv) détecte les connexions mortes
 
         return _send, _recv, s.close
 
@@ -1610,7 +1616,7 @@ def run_ha_ws_bridge():
         "alarm_control_panel", "scene", "automation",
     }
     while True:
-        ws_send, ws_recv, ws_close = _ha_ws_connect()
+        ws_send, ws_recv, ws_close = _ha_ws_connect(long_lived=True)
         if not ws_send:
             time.sleep(15)
             continue
