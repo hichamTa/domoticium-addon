@@ -1103,8 +1103,8 @@ def run_setup():
     # 4. Supprimer l'ancien discovery_prefix non-standard (migration v1.5 → v1.6)
     remove_legacy_mqtt_discovery_prefix()
 
-    install_matter_server()
-    install_thread_border_router()
+    # install_matter_server()      — désactivé temporairement : on valide Zigbee d'abord
+    # install_thread_border_router()  — idem (dépend de Matter/Thread)
     # install_frigate()  — caméras via go2rtc addon HA
     create_automations()
     write_rest_commands()
@@ -2142,7 +2142,7 @@ def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
         log("[matter] Matter Server absent — installation automatique…")
-        install_matter_server()
+        # install_matter_server()  — désactivé temporairement : on valide Zigbee d'abord
     elif not _is_addon_running(MATTER_SLUG):
         log("[matter] Matter Server installé mais arrêté — démarrage…")
         _start_addon(MATTER_SLUG, "Matter Server")
@@ -2164,7 +2164,7 @@ def _ensure_matter_server():
 
     if not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
-        install_thread_border_router()
+        # install_thread_border_router()  — désactivé temporairement : on valide Zigbee d'abord
     else:
         # Vérifier que les options actuelles sont correctes (network_device peut être périmé)
         needs_reconfig = not _is_addon_running(THREAD_SLUG)
@@ -2185,7 +2185,7 @@ def _ensure_matter_server():
 
         if needs_reconfig:
             log("[matter] OTBR — reconfiguration et redémarrage…")
-            install_thread_border_router()
+            # install_thread_border_router()  — désactivé temporairement : on valide Zigbee d'abord
         else:
             log("[matter] Open Thread Border Router en cours d'exécution ✓")
 
