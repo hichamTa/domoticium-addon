@@ -2367,7 +2367,9 @@ def run_command_server():
 def run_bridge():
     _load_cameras()
     start_cloudflared()
-    threading.Thread(target=_ensure_matter_server, daemon=True).start()
+    # _ensure_matter_server  — désactivé temporairement : on valide Zigbee d'abord
+    # (installe/démarre Matter Server + OTBR en tâche de fond à chaque démarrage —
+    # oublié lors du passage en Zigbee-only, cf. run_setup() et main.py history)
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     threading.Thread(target=_ha_sync_loop,   daemon=True).start()
