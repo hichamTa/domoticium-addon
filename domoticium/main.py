@@ -2,16 +2,17 @@
 """
 Domoticium — Add-on Home Assistant
 Phase 1 (une seule fois) :
-  • Configure MQTT → EMQX
+  • Configure MQTT → Mosquitto local
   • Installe Zigbee2MQTT, Matter Server, Frigate NVR
-  • Crée les 4 automations MQTT (State Stream, Commands, Heartbeat, Camera Status)
-  • Écrit le rest_command caméra hors ligne
+  • Crée l'automation heartbeat + écrit les rest_commands (heartbeat, caméra hors ligne)
 Phase 2 (service permanent) :
-  • Démarre cloudflared (Cloudflare Tunnel → go2rtc Frigate port 1984)
+  • Démarre cloudflared (Cloudflare Tunnel → go2rtc Frigate + serveur de commandes)
+  • Bridge HA WebSocket → Supabase (état temps réel, remplace EMQX)
+  • Serveur de commandes HTTP local (Vercel → HA API, remplace EMQX)
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, json, os, secrets, socket, struct, subprocess, sys, threading, time
+import base64, http.server, json, os, secrets, socket, socketserver, struct, subprocess, sys, threading, time
 import paho.mqtt.client as mqtt
 import requests
 
@@ -20,7 +21,6 @@ with open("/data/options.json") as f:
     cfg = json.load(f)
 
 SITE_PREFIX             = cfg["site_prefix"]
-EMQX_HOST               = cfg["emqx_host"]
 PI_USER                 = cfg["pi_username"]
 PI_PASS                 = cfg["pi_password"]
 COORDINATOR_HOST        = cfg.get("coordinator_host", "").strip()   # vide = mode USB
@@ -33,9 +33,12 @@ THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
 APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
 FORCE_SETUP             = cfg.get("force_setup", False)
-EMQX_LOCAL_HOST         = cfg.get("emqx_local_host", "127.0.0.1")
-EMQX_LOCAL_PORT         = int(cfg.get("emqx_local_port", 1884))
 INGEST_SECRET           = cfg.get("ingest_secret", "")
+
+# Serveur de commandes local (127.0.0.1 uniquement, exposé via le tunnel Cloudflare
+# existant sous un hostname dédié ha-{slug}.domoticium.fr). Remplace EMQX entièrement :
+# plus de broker cloud, Vercel appelle ce serveur en HTTPS, authentifié par INGEST_SECRET.
+COMMAND_PORT = 8098
 
 # Mode réseau (PoE) ou USB
 NETWORK_MODE = bool(COORDINATOR_HOST)
@@ -69,8 +72,7 @@ else:
 
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
 
-# Références aux deux clients MQTT (cloud EMQX + local Mosquitto)
-_cloud_client: mqtt.Client | None = None
+# Client MQTT local (Mosquitto, Z2M ↔ HA) — plus de client cloud, EMQX est retiré.
 _local_client: mqtt.Client | None = None
 
 
@@ -859,13 +861,9 @@ def _mqtt_is_done(result):
     return False
 
 
-def _build_mqtt_broker_payload(schema: list, local: bool = False) -> dict:
-    """
-    Construit le payload pour chaque étape du flow MQTT HA en lisant le data_schema.
-    local=True  → Mosquitto local (core-mosquitto:1883, pas de TLS)
-    local=False → EMQX Cloud (port 8883, TLS obligatoire)
-    Si schema vide → étape de confirmation sans champ → payload {}.
-    """
+def _build_mqtt_broker_payload(schema: list) -> dict:
+    """Construit le payload du flow MQTT HA pour Mosquitto local (core-mosquitto:1883, pas de TLS).
+    Si schema vide → étape de confirmation sans champ → payload {}."""
     if not schema:
         return {}
 
@@ -873,42 +871,20 @@ def _build_mqtt_broker_payload(schema: list, local: bool = False) -> dict:
     log(f"[MQTT] Champs du schéma : {sorted(schema_names)}")
     payload = {}
 
-    # ── Credentials broker ────────────────────────────────────────────────────
     for k in ("broker", "host", "server", "hostname"):
         if k in schema_names:
-            payload[k] = "core-mosquitto" if local else EMQX_HOST
+            payload[k] = "core-mosquitto"
             break
-
     if "port" in schema_names:
-        payload["port"] = 1883 if local else 8883
-
+        payload["port"] = 1883
     for k in ("username", "user"):
         if k in schema_names:
-            payload[k] = MOSQUITTO_USER if local else PI_USER
+            payload[k] = MOSQUITTO_USER
             break
-
     for k in ("password", "pass"):
         if k in schema_names:
-            payload[k] = MOSQUITTO_PASS if local else PI_PASS
+            payload[k] = MOSQUITTO_PASS
             break
-
-    if local:
-        # Mosquitto local — pas de TLS, pas d'options avancées
-        return payload
-
-    # ── TLS EMQX Cloud (local=False) ─────────────────────────────────────────
-    # EMQX Cloud Serverless n'expose que le port 8883 (TLS obligatoire).
-    # Sans advanced_options=True, HA tente une connexion TCP plain → cannot_connect.
-    if "advanced_options" in schema_names:
-        payload["advanced_options"] = True
-
-    # Le nom du champ CA a changé selon les versions HA :
-    # 'certificate' (anciennes) ou 'set_ca_cert' (HA 2025.x).
-    for k in ("certificate", "set_ca_cert"):
-        if k in schema_names:
-            payload[k] = "auto"  # CAs système — EMQX a un cert Let's Encrypt valide
-    if "tls_insecure" in schema_names:
-        payload["tls_insecure"] = False
 
     return payload
 
@@ -968,7 +944,7 @@ def configure_mqtt(force: bool = False):
         if errors:
             warn(f"[MQTT] Erreurs dans le formulaire : {errors}")
 
-        payload = _build_mqtt_broker_payload(schema, local=True)
+        payload = _build_mqtt_broker_payload(schema)
         log(f"[MQTT] Payload envoyé : {payload}")
 
         ok, flow = _mqtt_submit(flow_id, payload, f"form step={step_id}")
@@ -986,57 +962,17 @@ def configure_mqtt(force: bool = False):
 
 def create_automations():
     log("── Automations ──────────────────────────────")
-    p = SITE_PREFIX
 
+    # domoticium_state_stream et domoticium_command_handler (MQTT/EMQX) retirées —
+    # remplacées par run_ha_ws_bridge() (état) et le serveur de commandes HTTP (commandes).
     automations = [
-        {
-            "id": "domoticium_state_stream",
-            "alias": "Domoticium — State Stream",
-            "description": "Publie états et attributs vers EMQX",
-            "mode": "parallel", "max": 50,
-            "trigger": [{"platform": "event", "event_type": "state_changed"}],
-            "condition": [{"condition": "template", "value_template": (
-                "{{ trigger.event.data.entity_id.split('.')[0] in "
-                "['light','switch','sensor','binary_sensor','climate','cover','camera'] "
-                "and trigger.event.data.new_state is not none }}"
-            )}],
-            "action": [
-                {"service": "mqtt.publish", "data": {
-                    "topic": f"{p}/ha/{{{{ trigger.event.data.entity_id.split('.')[0] }}}}/{{{{ trigger.event.data.entity_id.split('.')[1] }}}}/state",
-                    "payload": "{{ trigger.event.data.new_state.state }}", "retain": True,
-                }},
-                {"service": "mqtt.publish", "data": {
-                    "topic": f"{p}/ha/{{{{ trigger.event.data.entity_id.split('.')[0] }}}}/{{{{ trigger.event.data.entity_id.split('.')[1] }}}}/attributes",
-                    "payload": "{{ trigger.event.data.new_state.attributes | to_json }}", "retain": True,
-                }},
-            ],
-        },
-        {
-            "id": "domoticium_command_handler",
-            "alias": "Domoticium — Command Handler",
-            "description": "Exécute les commandes reçues via EMQX",
-            "mode": "parallel", "max": 20,
-            "trigger": [{"platform": "mqtt", "topic": f"{p}/ha/command"}],
-            "condition": [{"condition": "template",
-                           "value_template": "{{ trigger.payload_json.service is defined }}"}],
-            "action": [{
-                "service": "{{ trigger.payload_json.service }}",
-                "target": "{{ trigger.payload_json.target | default({}) }}",
-                "data": "{{ trigger.payload_json.data | default({}) }}",
-            }],
-        },
         {
             "id": "domoticium_heartbeat",
             "alias": "Domoticium — Heartbeat",
-            "description": "Publie un heartbeat toutes les 30 secondes (MQTT + API)",
+            "description": "Notifie l'API toutes les 30 secondes",
             "mode": "single",
             "trigger": [{"platform": "time_pattern", "seconds": "/30"}],
-            "action": [
-                {"service": "mqtt.publish", "data": {
-                    "topic": f"{p}/ha/heartbeat", "payload": "1", "retain": False,
-                }},
-                {"service": "rest_command.domoticium_heartbeat"},
-            ],
+            "action": [{"service": "rest_command.domoticium_heartbeat"}],
         },
         {
             "id": "domoticium_camera_status",
@@ -1220,34 +1156,22 @@ def restart_frigate():
     threading.Thread(target=_do, daemon=True).start()
 
 
-def handle_camera_configure(client, msg):
-    """
-    Ajoute ou supprime une caméra dans Frigate.
-    Topic   : {prefix}/cameras/{cameraId}/configure
-    Payload : {"action": "add"|"remove", "streamName": "...", "rtspUrl": "rtsp://..."}
-    """
-    try:
-        data        = json.loads(msg.payload.decode())
-        action      = data.get("action", "add")
-        stream_name = data["streamName"]
-
-        if action == "add":
-            rtsp_url = data["rtspUrl"]
-            _cameras[stream_name] = rtsp_url
-            _save_cameras()
-            write_frigate_config()
-            restart_frigate()
-            log(f"✓ Caméra ajoutée : '{stream_name}' — Frigate redémarre")
-
-        elif action == "remove":
-            _cameras.pop(stream_name, None)
-            _save_cameras()
-            write_frigate_config()
-            restart_frigate()
-            log(f"✓ Caméra supprimée : '{stream_name}' — Frigate redémarre")
-
-    except Exception as e:
-        warn(f"Camera configure: {e}")
+def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None):
+    """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP."""
+    if action == "add":
+        if not rtsp_url:
+            raise ValueError("rtspUrl manquant")
+        _cameras[stream_name] = rtsp_url
+        _save_cameras()
+        write_frigate_config()
+        restart_frigate()
+        log(f"✓ Caméra ajoutée : '{stream_name}' — Frigate redémarre")
+    elif action == "remove":
+        _cameras.pop(stream_name, None)
+        _save_cameras()
+        write_frigate_config()
+        restart_frigate()
+        log(f"✓ Caméra supprimée : '{stream_name}' — Frigate redémarre")
 
 
 def _matter_ws_frames(s):
@@ -1351,52 +1275,64 @@ def _matter_commission_ws(code: str, timeout_s: int = 200):
                 pass
 
 
-def handle_matter_commission(client, msg):
-    """
-    Commissionne un device Matter via HA WebSocket.
-    Topic   : {prefix}/matter/commission/start
-    Payload : {"requestId": "...", "code": "12345678"}
-    """
+def handle_matter_commission(request_id: str, code: str):
+    """Commissionne un device Matter via matter-server WebSocket (thread de fond).
+    Le résultat est poussé vers Supabase (sites.last_commission_status) via ingest —
+    l'app le lit par polling pendant la fenêtre de commissioning."""
     def _do():
-        request_id = None
         try:
-            data       = json.loads(msg.payload.decode())
-            request_id = data.get("requestId")
-            code       = data.get("code", "")
-            if not code:
-                raise ValueError("Code PIN manquant")
-
-            log(f"Matter commission {(request_id or '?')[:8]}… code={code}")
+            log(f"Matter commission {request_id[:8]}… code={code}")
             success, detail = _matter_commission_ws(code)
-            result_topic = f"{SITE_PREFIX}/matter/commission/status/{request_id}"
             if success:
                 log(f"✓ Matter commission réussie — node_id={detail}")
-                client.publish(result_topic,
-                               json.dumps({"requestId": request_id, "success": True,
-                                           "nodeId": detail}),
-                               qos=1)
+                _post_ingest_commission_status(request_id, True, node_id=detail)
+                # Auto-enregistrement dans Supabase (comme Zigbee) — noms par défaut,
+                # l'utilisateur renomme ensuite dans l'app. Détails précis (vendor/product)
+                # pas disponibles ici ; l'entité HA réelle sera enrichie via ha-ws-bridge.
+                try:
+                    node_id_int = int(detail)
+                    _sync_matter_device_to_app(
+                        node_id_int, f"Matter #{node_id_int}", "", "", "switch"
+                    )
+                except (ValueError, TypeError):
+                    warn(f"[matter] node_id non numérique ({detail!r}) — auto-registration ignorée")
             else:
                 warn(f"⚠ Matter commission échouée: {detail}")
-                client.publish(result_topic,
-                               json.dumps({"requestId": request_id, "success": False,
-                                           "error": detail}),
-                               qos=1)
+                _post_ingest_commission_status(request_id, False, error=detail)
         except Exception as exc:
             warn(f"Matter commission: {exc}")
-            if request_id:
-                client.publish(
-                    f"{SITE_PREFIX}/matter/commission/status/{request_id}",
-                    json.dumps({"requestId": request_id, "success": False, "error": str(exc)}),
-                    qos=1)
+            _post_ingest_commission_status(request_id, False, error=str(exc))
 
     threading.Thread(target=_do, daemon=True).start()
+
+
+def _post_ingest_commission_status(
+    request_id: str, success: bool, node_id: str | None = None, error: str | None = None
+):
+    """Pousse le résultat du commissioning Matter vers Supabase (sites.last_commission_status)."""
+    if not INGEST_SECRET:
+        return
+    try:
+        requests.post(
+            f"{APP_URL}/api/ingest/commission-status",
+            json={
+                "siteSecret": INGEST_SECRET,
+                "siteId": SITE_PREFIX,
+                "requestId": request_id,
+                "success": success,
+                "nodeId": node_id,
+                "error": error,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        warn(f"[ingest/commission-status] {e}")
 
 
 _z2m_online: bool | None = None  # état Z2M courant, None = inconnu
 
 # ── Sync omnipresente App → HA ────────────────────────────────────────────────
-_sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: reconnexion)
-_first_connect   = True               # distingue démarrage initial vs reconnexion
+_sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: device supprimé)
 _mqtt_broker_checked = False          # flag one-shot pour _check_and_fix_mqtt_broker
 
 
@@ -1437,7 +1373,7 @@ def _check_and_fix_mqtt_broker():
         is_mosquitto = (
             "mosquitto" in broker.lower()
             or broker in ("127.0.0.1", "localhost", "")
-            or (port == 1883 and EMQX_HOST not in broker)
+            or port == 1883
         )
 
         if is_mosquitto:
@@ -1664,39 +1600,10 @@ def call_heartbeat_api():
         warn(f"Heartbeat API: {e}")
 
 
-def on_connect(client, userdata, flags, reason_code, properties):
-    """Connecté à EMQX local — souscrit uniquement aux commandes caméra (reste via HA API)."""
-    global _first_connect
-    if reason_code.is_failure:
-        warn(f"[emqx-local] Connexion échouée ({reason_code})")
-        return
-    p = SITE_PREFIX
-    # Seules les commandes caméra passent encore par EMQX local.
-    # Les commandes Z2M/Matter/HA arrivent désormais directement via HA API → pas de subscription.
-    client.subscribe([(f"{p}/cameras/+/configure", 1)])
-    log(f"[emqx-local] Connecté — souscrit à {p}/cameras/+/configure")
-
-    if _first_connect:
-        _first_connect = False
-    else:
-        log("[sync] Reconnexion EMQX local détectée — sync immédiate dans 10s")
-        def _delayed_sync():
-            time.sleep(10)
-            _sync_requested.set()
-        threading.Thread(target=_delayed_sync, daemon=True).start()
-
-
-def on_message(client, userdata, msg):
-    """Messages reçus depuis EMQX local (commandes caméra uniquement)."""
-    parts = msg.topic.split("/")
-    if len(parts) >= 4 and parts[1] == "cameras" and parts[3] == "configure":
-        handle_camera_configure(client, msg)
-
-
 def run_ha_ws_bridge():
-    """Thread permanent : écoute HA WebSocket → relaie état_changed + entity_registry vers EMQX local.
-    Remplace les automations HA State Stream et le relay cloud EMQX→local."""
-    # Domaines HA à relayer vers EMQX local (filtre pour réduire le trafic)
+    """Thread permanent : écoute HA WebSocket → persiste état + registre vers Supabase (ingest).
+    Seul canal d'état — remplace entièrement EMQX et les automations HA State Stream."""
+    # Domaines HA à persister (filtre pour réduire le trafic — tout ce que l'app affiche)
     RELAY_DOMAINS = {
         "light", "switch", "cover", "lock", "fan", "climate", "sensor",
         "binary_sensor", "input_boolean", "media_player", "camera",
@@ -1734,23 +1641,10 @@ def run_ha_ws_bridge():
 
                     state_val = new_state.get("state", "")
                     attributes = new_state.get("attributes", {})
-                    obj_id = entity_id.split(".", 1)[1] if "." in entity_id else entity_id
 
-                    if _cloud_client:
-                        # État : texte brut (comme l'ancienne automation State Stream)
-                        _cloud_client.publish(
-                            f"{SITE_PREFIX}/ha/{domain}/{obj_id}/state",
-                            state_val, qos=0
-                        )
-                        # Attributs complets : JSON
-                        if attributes:
-                            _cloud_client.publish(
-                                f"{SITE_PREFIX}/ha/{domain}/{obj_id}/attributes",
-                                json.dumps(attributes), qos=0
-                            )
-
-                    # Persiste en DB via /api/ingest/states (caméras + historique)
-                    if INGEST_SECRET and domain in ("camera", "alarm_control_panel"):
+                    # Persiste en DB via /api/ingest/states — seul canal d'état vers l'app
+                    # (Supabase Realtime relaie ensuite vers le navigateur).
+                    if INGEST_SECRET:
                         threading.Thread(
                             target=_post_ingest_state,
                             args=(entity_id, state_val, attributes),
@@ -1816,12 +1710,11 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
 
 
 def _heartbeat_loop():
-    """Envoie un heartbeat toutes les 30 secondes : webhook API + EMQX local (→ haOnline navigateur)."""
+    """Envoie un heartbeat toutes les 30 secondes via webhook API — met à jour
+    sites.last_heartbeat_at, relayé au navigateur par Supabase Realtime."""
     time.sleep(10)
     while True:
         call_heartbeat_api()
-        if _cloud_client:
-            _cloud_client.publish(f"{SITE_PREFIX}/ha/heartbeat", "1", qos=1)
         time.sleep(30)
 
 
@@ -1829,12 +1722,7 @@ def on_local_connect(client, userdata, flags, reason_code, properties):
     if reason_code.is_failure:
         warn(f"[local] Connexion Mosquitto échouée ({reason_code})")
         return
-    p = SITE_PREFIX
-    topics = [
-        ("zigbee2mqtt/#", 1),       # tous les messages Z2M (états + bridge/state)
-        (f"{p}/ha/#", 1),           # état stream HA (publié par automation State Stream)
-    ]
-    client.subscribe(topics)
+    client.subscribe([("zigbee2mqtt/#", 1)])  # tous les messages Z2M (états + bridge/state)
     log("[local] Connecté Mosquitto — souscrit zigbee2mqtt/# et ha/#")
 
 
@@ -2037,7 +1925,8 @@ def _sync_matter_device_to_app(node_id, name, vendor_name, product_name, device_
 
 
 def on_local_message(client, userdata, msg):
-    """Messages reçus depuis Mosquitto local → relay vers EMQX Cloud."""
+    """Messages reçus depuis Mosquitto local (Z2M). Plus de relay cloud —
+    l'état passe uniquement par run_ha_ws_bridge() → /api/ingest/states."""
     global _z2m_online
     topic   = msg.topic
     payload = msg.payload
@@ -2051,10 +1940,9 @@ def on_local_message(client, userdata, msg):
             online = payload.decode().strip() == "online"
         _z2m_online = online
         threading.Thread(target=call_heartbeat_api, daemon=True).start()
-        return  # pas besoin de relayer bridge/state vers le cloud
+        return
 
     # ── Z2M bridge/devices → auto-registration dans Supabase ─────────────────
-    # On relaie quand même vers EMQX pour que le navigateur voie les features.
     if topic == "zigbee2mqtt/bridge/devices":
         try:
             devices_list = json.loads(payload.decode())
@@ -2064,40 +1952,10 @@ def on_local_message(client, userdata, msg):
                 ).start()
         except Exception as exc:
             warn(f"[devices-sync] parse error: {exc}")
-        # Le relay vers EMQX se fait en fin de fonction (pas de return ici)
-
-    # ── Pas de relay des commandes (sens cloud→local uniquement) ─────────────
-    # /set, /get : commandes device → ne pas reboucler vers EMQX
-    # bridge/request/+ : permit_join, restart… → le cloud bridge les injecte sur
-    #   Mosquitto ; le local bridge les reçoit aussi car abonné à zigbee2mqtt/#.
-    #   Sans ce filtre, ils repartiraient vers EMQX → cloud bridge les reinjecterait
-    #   sur Mosquitto → boucle infinie.
-    if topic.endswith("/set") or topic.endswith("/get") or "/bridge/request/" in topic:
-        return
-
-    if not _cloud_client:
-        return
-
-    # ── Relay Z2M états local → EMQX : zigbee2mqtt/X → {prefix}/zigbee2mqtt/X ─
-    if topic.startswith("zigbee2mqtt/"):
-        # bridge/devices retenu sur EMQX → le navigateur le reçoit à chaque reconnexion
-        retain = (topic == "zigbee2mqtt/bridge/devices")
-        _cloud_client.publish(f"{SITE_PREFIX}/{topic}", payload, qos=1, retain=retain)
-        return
-
-    # ── Commandes ha/command → scripts HA (ne pas relayer vers le cloud) ────────
-    if topic == f"{SITE_PREFIX}/ha/command":
-        threading.Thread(target=_handle_ha_command, args=(payload,), daemon=True).start()
-        return
-
-    # ── Relay HA état stream local → EMQX : {prefix}/ha/X → {prefix}/ha/X ────
-    if topic.startswith(f"{SITE_PREFIX}/ha/"):
-        _cloud_client.publish(topic, payload, qos=1)
-        return
 
 
 def run_local_bridge():
-    """Thread permanent : connexion à Mosquitto local + relay vers EMQX Cloud."""
+    """Thread permanent : connexion à Mosquitto local (suivi Z2M, auto-registration devices)."""
     global _local_client
     _local_client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
@@ -2332,8 +2190,170 @@ def _ensure_matter_server():
             log("[matter] Open Thread Border Router en cours d'exécution ✓")
 
 
+# ── Serveur de commandes (remplace EMQX) ───────────────────────────────────────
+# Reçoit les appels HTTPS de Vercel (via tunnel Cloudflare, hostname dédié par site),
+# authentifié par INGEST_SECRET. Liste blanche de verbes de service HA — pas de
+# passthrough générique vers l'API HA (protège notamment contre camera.snapshot).
+ALLOWED_SERVICES = {
+    "light":         {"turn_on", "turn_off", "toggle"},
+    "switch":        {"turn_on", "turn_off", "toggle"},
+    "climate":       {"set_temperature", "set_hvac_mode", "turn_on", "turn_off"},
+    "cover":         {"open_cover", "close_cover", "stop_cover", "set_cover_position"},
+    "lock":          {"lock", "unlock"},
+    "fan":           {"turn_on", "turn_off", "toggle", "set_percentage"},
+    "media_player":  {"turn_on", "turn_off", "volume_set", "media_play", "media_pause"},
+    "homeassistant": {"turn_on", "turn_off", "toggle"},
+    "scene":         {"turn_on"},
+    "alarm_control_panel": {
+        "alarm_arm_home", "alarm_arm_away", "alarm_arm_night",
+        "alarm_arm_vacation", "alarm_disarm", "alarm_trigger",
+    },
+}
+
+
+class _CommandHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        log(f"[cmd-server] {self.address_string()} — {fmt % args}")
+
+    def _respond(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _reject(self, code, msg):
+        self._respond(code, {"error": msg})
+
+    def _ok(self, data=None):
+        self._respond(200, data or {"ok": True})
+
+    def do_POST(self):
+        if not INGEST_SECRET:
+            return self._reject(503, "ingest_secret non configuré")
+        if self.headers.get("X-Site-Secret") != INGEST_SECRET:
+            return self._reject(401, "Non autorisé")
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            data = json.loads(raw.decode() or "{}")
+        except Exception:
+            return self._reject(400, "JSON invalide")
+
+        try:
+            handlers = {
+                "/cmd":                  self._handle_cmd,
+                "/matter/commission":    self._handle_matter_commission,
+                "/zigbee/permit-join":   self._handle_permit_join,
+                "/zigbee/remove-device": self._handle_remove_device,
+                "/zigbee/set-attribute": self._handle_set_attribute,
+                "/ha-command":           self._handle_ha_command_route,
+                "/camera/configure":     self._handle_camera_configure_route,
+            }
+            handler = handlers.get(self.path)
+            if not handler:
+                return self._reject(404, "Route inconnue")
+            handler(data)
+        except Exception as e:
+            warn(f"[cmd-server] {self.path}: {e}")
+            self._reject(500, str(e))
+
+    def _handle_cmd(self, data):
+        service = data.get("service", "")
+        entity_id = data.get("entity_id")
+        extra = data.get("data") or {}
+        if "." not in service:
+            return self._reject(400, "service invalide")
+        domain, verb = service.split(".", 1)
+        if verb not in ALLOWED_SERVICES.get(domain, set()):
+            return self._reject(403, f"service non autorisé: {service}")
+        payload = dict(extra)
+        if entity_id:
+            payload["entity_id"] = entity_id
+        r = ha_post(f"/services/{domain}/{verb}", payload)
+        if r.ok:
+            self._ok()
+        else:
+            self._reject(502, f"HA {r.status_code}: {r.text[:200]}")
+
+    def _handle_matter_commission(self, data):
+        request_id = data.get("requestId") or secrets.token_hex(8)
+        code = data.get("code", "")
+        if not code:
+            return self._reject(400, "code manquant")
+        handle_matter_commission(request_id, code)
+        self._ok({"requestId": request_id, "status": "commissioning"})
+
+    def _handle_permit_join(self, data):
+        enable = data.get("enable", True)
+        duration = data.get("duration", 60)
+        if not _local_client:
+            return self._reject(503, "Mosquitto local non connecté")
+        _local_client.publish(
+            "zigbee2mqtt/bridge/request/permit_join",
+            json.dumps({"value": bool(enable), "time": duration if enable else 0}),
+            qos=1,
+        )
+        self._ok()
+
+    def _handle_remove_device(self, data):
+        ieee = data.get("ieee_address")
+        if not ieee:
+            return self._reject(400, "ieee_address manquant")
+        if not _local_client:
+            return self._reject(503, "Mosquitto local non connecté")
+        _local_client.publish(
+            "zigbee2mqtt/bridge/request/device/remove",
+            json.dumps({"id": ieee, "force": False}),
+            qos=1,
+        )
+        self._ok()
+
+    def _handle_set_attribute(self, data):
+        friendly_name = data.get("friendlyName")
+        attribute = data.get("attribute")
+        if not friendly_name or not attribute:
+            return self._reject(400, "friendlyName et attribute requis")
+        if not _local_client:
+            return self._reject(503, "Mosquitto local non connecté")
+        _local_client.publish(
+            f"zigbee2mqtt/{friendly_name}/set",
+            json.dumps({attribute: data.get("value")}),
+            qos=1,
+        )
+        self._ok()
+
+    def _handle_ha_command_route(self, data):
+        _handle_ha_command(json.dumps(data).encode())
+        self._ok()
+
+    def _handle_camera_configure_route(self, data):
+        action = data.get("action", "add")
+        stream_name = data.get("streamName")
+        if not stream_name:
+            return self._reject(400, "streamName manquant")
+        handle_camera_configure(action, stream_name, data.get("rtspUrl"))
+        self._ok()
+
+
+def run_command_server():
+    """Serveur HTTP local (127.0.0.1 uniquement) — exposé au monde via le tunnel
+    Cloudflare existant (ingress ha-{slug}.domoticium.fr → 127.0.0.1:COMMAND_PORT)."""
+    if not INGEST_SECRET:
+        warn("[cmd-server] ingest_secret non configuré — serveur de commandes désactivé")
+        return
+    try:
+        httpd = socketserver.ThreadingTCPServer(("127.0.0.1", COMMAND_PORT), _CommandHandler)
+        httpd.daemon_threads = True
+        log(f"[cmd-server] ✓ Serveur de commandes actif sur 127.0.0.1:{COMMAND_PORT}")
+        httpd.serve_forever()
+    except Exception as e:
+        warn(f"[cmd-server] Erreur fatale : {e}")
+
+
 def run_bridge():
-    global _cloud_client
     _load_cameras()
     start_cloudflared()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
@@ -2341,26 +2361,11 @@ def run_bridge():
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     threading.Thread(target=_ha_sync_loop,   daemon=True).start()
     threading.Thread(target=run_local_bridge, daemon=True).start()
-    # Bridge HA WebSocket → EMQX local (remplace le relay cloud + automations State Stream)
+    # Bridge HA WebSocket → Supabase (ingest) : seul canal d'état, remplace EMQX
     threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
 
-    # Connexion à EMQX local (pas de TLS — même Pi, réseau interne)
-    # EMQX local doit être configuré sur EMQX_LOCAL_PORT (1884 par défaut, évite conflit Mosquitto:1883)
-    _cloud_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="domoticium-emqx-local", clean_session=True)
-    _cloud_client.username_pw_set(PI_USER, PI_PASS)
-    _cloud_client.on_connect    = on_connect
-    _cloud_client.on_message    = on_message
-    _cloud_client.on_disconnect = lambda c, u, df, rc, props: (
-        warn(f"[emqx-local] Déconnexion ({rc}) — reconnexion…") if rc.is_failure else None
-    )
-    log(f"[emqx-local] Connexion à {EMQX_LOCAL_HOST}:{EMQX_LOCAL_PORT} (sans TLS)")
-    while True:
-        try:
-            _cloud_client.connect(EMQX_LOCAL_HOST, EMQX_LOCAL_PORT, keepalive=60)
-            _cloud_client.loop_forever()
-        except Exception as e:
-            warn(f"[emqx-local] {e} — retry dans 10s")
-            time.sleep(10)
+    # Serveur de commandes — bloquant, tourne dans le thread principal
+    run_command_server()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
