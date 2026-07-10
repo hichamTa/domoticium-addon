@@ -1104,7 +1104,7 @@ def run_setup():
     remove_legacy_mqtt_discovery_prefix()
 
     # install_matter_server()      — désactivé temporairement : on valide Zigbee d'abord
-    # install_thread_border_router()  — idem (dépend de Matter/Thread)
+    # if INSTALL_THREAD_ROUTER: install_thread_border_router()  — idem (dépend de Matter/Thread)
     # install_frigate()  — caméras via go2rtc addon HA
     create_automations()
     write_rest_commands()
@@ -2162,7 +2162,9 @@ def _ensure_matter_server():
     else:
         warn("[bluetooth] Intégration Bluetooth non disponible après 5 tentatives — le commissioning Matter via BLE sera impossible")
 
-    if not _is_addon_installed(THREAD_SLUG):
+    if not INSTALL_THREAD_ROUTER:
+        log("[matter] Open Thread Border Router désactivé (install_thread_border_router=false) — ignoré")
+    elif not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
         # install_thread_border_router()  — désactivé temporairement : on valide Zigbee d'abord
     else:
