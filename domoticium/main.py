@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, http.server, json, os, secrets, socket, socketserver, struct, subprocess, sys, threading, time
+import base64, http.server, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time
 import paho.mqtt.client as mqtt
 import requests
 
@@ -1569,7 +1569,39 @@ def _sync_all_to_ha():
         _local_client.publish("zigbee2mqtt/bridge/request/devices", "", qos=1)
         log("[sync] bridge/request/devices publié → Z2M va republier bridge/devices")
 
+    _backfill_ha_entity_links()
+
     log("[sync] ✓ Terminé")
+
+
+def _backfill_ha_entity_links():
+    """Relie tout device Zigbee dont ha_entity_id est encore vide à son entité HA —
+    rattrape les devices créés avant le lien entity_registry_updated→ieee_address
+    (ou dont l'événement a été manqué : redémarrage, erreur réseau ponctuelle…).
+    Idempotent (ré-envoyer le même lien ne fait rien) — appelé à chaque cycle de sync."""
+    result = _ha_ws_call("config/entity_registry/list")
+    if not result or not result.get("success"):
+        return
+    for e in result.get("result", []):
+        entity_id = e.get("entity_id", "")
+        m = _IEEE_RE.search(e.get("unique_id") or "")
+        if not m:
+            continue
+        try:
+            requests.post(
+                f"{APP_URL}/api/ingest/registry",
+                json={
+                    "siteSecret": INGEST_SECRET,
+                    "siteId": SITE_PREFIX,
+                    "action": "added",
+                    "entityId": entity_id,
+                    "domain": entity_id.split(".")[0] if "." in entity_id else None,
+                    "ieeeAddress": m.group(0),
+                },
+                timeout=10,
+            )
+        except Exception as ex:
+            warn(f"[sync] backfill ha_entity_id {entity_id}: {ex}")
 
 
 def _ha_sync_loop():
@@ -1696,21 +1728,41 @@ def _post_ingest_state(entity_id: str, state: str, attributes: dict):
         warn(f"[ingest/states] {entity_id}: {e}")
 
 
+_IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
+
+def _ieee_from_entity_unique_id(entity_id: str) -> str | None:
+    """Retrouve l'adresse IEEE Zigbee2MQTT d'une entité HA via son unique_id
+    (Z2M l'y inclut toujours, ex: '0x8c8b48fffe0fc275_light'). None si l'entité
+    n'est pas Zigbee ou introuvable."""
+    result = _ha_ws_call("config/entity_registry/list")
+    if not result or not result.get("success"):
+        return None
+    for e in result.get("result", []):
+        if e.get("entity_id") == entity_id:
+            m = _IEEE_RE.search(e.get("unique_id") or "")
+            return m.group(0) if m else None
+    return None
+
+
 def _post_ingest_registry(entity_id: str, action: str, data: dict):
     """Appelle /api/ingest/registry quand une entité HA est ajoutée/supprimée/renommée."""
     try:
-        requests.post(
-            f"{APP_URL}/api/ingest/registry",
-            json={
-                "siteSecret": INGEST_SECRET,
-                "siteId": SITE_PREFIX,
-                "action": action,
-                "entityId": entity_id,
-                "friendlyName": data.get("name") or data.get("changes", {}).get("name"),
-                "domain": entity_id.split(".")[0] if "." in entity_id else None,
-            },
-            timeout=10,
-        )
+        payload = {
+            "siteSecret": INGEST_SECRET,
+            "siteId": SITE_PREFIX,
+            "action": action,
+            "entityId": entity_id,
+            "friendlyName": data.get("name") or data.get("changes", {}).get("name"),
+            "domain": entity_id.split(".")[0] if "." in entity_id else None,
+        }
+        if action == "added":
+            # Relie le device Zigbee (créé par devices-sync, ha_entity_id encore null)
+            # à cette entité HA fraîchement créée — sinon état et commandes ne
+            # fonctionnent jamais pour ce device (vu en test réel).
+            ieee = _ieee_from_entity_unique_id(entity_id)
+            if ieee:
+                payload["ieeeAddress"] = ieee
+        requests.post(f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
     except Exception as e:
         warn(f"[ingest/registry] {entity_id}: {e}")
 
