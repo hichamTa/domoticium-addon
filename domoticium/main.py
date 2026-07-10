@@ -2243,6 +2243,9 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             return self._reject(400, "JSON invalide")
 
         try:
+            # Le tunnel Cloudflare route ce port via le préfixe /addon (hostname unique
+            # par site, partagé avec les caméras — cf. lib/cloudflare/tunnel.ts côté Vercel).
+            route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
             handlers = {
                 "/cmd":                  self._handle_cmd,
                 "/matter/commission":    self._handle_matter_commission,
@@ -2252,7 +2255,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/ha-command":           self._handle_ha_command_route,
                 "/camera/configure":     self._handle_camera_configure_route,
             }
-            handler = handlers.get(self.path)
+            handler = handlers.get(route)
             if not handler:
                 return self._reject(404, "Route inconnue")
             handler(data)
