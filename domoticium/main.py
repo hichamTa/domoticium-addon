@@ -2146,15 +2146,11 @@ def _ensure_bluetooth_integration():
     Retourne True si Bluetooth est disponible (déjà configuré ou ajouté),
     False si aucun adaptateur n'est détecté.
     """
-    # 1a. Vérifier via /api/config (composants chargés) — check le plus fiable
-    r_cfg = ha_get("/config")
-    if r_cfg.ok:
-        components = r_cfg.json().get("components", [])
-        if "bluetooth" in components:
-            log("[bluetooth] ✓ Intégration Bluetooth active (composant HA chargé)")
-            return True
-
-    # 1b. Vérifier via config entries
+    # 1. Vérifier via config entries — seul check fiable : "bluetooth" peut apparaître
+    # dans /config (composants chargés) simplement parce qu'une autre intégration (ex.
+    # Matter BLE proxy) déclare "bluetooth" comme dépendance, sans qu'aucun adaptateur
+    # ne soit réellement configuré (vu en test réel : composant chargé mais hci0 encore
+    # en attente dans "Découvertes", jamais ajouté car ce check retournait déjà True).
     r = ha_get("/config/config_entries/entries")
     if r.ok:
         domains = [e.get("domain", "") for e in r.json()]
