@@ -895,19 +895,28 @@ def _build_mqtt_broker_payload(schema: list) -> dict:
     return payload
 
 
+def _mqtt_config_entry_exists() -> bool:
+    """Lit core.config_entries (source fiable) — /services expose mqtt.publish même sans
+    aucune entrée configurée (faux positif observé en test réel : configure_mqtt() se
+    croyait "déjà configuré et actif" alors qu'aucune intégration MQTT n'existait dans HA,
+    et ne créait donc jamais les entités Zigbee — état/commandes cassés en conséquence)."""
+    try:
+        with open("/homeassistant/.storage/core.config_entries") as f:
+            storage = json.load(f)
+        entries = storage.get("data", {}).get("entries", [])
+        return any(e.get("domain") == "mqtt" for e in entries)
+    except Exception as e:
+        warn(f"[MQTT] Lecture core.config_entries impossible : {e}")
+        return False
+
+
 def configure_mqtt(force: bool = False):
     log("── MQTT (Mosquitto local) ───────────────────")
 
     # Vérifier si MQTT est déjà actif (sauf si force=True après suppression de l'entrée)
-    if not force:
-        svc_resp = requests.get(f"{API}/services", headers=HDRS, timeout=10)
-        if svc_resp.ok:
-            try:
-                if any(s.get("domain") == "mqtt" for s in svc_resp.json()):
-                    log("MQTT déjà configuré et actif")
-                    return
-            except Exception:
-                pass
+    if not force and _mqtt_config_entry_exists():
+        log("MQTT déjà configuré et actif")
+        return
 
     log("Configuration MQTT → core-mosquitto:1883…")
     flow_resp = ha_post("/config/config_entries/flow", {"handler": "mqtt"})
