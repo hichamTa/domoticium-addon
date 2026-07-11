@@ -622,7 +622,9 @@ def install_thread_border_router():
                 headers=HDRS, json=step_payload, timeout=10
             )
             log(f"[OTBR] flow step → {r2.status_code}: {r2.text[:400]}")
-            if r2.ok and r2.json().get("type") == "create_entry":
+            r2_json = r2.json() if r2.ok else {}
+            r2_reason = r2_json.get("reason", "")
+            if r2_json.get("type") == "create_entry" or "already" in r2_reason:
                 log("✓ Intégration OTBR (Thread) activée dans HA")
             else:
                 warn(f"[OTBR] Intégration non finalisée — {r2.status_code}: {r2.text[:200]}")
