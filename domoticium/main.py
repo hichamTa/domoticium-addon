@@ -1338,7 +1338,13 @@ def _matter_commission_ws(code: str, timeout_s: int = 200):
                     return False, details
                 if "error" in msg:
                     return False, str(msg["error"])
-                return True, str(msg.get("result", ""))
+                # result est le node complet (node_id, date_commissioned, attributes…),
+                # pas juste l'id — extraire node_id explicitement (vu en test réel :
+                # str(dict complet) passé tel quel faisait échouer int(detail) en aval,
+                # "auto-registration ignorée" malgré un commissioning réussi).
+                result = msg.get("result", {})
+                node_id = result.get("node_id") if isinstance(result, dict) else result
+                return True, str(node_id)
 
     except socket.timeout:
         return False, f"Timeout {timeout_s}s — device pas en mode jumelage (discriminator attendu: vérifier reset d'usine)"
