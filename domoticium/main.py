@@ -605,10 +605,17 @@ def install_thread_border_router():
         if flow_type == "create_entry":
             log("✓ Intégration OTBR (Thread) activée dans HA")
         elif flow_id:
-            # Selon le step, soumettre l'URL de l'API OTBR (port 8081 par défaut)
+            # Selon le step, soumettre l'URL de l'API OTBR (port 8081 par défaut).
+            # "localhost" est FAUX ici : chaque add-on HA OS tourne dans son propre
+            # conteneur — HA Core n'a pas d'API OTBR sur son propre "localhost".
+            # Le nom d'hôte interne Supervisor suit toujours slug avec "_" → "-"
+            # (même convention que core_mosquitto → "core-mosquitto:1883" ailleurs
+            # dans ce fichier) — confirmé en test réel : OTBR démarre et forme
+            # correctement son réseau Thread, seule cette URL était fausse.
             step_payload: dict = {}
             if step_id in ("user", None) or "url" in str(result.get("data_schema", "")):
-                step_payload = {"url": "http://localhost:8081"}
+                otbr_hostname = THREAD_SLUG.replace("_", "-")
+                step_payload = {"url": f"http://{otbr_hostname}:8081"}
             log(f"[OTBR] step_id={step_id!r} → payload={step_payload}")
             r2 = requests.post(
                 f"{API}/config/config_entries/flow/{flow_id}",
