@@ -1250,6 +1250,30 @@ def _matter_ws_frames(s):
     return _recv, _send
 
 
+def _get_otbr_active_dataset():
+    """Récupère le dataset opérationnel Thread actif depuis OTBR (format TLV hex),
+    à pousser vers matter-server avant tout commissioning Matter-over-Thread.
+    Sans ça, matter-server ne connaît aucun réseau Thread à donner au device
+    pendant la commande NetworkCommissioning → échec systématique
+    "No Wi-Fi/Thread network credentials are configured for commissioning"
+    (vu en test réel : PASE/attestation BLE réussissent, seule cette étape bloque).
+    Retourne None si OTBR est désactivé ou injoignable (device WiFi-only : pas bloquant)."""
+    if not INSTALL_THREAD_ROUTER:
+        return None
+    otbr_hostname = THREAD_SLUG.replace("_", "-")
+    try:
+        r = requests.get(
+            f"http://{otbr_hostname}:8081/node/dataset/active",
+            headers={"Accept": "text/plain"}, timeout=10,
+        )
+        if r.ok and r.text.strip():
+            return r.text.strip()
+        warn(f"[matter] Dataset Thread OTBR : {r.status_code} {r.text[:150]}")
+    except Exception as e:
+        warn(f"[matter] Lecture dataset Thread OTBR : {e}")
+    return None
+
+
 def _matter_commission_ws(code: str, timeout_s: int = 200):
     """Commission via matter-server WebSocket direct (port 5580).
     HA 2026+ : ni REST ni HA WebSocket ne fonctionnent pour le commissioning.
@@ -1278,6 +1302,23 @@ def _matter_commission_ws(code: str, timeout_s: int = 200):
         # matter-server envoie un message info à la connexion
         info = _recv()
         log(f"[matter-server] Connecté — schema={info.get('schema_version')} sdk={info.get('sdk_version')}")
+
+        # Matter-over-Thread : matter-server doit connaître le réseau Thread AVANT
+        # de commissionner, sinon l'étape NetworkCommissioning.Validate échoue toujours
+        # (device WiFi-only : dataset=None, on skip simplement, pas bloquant).
+        dataset = _get_otbr_active_dataset()
+        if dataset:
+            _send({"message_id": "set-thread-dataset-1", "command": "set_thread_dataset",
+                   "args": {"dataset": dataset}})
+            while True:
+                msg = _recv()
+                mid = msg.get("message_id") or msg.get("messageId")
+                if mid == "set-thread-dataset-1":
+                    if "error_code" in msg or "errorCode" in msg or "error" in msg:
+                        warn(f"[matter-server] set_thread_dataset échoué : {json.dumps(msg)[:300]}")
+                    else:
+                        log("[matter-server] ✓ Dataset Thread transmis")
+                    break
 
         msg_id = "commission-1"
         _send({"message_id": msg_id, "command": "commission_with_code",
