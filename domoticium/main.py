@@ -369,6 +369,19 @@ def install_zigbee2mqtt():
         zigbee_port = ZIGBEE_ADAPTER  # "auto" ou port USB explicite
         serial_cfg  = {"port": zigbee_port}  # USB : pas besoin de préciser le type
 
+    z2m_dir = "/homeassistant/zigbee2mqtt"
+    os.makedirs(z2m_dir, exist_ok=True)
+
+    # "network_key": "GENERATE" ne doit être écrit qu'à la toute première installation.
+    # Le réécrire à chaque run_setup() (ex: force_setup) fait redemander une NOUVELLE clé
+    # aléatoire à chaque fois → décalage avec le backup Zigbee-herdsman existant → Z2M
+    # reforme un réseau vierge et perd TOUS les appareils déjà appairés (vu en test réel :
+    # "Currently 0 devices are joined" après un force_setup sur un coordinateur déjà en service).
+    is_first_setup = not os.path.exists(f"{z2m_dir}/configuration.yaml")
+    advanced_cfg: dict = {"log_level": "info"}
+    if is_first_setup:
+        advanced_cfg["network_key"] = "GENERATE"
+
     z2m_config = {
         "mqtt": {
             # Z2M → Mosquitto local (offline-first).
@@ -385,12 +398,10 @@ def install_zigbee2mqtt():
             "status_topic":    "homeassistant/status",
         },
         "permit_join": False,
-        "advanced": {"log_level": "info", "network_key": "GENERATE"},
+        "advanced": advanced_cfg,
         "frontend": {"port": 8099},
     }
 
-    z2m_dir = "/homeassistant/zigbee2mqtt"
-    os.makedirs(z2m_dir, exist_ok=True)
     with open(f"{z2m_dir}/configuration.yaml", "w") as f:
         f.write(_dict_to_yaml(z2m_config))
     log("✓ Configuration Zigbee2MQTT écrite")
