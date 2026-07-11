@@ -1761,31 +1761,35 @@ def _sync_all_to_ha():
 
 
 def _backfill_ha_entity_links():
-    """Relie tout device Zigbee dont ha_entity_id est encore vide à son entité HA —
-    rattrape les devices créés avant le lien entity_registry_updated→ieee_address
-    (ou dont l'événement a été manqué : redémarrage, erreur réseau ponctuelle…).
-    Idempotent (ré-envoyer le même lien ne fait rien) — appelé à chaque cycle de sync."""
+    """Relie tout device (Zigbee ou Matter) dont ha_entity_id est encore vide à son
+    entité HA — rattrape les devices créés avant le lien entity_registry_updated→
+    ieee/node_id (ou dont l'événement a été manqué : redémarrage, erreur réseau
+    ponctuelle…). Idempotent (ré-envoyer le même lien ne fait rien) — appelé à chaque
+    cycle de sync. Sans ce lien pour Matter, l'état (ex: capteur d'ouverture) ne
+    remonte jamais dans l'app — vu en test réel après le 1er commissioning."""
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         return
     for e in result.get("result", []):
         entity_id = e.get("entity_id", "")
-        m = _IEEE_RE.search(e.get("unique_id") or "")
-        if not m:
-            continue
+        unique_id = e.get("unique_id") or ""
+        m = _IEEE_RE.search(unique_id)
+        payload = {
+            "siteSecret": INGEST_SECRET,
+            "siteId": SITE_PREFIX,
+            "action": "added",
+            "entityId": entity_id,
+            "domain": entity_id.split(".")[0] if "." in entity_id else None,
+        }
+        if m:
+            payload["ieeeAddress"] = m.group(0)
+        else:
+            node_id = _matter_node_id_from_unique_id(unique_id)
+            if node_id is None:
+                continue
+            payload["matterNodeId"] = node_id
         try:
-            requests.post(
-                f"{APP_URL}/api/ingest/registry",
-                json={
-                    "siteSecret": INGEST_SECRET,
-                    "siteId": SITE_PREFIX,
-                    "action": "added",
-                    "entityId": entity_id,
-                    "domain": entity_id.split(".")[0] if "." in entity_id else None,
-                    "ieeeAddress": m.group(0),
-                },
-                timeout=10,
-            )
+            requests.post(f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
         except Exception as ex:
             warn(f"[sync] backfill ha_entity_id {entity_id}: {ex}")
 
@@ -1915,19 +1919,27 @@ def _post_ingest_state(entity_id: str, state: str, attributes: dict):
 
 
 _IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
+# unique_id Matter HA : "{fabric_id_hex:16}-{node_id_hex:16}-{postfix}-{endpoint}-{key}-
+# {cluster}-{attr}" (cf. get_device_id() dans homeassistant/components/matter/helpers.py
+# — le node_id complet est présent en hex dans le 2e segment, pas hashé).
+_MATTER_UID_RE = re.compile(r"^[0-9a-fA-F]{16}-([0-9a-fA-F]{16})-")
 
-def _ieee_from_entity_unique_id(entity_id: str) -> str | None:
-    """Retrouve l'adresse IEEE Zigbee2MQTT d'une entité HA via son unique_id
-    (Z2M l'y inclut toujours, ex: '0x8c8b48fffe0fc275_light'). None si l'entité
-    n'est pas Zigbee ou introuvable."""
+def _entity_unique_id(entity_id: str) -> str | None:
+    """Retrouve le unique_id HA d'une entité (pas exposé en REST, seulement WS)."""
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         return None
     for e in result.get("result", []):
         if e.get("entity_id") == entity_id:
-            m = _IEEE_RE.search(e.get("unique_id") or "")
-            return m.group(0) if m else None
+            return e.get("unique_id")
     return None
+
+
+def _matter_node_id_from_unique_id(unique_id: str | None) -> int | None:
+    """Retrouve le node_id Matter (int) d'une entité HA via son unique_id.
+    None si l'entité n'est pas Matter ou introuvable."""
+    m = _MATTER_UID_RE.match(unique_id or "")
+    return int(m.group(1), 16) if m else None
 
 
 def _post_ingest_registry(entity_id: str, action: str, data: dict):
@@ -1942,12 +1954,18 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
             "domain": entity_id.split(".")[0] if "." in entity_id else None,
         }
         if action == "added":
-            # Relie le device Zigbee (créé par devices-sync, ha_entity_id encore null)
-            # à cette entité HA fraîchement créée — sinon état et commandes ne
-            # fonctionnent jamais pour ce device (vu en test réel).
-            ieee = _ieee_from_entity_unique_id(entity_id)
+            # Relie le device (Zigbee par IEEE, Matter par node_id — créé par
+            # devices-sync, ha_entity_id encore null) à cette entité HA fraîchement
+            # créée — sinon état et commandes ne fonctionnent jamais pour ce device
+            # (vu en test réel : capteur Matter commissionné mais état jamais à jour).
+            unique_id = _entity_unique_id(entity_id)
+            ieee = _IEEE_RE.search(unique_id or "")
             if ieee:
-                payload["ieeeAddress"] = ieee
+                payload["ieeeAddress"] = ieee.group(0)
+            else:
+                node_id = _matter_node_id_from_unique_id(unique_id)
+                if node_id is not None:
+                    payload["matterNodeId"] = node_id
         requests.post(f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
     except Exception as e:
         warn(f"[ingest/registry] {entity_id}: {e}")
