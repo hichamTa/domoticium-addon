@@ -1274,6 +1274,129 @@ def _get_otbr_active_dataset():
     return None
 
 
+def _matter_ws_connect(timeout_s: int = 15):
+    """Ouvre une connexion WS brute vers matter-server (localhost:5580/ws) et effectue
+    le handshake. Retourne (sock, _recv, _send, info) ou (None, None, None, error_str)."""
+    s = socket.create_connection(("localhost", 5580), timeout=15)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall((
+        "GET /ws HTTP/1.1\r\nHost: localhost:5580\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ).encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        resp += s.recv(1)
+    if b"101" not in resp:
+        s.close()
+        return None, None, None, f"Matter Server WS handshake échoué: {resp[:80]}"
+
+    s.settimeout(timeout_s)
+    _recv, _send = _matter_ws_frames(s)
+    info = _recv()  # matter-server envoie un message info à la connexion
+    return s, _recv, _send, info
+
+
+def _matter_get_nodes():
+    """Liste tous les devices commissionnés côté matter-server (get_nodes), pour
+    réconciliation périodique (même logique que bridge/devices côté Zigbee) — plus
+    robuste que le seul enregistrement post-commissioning (vu en test réel : un bug
+    d'extraction de node_id a fait échouer l'auto-registration malgré un commissioning
+    réussi ; une réconciliation périodique se serait auto-corrigée toute seule).
+    Retourne une liste de nodes (dicts) ou None en cas d'erreur."""
+    s = None
+    try:
+        s, _recv, _send, info = _matter_ws_connect(timeout_s=20)
+        if not s:
+            warn(f"[matter-server] get_nodes connexion : {info}")
+            return None
+        msg_id = "get-nodes-1"
+        _send({"message_id": msg_id, "command": "get_nodes"})
+        while True:
+            msg = _recv()
+            mid = msg.get("message_id") or msg.get("messageId")
+            if mid == msg_id:
+                if "error_code" in msg or "errorCode" in msg or "error" in msg:
+                    warn(f"[matter-server] get_nodes échoué : {json.dumps(msg)[:200]}")
+                    return None
+                result = msg.get("result", [])
+                return result if isinstance(result, list) else None
+    except Exception as e:
+        warn(f"[matter-server] get_nodes: {e}")
+        return None
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+# Mapping best-effort deviceType Matter (Descriptor.DeviceTypeList) → type Domoticium.
+# Pas exhaustif — les types non reconnus retombent sur "switch" (comme avant).
+_MATTER_DEVICE_TYPES = {
+    0x0100: "light", 0x0101: "light", 0x010C: "light",   # OnOff/Dimmable/ColorTemp Light
+    0x0103: "switch", 0x010A: "plug",                     # OnOff Light Switch, Plug
+    0x0202: "cover",                                       # Window Covering
+    0x0301: "thermostat",
+    0x0015: "sensor-contact",                              # Contact Sensor
+    0x0107: "sensor-motion",                                # Occupancy Sensor
+    0x0302: "sensor-temp",                                  # Temperature Sensor
+}
+
+
+def _extract_matter_device_info(node: dict):
+    """Extrait node_id/vendor/product/device_type depuis un node matter-server (format
+    get_nodes / commission result : attributes plates 'endpoint/cluster/attribute')."""
+    node_id = node.get("node_id")
+    attrs = node.get("attributes", {}) or {}
+    vendor  = attrs.get("0/40/1", "")
+    product = attrs.get("0/40/3", "")
+    device_type = "switch"
+    # Chercher le DeviceTypeList sur le premier endpoint fonctionnel (≠ 0, qui est RootNode)
+    endpoints = sorted({k.split("/")[0] for k in attrs if "/" in k} - {"0"}, key=lambda x: int(x) if x.isdigit() else 999)
+    for ep in endpoints:
+        type_list = attrs.get(f"{ep}/29/0")
+        if isinstance(type_list, list) and type_list:
+            dt = type_list[0].get("0") if isinstance(type_list[0], dict) else None
+            if dt in _MATTER_DEVICE_TYPES:
+                device_type = _MATTER_DEVICE_TYPES[dt]
+                break
+    return node_id, vendor, product, device_type
+
+
+def _sync_matter_devices_to_app():
+    """Réconciliation périodique Matter → Supabase (analogue à bridge/devices Zigbee).
+    Envoie la liste COMPLÈTE des nodes commissionnés — le webhook réconcilie (upsert +
+    suppression des devices absents), pas juste un ajout ponctuel."""
+    nodes = _matter_get_nodes()
+    if nodes is None:
+        return
+    devices_payload = []
+    for node in nodes:
+        node_id, vendor, product, device_type = _extract_matter_device_info(node)
+        if node_id is None:
+            continue
+        devices_payload.append({
+            "node_id": node_id,
+            "name": product or f"Matter #{node_id}",
+            "vendor_name": vendor,
+            "product_name": product,
+            "device_type": device_type,
+        })
+    try:
+        auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
+        r = requests.post(
+            f"{APP_URL}/api/webhooks/pi/devices-sync",
+            json={"siteId": SITE_PREFIX, "source": "matter", "devices": devices_payload},
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        log(f"[devices-sync/matter] HTTP {r.status_code} — {len(devices_payload)} devices, réponse: {r.text[:200]}")
+    except Exception as e:
+        warn(f"[devices-sync/matter] {e}")
+
+
 def _matter_commission_ws(code: str, timeout_s: int = 200):
     """Commission via matter-server WebSocket direct (port 5580).
     HA 2026+ : ni REST ni HA WebSocket ne fonctionnent pour le commissioning.
@@ -1283,24 +1406,10 @@ def _matter_commission_ws(code: str, timeout_s: int = 200):
     """
     s = None
     try:
-        s = socket.create_connection(("localhost", 5580), timeout=15)
-        key = base64.b64encode(os.urandom(16)).decode()
-        s.sendall((
-            "GET /ws HTTP/1.1\r\nHost: localhost:5580\r\n"
-            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        ).encode())
-        resp = b""
-        while b"\r\n\r\n" not in resp:
-            resp += s.recv(1)
-        if b"101" not in resp:
-            return False, f"Matter Server WS handshake échoué: {resp[:80]}"
-
+        s, _recv, _send, info = _matter_ws_connect(timeout_s=15)
+        if not s:
+            return False, info
         s.settimeout(timeout_s)
-        _recv, _send = _matter_ws_frames(s)
-
-        # matter-server envoie un message info à la connexion
-        info = _recv()
         log(f"[matter-server] Connecté — schema={info.get('schema_version')} sdk={info.get('sdk_version')}")
 
         # Matter-over-Thread : matter-server doit connaître le réseau Thread AVANT
@@ -1369,16 +1478,12 @@ def handle_matter_commission(request_id: str, code: str):
             if success:
                 log(f"✓ Matter commission réussie — node_id={detail}")
                 _post_ingest_commission_status(request_id, True, node_id=detail)
-                # Auto-enregistrement dans Supabase (comme Zigbee) — noms par défaut,
-                # l'utilisateur renomme ensuite dans l'app. Détails précis (vendor/product)
-                # pas disponibles ici ; l'entité HA réelle sera enrichie via ha-ws-bridge.
-                try:
-                    node_id_int = int(detail)
-                    _sync_matter_device_to_app(
-                        node_id_int, f"Matter #{node_id_int}", "", "", "switch"
-                    )
-                except (ValueError, TypeError):
-                    warn(f"[matter] node_id non numérique ({detail!r}) — auto-registration ignorée")
+                # Pas d'enregistrement Supabase ponctuel ici (fragile — un seul device,
+                # un seul essai) : on déclenche une réconciliation complète immédiate
+                # (_sync_matter_devices_to_app via _sync_all_to_ha), même mécanisme
+                # auto-réparateur que Zigbee. Le nouveau device sera repris avec les
+                # autres au prochain cycle (déclenché tout de suite, pas dans 60s).
+                _sync_requested.set()
             else:
                 warn(f"⚠ Matter commission échouée: {detail}")
                 _post_ingest_commission_status(request_id, False, error=detail)
@@ -1645,6 +1750,10 @@ def _sync_all_to_ha():
     if _local_client:
         _local_client.publish("zigbee2mqtt/bridge/request/devices", "", qos=1)
         log("[sync] bridge/request/devices publié → Z2M va republier bridge/devices")
+
+    # Réconciliation Matter (get_nodes) — même logique que bridge/devices Zigbee,
+    # auto-réparatrice si l'enregistrement post-commissioning a échoué ou a été manqué.
+    _sync_matter_devices_to_app()
 
     _backfill_ha_entity_links()
 
@@ -2036,27 +2145,6 @@ def _sync_devices_to_app(devices_list):
         log(f"[devices-sync] HTTP {r.status_code} — {len(devices_list)} devices, réponse: {r.text[:120]}")
     except Exception as e:
         warn(f"[devices-sync] {e}")
-
-
-def _sync_matter_device_to_app(node_id, name, vendor_name, product_name, device_type):
-    """Background thread : enregistre un device Matter dans le backend après commissioning."""
-    try:
-        auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
-        r = requests.post(
-            f"{APP_URL}/api/webhooks/pi/devices-sync",
-            json={
-                "siteId": SITE_PREFIX,
-                "source": "matter",
-                "devices": [{"node_id": node_id, "name": name,
-                              "vendor_name": vendor_name, "product_name": product_name,
-                              "device_type": device_type}],
-            },
-            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        log(f"[devices-sync/matter] HTTP {r.status_code} — node {node_id}")
-    except Exception as e:
-        warn(f"[devices-sync/matter] {e}")
 
 
 def on_local_message(client, userdata, msg):
