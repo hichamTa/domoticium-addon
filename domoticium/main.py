@@ -2228,6 +2228,58 @@ def _ensure_bluetooth_integration():
     return False
 
 
+def _ensure_matter_ble_proxy():
+    """Active l'option "Enable BLE proxy" du add-on Matter Server.
+
+    Sans cette option, matter-server (qui tourne dans son propre conteneur) n'a
+    aucun accès BLE — le commissioning Matter-over-Thread/BLE échoue toujours
+    avec "No commissionable device was discovered", même avec un dongle
+    Bluetooth fonctionnel et l'intégration Bluetooth HA active (vu en test
+    réel : timeout complet à chaque tentative, adaptateur pourtant détecté).
+    Le nom exact du champ n'est pas garanti stable → recherche dynamique dans
+    le schéma (champ booléen contenant "ble"), même approche défensive que
+    pour le schema OTBR ailleurs dans ce fichier.
+    """
+    try:
+        info = sup_get(f"/addons/{MATTER_SLUG}/info")
+        if not info.ok:
+            warn(f"[matter] Lecture options BLE proxy : {info.status_code}")
+            return
+        data = info.json()
+        if isinstance(data, dict):
+            data = data.get("data", data)
+        schema = data.get("schema", [])
+        options_current = data.get("options", {}) or {}
+
+        ble_field = None
+        if isinstance(schema, list):
+            for field in schema:
+                if (
+                    isinstance(field, dict)
+                    and field.get("type") == "boolean"
+                    and "ble" in str(field.get("name", "")).lower()
+                ):
+                    ble_field = field["name"]
+                    break
+
+        if not ble_field:
+            warn("[matter] Champ BLE proxy introuvable dans le schéma Matter Server — à vérifier manuellement")
+            return
+
+        if options_current.get(ble_field) is True:
+            log(f"[matter] ✓ BLE proxy déjà activé ({ble_field})")
+            return
+
+        r = sup_post(f"/addons/{MATTER_SLUG}/options", {"options": {**options_current, ble_field: True}})
+        if r.ok:
+            log(f"[matter] ✓ BLE proxy activé ({ble_field}) — redémarrage Matter Server…")
+            sup_post(f"/addons/{MATTER_SLUG}/restart")
+        else:
+            warn(f"[matter] Activation BLE proxy : {r.status_code} {r.text[:150]}")
+    except Exception as e:
+        warn(f"[matter] _ensure_matter_ble_proxy: {e}")
+
+
 def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
@@ -2255,6 +2307,11 @@ def _ensure_matter_server():
             time.sleep(60)
     else:
         warn(f"[bluetooth] Intégration Bluetooth non disponible après {BT_ATTEMPTS} tentatives — le commissioning Matter via BLE sera impossible")
+
+    # Matter Server a besoin de l'option "Enable BLE proxy" pour utiliser le Bluetooth
+    # HA — sans ça, le commissioning BLE échoue toujours (No commissionable device),
+    # même avec un dongle Bluetooth fonctionnel et l'intégration HA active.
+    _ensure_matter_ble_proxy()
 
     if not INSTALL_THREAD_ROUTER:
         log("[matter] Open Thread Border Router désactivé (install_thread_border_router=false) — ignoré")
