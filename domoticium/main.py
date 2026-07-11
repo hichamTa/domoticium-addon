@@ -2153,9 +2153,15 @@ def _ensure_bluetooth_integration():
     # Matter BLE proxy) déclare "bluetooth" comme dépendance, sans qu'aucun adaptateur
     # ne soit réellement configuré (vu en test réel : composant chargé mais hci0 encore
     # en attente dans "Découvertes", jamais ajouté car ce check retournait déjà True).
-    r = ha_get("/config/config_entries/entries")
-    if r.ok:
-        domains = [e.get("domain", "") for e in r.json()]
+    # NB : GET /config/config_entries/entries n'existe PAS en REST côté HA (seules les
+    # actions flow le sont) — ce check échouait silencieusement à chaque appel (r.ok
+    # toujours False), donc ne trouvait jamais Bluetooth même déjà configuré (vu en
+    # test réel : Bluetooth visible dans "Configurées" mais l'addon retentait quand
+    # même en boucle). Comme entity_registry/area_registry ailleurs dans ce fichier,
+    # la liste des config entries n'est disponible que via le WebSocket.
+    result = _ha_ws_call("config_entries/get")
+    if result and result.get("success"):
+        domains = [e.get("domain", "") for e in result.get("result", [])]
         bt_entries = [d for d in domains if "bluetooth" in d.lower()]
         if bt_entries:
             log(f"[bluetooth] ✓ Intégration Bluetooth déjà configurée ({bt_entries[0]})")
