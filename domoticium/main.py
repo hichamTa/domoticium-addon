@@ -2237,8 +2237,11 @@ def _ensure_matter_ble_proxy():
     Bluetooth fonctionnel et l'intégration Bluetooth HA active (vu en test
     réel : timeout complet à chaque tentative, adaptateur pourtant détecté).
     Le nom exact du champ n'est pas garanti stable → recherche dynamique dans
-    le schéma (champ booléen contenant "ble"), même approche défensive que
-    pour le schema OTBR ailleurs dans ce fichier.
+    le schéma (champ booléen dont le nom contient le token "ble"), même
+    approche défensive que pour le schema OTBR ailleurs dans ce fichier.
+    ATTENTION : "ble" doit être un token isolé (split sur "_"), pas une simple
+    sous-chaîne — "enable_test_net_dcl_usage" contient "ble" dans "en-ABLE" et
+    a été activé par erreur avant ce fix (vu en test réel).
     """
     try:
         info = sup_get(f"/addons/{MATTER_SLUG}/info")
@@ -2257,7 +2260,7 @@ def _ensure_matter_ble_proxy():
                 if (
                     isinstance(field, dict)
                     and field.get("type") == "boolean"
-                    and "ble" in str(field.get("name", "")).lower()
+                    and "ble" in str(field.get("name", "")).lower().split("_")
                 ):
                     ble_field = field["name"]
                     break
