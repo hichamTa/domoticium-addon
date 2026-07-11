@@ -2237,14 +2237,18 @@ def _ensure_matter_server():
     _ensure_matter_integration()
 
     # Dongle USB Bluetooth → intégration Bluetooth HA (BLE requis pour commissioning Matter)
-    for attempt in range(1, 6):
+    # 10 tentatives (pas 5) : en test réel, le stack BlueZ/USB de HA n'était pas encore
+    # prêt après 5×60s=5min suivant un redémarrage — le dongle a fini par être détecté
+    # (visible dans Configurées) juste après que l'addon ait abandonné.
+    BT_ATTEMPTS = 10
+    for attempt in range(1, BT_ATTEMPTS + 1):
         if _ensure_bluetooth_integration():
             break
-        if attempt < 5:
-            log(f"[bluetooth] Dongle non détecté, nouvel essai dans 60s (tentative {attempt}/5)…")
+        if attempt < BT_ATTEMPTS:
+            log(f"[bluetooth] Dongle non détecté, nouvel essai dans 60s (tentative {attempt}/{BT_ATTEMPTS})…")
             time.sleep(60)
     else:
-        warn("[bluetooth] Intégration Bluetooth non disponible après 5 tentatives — le commissioning Matter via BLE sera impossible")
+        warn(f"[bluetooth] Intégration Bluetooth non disponible après {BT_ATTEMPTS} tentatives — le commissioning Matter via BLE sera impossible")
 
     if not INSTALL_THREAD_ROUTER:
         log("[matter] Open Thread Border Router désactivé (install_thread_border_router=false) — ignoré")
