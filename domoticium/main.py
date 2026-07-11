@@ -2334,6 +2334,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/zigbee/set-attribute": self._handle_set_attribute,
                 "/ha-command":           self._handle_ha_command_route,
                 "/camera/configure":     self._handle_camera_configure_route,
+                "/sync-now":             self._handle_sync_now,
             }
             handler = handlers.get(route)
             if not handler:
@@ -2418,6 +2419,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         if not stream_name:
             return self._reject(400, "streamName manquant")
         handle_camera_configure(action, stream_name, data.get("rtspUrl"))
+        self._ok()
+
+    def _handle_sync_now(self, data):
+        """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
+        + republication bridge/devices Z2M → réconciliation devices-sync) au lieu
+        d'attendre le prochain cycle périodique (jusqu'à 60s) — bouton "Sync HA"."""
+        _sync_requested.set()
         self._ok()
 
 
