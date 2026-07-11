@@ -1129,9 +1129,10 @@ def run_setup():
     # 4. Supprimer l'ancien discovery_prefix non-standard (migration v1.5 → v1.6)
     remove_legacy_mqtt_discovery_prefix()
 
-    # install_matter_server()      — désactivé temporairement : on valide Zigbee d'abord
-    # if INSTALL_THREAD_ROUTER: install_thread_border_router()  — idem (dépend de Matter/Thread)
-    # install_frigate()  — caméras via go2rtc addon HA
+    install_matter_server()
+    if INSTALL_THREAD_ROUTER:
+        install_thread_border_router()
+    # install_frigate()  — désactivé temporairement : Matter d'abord, caméras ensuite
     create_automations()
     write_rest_commands()
 
@@ -2220,7 +2221,7 @@ def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
         log("[matter] Matter Server absent — installation automatique…")
-        # install_matter_server()  — désactivé temporairement : on valide Zigbee d'abord
+        install_matter_server()
     elif not _is_addon_running(MATTER_SLUG):
         log("[matter] Matter Server installé mais arrêté — démarrage…")
         _start_addon(MATTER_SLUG, "Matter Server")
@@ -2244,7 +2245,7 @@ def _ensure_matter_server():
         log("[matter] Open Thread Border Router désactivé (install_thread_border_router=false) — ignoré")
     elif not _is_addon_installed(THREAD_SLUG):
         log("[matter] Open Thread Border Router absent — installation automatique…")
-        # install_thread_border_router()  — désactivé temporairement : on valide Zigbee d'abord
+        install_thread_border_router()
     else:
         # Vérifier que les options actuelles sont correctes (network_device peut être périmé)
         needs_reconfig = not _is_addon_running(THREAD_SLUG)
@@ -2265,7 +2266,7 @@ def _ensure_matter_server():
 
         if needs_reconfig:
             log("[matter] OTBR — reconfiguration et redémarrage…")
-            # install_thread_border_router()  — désactivé temporairement : on valide Zigbee d'abord
+            install_thread_border_router()
         else:
             log("[matter] Open Thread Border Router en cours d'exécution ✓")
 
@@ -2447,9 +2448,7 @@ def run_command_server():
 def run_bridge():
     _load_cameras()
     start_cloudflared()
-    # _ensure_matter_server  — désactivé temporairement : on valide Zigbee d'abord
-    # (installe/démarre Matter Server + OTBR en tâche de fond à chaque démarrage —
-    # oublié lors du passage en Zigbee-only, cf. run_setup() et main.py history)
+    threading.Thread(target=_ensure_matter_server, daemon=True).start()
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     threading.Thread(target=_ha_sync_loop,   daemon=True).start()
