@@ -1342,6 +1342,7 @@ _MATTER_DEVICE_TYPES = {
     0x0015: "sensor-contact",                              # Contact Sensor
     0x0107: "sensor-motion",                                # Occupancy Sensor
     0x0302: "sensor-temp",                                  # Temperature Sensor
+    0x002C: "sensor-generic",                               # Air Quality Sensor
 }
 
 
@@ -1352,7 +1353,11 @@ def _extract_matter_device_info(node: dict):
     attrs = node.get("attributes", {}) or {}
     vendor  = attrs.get("0/40/1", "")
     product = attrs.get("0/40/3", "")
-    device_type = "switch"
+    # "switch" par défaut créait un faux toggle on/off pour les devices non reconnus
+    # (vu en test réel : moniteur qualité d'air affiché comme actionneur). Un type
+    # inconnu est presque toujours un pur capteur (mesures dans device_entities),
+    # jamais un actionneur — "sensor-generic" est le fallback sûr.
+    device_type = "sensor-generic"
     # Chercher le DeviceTypeList sur le premier endpoint fonctionnel (≠ 0, qui est RootNode)
     endpoints = sorted({k.split("/")[0] for k in attrs if "/" in k} - {"0"}, key=lambda x: int(x) if x.isdigit() else 999)
     for ep in endpoints:
