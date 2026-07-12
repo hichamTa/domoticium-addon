@@ -1776,6 +1776,8 @@ def _backfill_ha_entity_links():
     if not result or not result.get("success"):
         return
     for e in result.get("result", []):
+        if e.get("entity_category") in ("diagnostic", "config"):
+            continue  # jamais pertinent côté client (redémarrages, raison démarrage…)
         entity_id = e.get("entity_id", "")
         unique_id = e.get("unique_id") or ""
         m = _IEEE_RE.search(unique_id)
@@ -1784,6 +1786,7 @@ def _backfill_ha_entity_links():
             "siteId": SITE_PREFIX,
             "action": "added",
             "entityId": entity_id,
+            "friendlyName": e.get("name") or e.get("original_name"),
             "domain": entity_id.split(".")[0] if "." in entity_id else None,
         }
         if m:
@@ -1929,14 +1932,15 @@ _IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
 # — le node_id complet est présent en hex dans le 2e segment, pas hashé).
 _MATTER_UID_RE = re.compile(r"^[0-9a-fA-F]{16}-([0-9a-fA-F]{16})-")
 
-def _entity_unique_id(entity_id: str) -> str | None:
-    """Retrouve le unique_id HA d'une entité (pas exposé en REST, seulement WS)."""
+def _entity_registry_entry(entity_id: str) -> dict | None:
+    """Retrouve l'entrée entity_registry HA d'une entité (unique_id, entity_category…) —
+    pas exposé en REST, seulement WS."""
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         return None
     for e in result.get("result", []):
         if e.get("entity_id") == entity_id:
-            return e.get("unique_id")
+            return e
     return None
 
 
@@ -1963,7 +1967,20 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
             # devices-sync, ha_entity_id encore null) à cette entité HA fraîchement
             # créée — sinon état et commandes ne fonctionnent jamais pour ce device
             # (vu en test réel : capteur Matter commissionné mais état jamais à jour).
-            unique_id = _entity_unique_id(entity_id)
+            entry = _entity_registry_entry(entity_id)
+            # entity_category "diagnostic"/"config" = jamais pertinent côté client
+            # (ex: "Nombre de redémarrages", "Raison de démarrage") — vu en test réel
+            # polluer la carte device une fois les entités secondaires affichées.
+            if entry and entry.get("entity_category") in ("diagnostic", "config"):
+                return
+            # Nom lisible dès la liaison — ne pas attendre le 1er changement d'état
+            # (name = override utilisateur, original_name = nom par défaut ; les deux
+            # peuvent être absents de l'event live entity_registry_updated, vu en test
+            # réel : libellé vide jusqu'au 1er state_changed, parfois jamais pour les
+            # capteurs qui changent peu, ex. qualité de l'air).
+            if entry and not payload["friendlyName"]:
+                payload["friendlyName"] = entry.get("name") or entry.get("original_name")
+            unique_id = entry.get("unique_id") if entry else None
             ieee = _IEEE_RE.search(unique_id or "")
             if ieee:
                 payload["ieeeAddress"] = ieee.group(0)
