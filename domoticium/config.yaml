@@ -1,14 +1,14 @@
 name: "Domoticium"
 description: >
   Configure automatiquement Home Assistant pour Domoticium :
-  installe Zigbee2MQTT et Matter Server (+ OTBR si install_thread_border_router
-  activé) — Frigate NVR temporairement désactivé, activation par étapes voir
-  run_setup() dans main.py —, expose un serveur de commandes local (HA API,
-  aucun token stocké côté cloud), puis tourne en service pont permanent
-  (état → Supabase, commandes → HA locale).
+  installe Zigbee2MQTT, Matter Server (+ OTBR si install_thread_border_router
+  activé) et Frigate NVR (go2rtc intégré pour les caméras), expose un serveur
+  de commandes local (HA API, aucun token stocké côté cloud), puis tourne en
+  service pont permanent (état → Supabase, commandes → HA locale).
   Supporte les coordinateurs USB et réseau PoE (SLZB-MR4U, SLZB-06…).
   À lancer une seule fois après la création du compte admin HA.
-version: "2.3.4"
+version: "2.3.5"
+auto_update: true
 slug: "domoticium"
 init: false
 arch:
