@@ -1141,7 +1141,7 @@ def run_setup():
     install_matter_server()
     if INSTALL_THREAD_ROUTER:
         install_thread_border_router()
-    # install_frigate()  — désactivé temporairement : Matter d'abord, caméras ensuite
+    install_frigate()
     create_automations()
     write_rest_commands()
 
@@ -2545,6 +2545,29 @@ def _ensure_matter_ble_proxy():
         warn(f"[matter] _ensure_matter_ble_proxy: {e}")
 
 
+def _ensure_frigate():
+    """Installe et démarre Frigate + go2rtc s'ils sont absents ou arrêtés.
+    Appelé en thread de fond au démarrage du bridge — permet de lancer Frigate
+    sur une installation existante sans déclencher un force_setup complet."""
+    try:
+        if not _is_addon_installed(FRIGATE_SLUG):
+            log("[frigate] Frigate absent — installation automatique…")
+            install_frigate()
+        elif not _is_addon_running(FRIGATE_SLUG):
+            log("[frigate] Frigate installé mais arrêté — démarrage…")
+            _load_cameras()
+            write_frigate_config()
+            _start_addon(FRIGATE_SLUG, "Frigate")
+            _wait_frigate_ready()
+        elif not _frigate_go2rtc_ready():
+            log("[frigate] Frigate en cours mais go2rtc indisponible — reconfiguration…")
+            _configure_frigate_and_start()
+        else:
+            log("[frigate] ✓ Frigate et go2rtc opérationnels")
+    except Exception as e:
+        warn(f"[frigate] _ensure_frigate: {e}")
+
+
 def _ensure_matter_server():
     """Installe et démarre Matter Server + OTBR s'ils sont absents ou arrêtés."""
     if not _is_addon_installed(MATTER_SLUG):
@@ -3006,6 +3029,7 @@ def run_command_server():
 def run_bridge():
     _load_cameras()
     start_cloudflared()
+    threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
