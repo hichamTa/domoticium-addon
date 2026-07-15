@@ -82,8 +82,8 @@ def warn(msg): print(f"[domoticium] ⚠ {msg}", file=sys.stderr, flush=True)
 def sup_get(path):
     return requests.get(f"{SUP}{path}", headers=HDRS, timeout=15)
 
-def sup_post(path, data=None):
-    return requests.post(f"{SUP}{path}", headers=HDRS, json=data or {}, timeout=60)
+def sup_post(path, data=None, timeout=60):
+    return requests.post(f"{SUP}{path}", headers=HDRS, json=data or {}, timeout=timeout)
 
 def ha_post(path, data=None):
     return requests.post(f"{API}{path}", headers=HDRS, json=data or {}, timeout=15)
@@ -770,7 +770,7 @@ def install_frigate():
     # 3. Installer si nécessaire
     if not _is_addon_installed(FRIGATE_SLUG):
         log("Installation de Frigate (peut prendre 2-3 min)…")
-        r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install")
+        r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install", timeout=300)
         if r.ok:
             log("✓ Frigate installé")
             time.sleep(10)
@@ -802,7 +802,7 @@ def install_frigate():
     log("Désinstallation Frigate…")
     time.sleep(20)
 
-    r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install")
+    r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install", timeout=300)
     if not r.ok:
         warn(f"✗ {r.status_code} Réinstallation Frigate impossible : {r.text[:100]}")
         return
@@ -2548,24 +2548,31 @@ def _ensure_matter_ble_proxy():
 def _ensure_frigate():
     """Installe et démarre Frigate + go2rtc s'ils sont absents ou arrêtés.
     Appelé en thread de fond au démarrage du bridge — permet de lancer Frigate
-    sur une installation existante sans déclencher un force_setup complet."""
-    try:
-        if not _is_addon_installed(FRIGATE_SLUG):
-            log("[frigate] Frigate absent — installation automatique…")
-            install_frigate()
-        elif not _is_addon_running(FRIGATE_SLUG):
-            log("[frigate] Frigate installé mais arrêté — démarrage…")
-            _load_cameras()
-            write_frigate_config()
-            _start_addon(FRIGATE_SLUG, "Frigate")
-            _wait_frigate_ready()
-        elif not _frigate_go2rtc_ready():
-            log("[frigate] Frigate en cours mais go2rtc indisponible — reconfiguration…")
-            _configure_frigate_and_start()
-        else:
-            log("[frigate] ✓ Frigate et go2rtc opérationnels")
-    except Exception as e:
-        warn(f"[frigate] _ensure_frigate: {e}")
+    sur une installation existante sans déclencher un force_setup complet.
+    Réessaie toutes les 5 min en cas d'échec (timeout Supervisor, réseau lent…)."""
+    for attempt in range(1, 6):
+        try:
+            if not _is_addon_installed(FRIGATE_SLUG):
+                log(f"[frigate] Frigate absent — installation automatique… (tentative {attempt}/5)")
+                install_frigate()
+            elif not _is_addon_running(FRIGATE_SLUG):
+                log("[frigate] Frigate installé mais arrêté — démarrage…")
+                _load_cameras()
+                write_frigate_config()
+                _start_addon(FRIGATE_SLUG, "Frigate")
+                _wait_frigate_ready()
+            elif not _frigate_go2rtc_ready():
+                log("[frigate] Frigate en cours mais go2rtc indisponible — reconfiguration…")
+                _configure_frigate_and_start()
+            else:
+                log("[frigate] ✓ Frigate et go2rtc opérationnels")
+            return  # succès
+        except Exception as e:
+            warn(f"[frigate] _ensure_frigate tentative {attempt}/5 : {e}")
+            if attempt < 5:
+                log("[frigate] Nouvel essai dans 5 min…")
+                time.sleep(300)
+    warn("[frigate] ✗ Frigate non démarré après 5 tentatives — vérifier les logs Frigate dans HA")
 
 
 def _ensure_matter_server():
