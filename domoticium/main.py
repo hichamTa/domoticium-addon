@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, http.server, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time
+import base64, http.server, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, uuid
 import paho.mqtt.client as mqtt
 import requests
 
@@ -1761,6 +1761,7 @@ def _sync_all_to_ha():
     _sync_matter_devices_to_app()
 
     _backfill_ha_entity_links()
+    _backfill_camera_entity_links()
 
     log("[sync] ✓ Terminé")
 
@@ -1800,6 +1801,78 @@ def _backfill_ha_entity_links():
             requests.post(f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
         except Exception as ex:
             warn(f"[sync] backfill ha_entity_id {entity_id}: {ex}")
+
+
+def _backfill_camera_entity_links():
+    """Relie chaque caméra HA à ses entités secondaires (micro, IR, PTZ presets,
+    détection mouvement…) dans Supabase. Même pattern que _backfill_ha_entity_links()
+    mais pour les caméras : lit le device_id HA de chaque entité camera.*, puis
+    regroupe toutes les entités siblings (non diagnostic/config) du même device.
+    Idempotent — upsert côté web ne réécrase pas visible_client (override admin préservé).
+    """
+    result = _ha_ws_call("config/entity_registry/list")
+    if not result or not result.get("success"):
+        return
+
+    entities = result.get("result", [])
+
+    # Grouper par device_id HA (UUID interne HA)
+    by_device: dict[str, list[dict]] = {}
+    for e in entities:
+        did = e.get("device_id")
+        if did:
+            by_device.setdefault(did, []).append(e)
+
+    WRITABLE_DOMAINS = {
+        "switch", "select", "number", "input_boolean", "input_number",
+        "input_select", "button", "light", "cover", "climate", "lock", "fan",
+    }
+
+    for e in entities:
+        entity_id = e.get("entity_id", "")
+        if not entity_id.startswith("camera."):
+            continue
+        if e.get("entity_category") in ("diagnostic", "config"):
+            continue
+        device_id = e.get("device_id")
+        if not device_id:
+            continue
+
+        secondary = []
+        for sibling in by_device.get(device_id, []):
+            s_id = sibling.get("entity_id", "")
+            if s_id == entity_id:
+                continue
+            if sibling.get("entity_category") in ("diagnostic", "config"):
+                continue
+            domain = s_id.split(".")[0] if "." in s_id else ""
+            if not domain:
+                continue
+            secondary.append({
+                "entityId": s_id,
+                "domain": domain,
+                "friendlyName": sibling.get("name") or sibling.get("original_name"),
+                "deviceClass": sibling.get("device_class") or sibling.get("original_device_class"),
+                "writable": domain in WRITABLE_DOMAINS,
+            })
+
+        if not secondary:
+            continue
+
+        try:
+            requests.post(
+                f"{APP_URL}/api/ingest/camera-registry",
+                json={
+                    "siteSecret": INGEST_SECRET,
+                    "siteId": SITE_PREFIX,
+                    "cameraHaEntityId": entity_id,
+                    "entities": secondary,
+                },
+                timeout=10,
+            )
+            log(f"[camera-registry] {entity_id} → {len(secondary)} entité(s) secondaire(s)")
+        except Exception as ex:
+            warn(f"[camera-registry] {entity_id}: {ex}")
 
 
 def _ha_sync_loop():
@@ -2542,6 +2615,207 @@ ALLOWED_SERVICES = {
 }
 
 
+# ── Helpers extraction XML (sans dépendances) ────────────────────────────────
+
+def _xml_text(text: str, tag: str) -> str:
+    """Premier texte d'un élément en ignorant les préfixes de namespace."""
+    m = re.search(
+        r'<(?:[^:>\s]+:)?' + re.escape(tag) + r'(?:\s[^>]*)?>([^<]*)</(?:[^:>]+:)?' + re.escape(tag) + r'>',
+        text, re.DOTALL,
+    )
+    return m.group(1).strip() if m else ''
+
+
+def _xml_all(text: str, tag: str) -> list:
+    """Tous les textes des éléments avec ce nom local."""
+    return [
+        m.group(1).strip()
+        for m in re.finditer(
+            r'<(?:[^:>\s]+:)?' + re.escape(tag) + r'(?:\s[^>]*)?>([^<]*)</(?:[^:>]+:)?' + re.escape(tag) + r'>',
+            text, re.DOTALL,
+        )
+    ]
+
+
+def _xml_attr(text: str, tag: str, attr: str) -> str:
+    """Valeur d'un attribut sur le premier élément trouvé."""
+    m = re.search(
+        r'<(?:[^:>\s]+:)?' + re.escape(tag) + r'\b[^>]*\b' + re.escape(attr) + r'=["\']([^"\']*)["\']',
+        text,
+    )
+    return m.group(1) if m else ''
+
+
+# ── Découverte ONVIF ─────────────────────────────────────────────────────────
+
+_WS_DISCOVER_ADDR = "239.255.255.250"
+_WS_DISCOVER_PORT = 3702
+
+_RTSP_TEMPLATES = {
+    "hikvision": "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/101",
+    "dahua":     "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=0",
+    "amcrest":   "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=0",
+    "axis":      "rtsp://root:MOTDEPASSE@{ip}/axis-media/media.amp",
+    "reolink":   "rtsp://admin:MOTDEPASSE@{ip}:554/h264Preview_01_main",
+    "uniview":   "rtsp://admin:MOTDEPASSE@{ip}:554/media/video1",
+    "hanwha":    "rtsp://admin:MOTDEPASSE@{ip}:554/profile1/media.smp",
+    "vivotek":   "rtsp://root:MOTDEPASSE@{ip}:554/live.sdp",
+    "bosch":     "rtsp://admin:MOTDEPASSE@{ip}:554/video?inst=1",
+    "pelco":     "rtsp://admin:MOTDEPASSE@{ip}:554/stream1",
+    "flir":      "rtsp://admin:MOTDEPASSE@{ip}:554/avc",
+}
+
+
+def _rtsp_fallback(manufacturer: str, ip: str) -> str:
+    key = manufacturer.lower().split()[0] if manufacturer else ""
+    tpl = _RTSP_TEMPLATES.get(key, "rtsp://admin:MOTDEPASSE@{ip}:554/stream")
+    return tpl.format(ip=ip)
+
+
+def _ws_discover(timeout: float = 5.0) -> list:
+    """WS-Discovery UDP multicast 239.255.255.250:3702 → liste d'XAddrs ONVIF."""
+    msg_id = str(uuid.uuid4())
+    probe = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+        ' xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01"'
+        ' xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
+        '<s:Header>'
+        '<a:Action>http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01/Probe</a:Action>'
+        f'<a:MessageID>uuid:{msg_id}</a:MessageID>'
+        '<a:To>urn:docs-oasis-open-org:ws-dd:ns:discovery:2009:01</a:To>'
+        '</s:Header>'
+        '<s:Body><d:Probe>'
+        '<d:Types>dn:NetworkVideoTransmitter</d:Types>'
+        '</d:Probe></s:Body>'
+        '</s:Envelope>'
+    ).encode('utf-8')
+
+    xaddrs: set = set()
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(timeout)
+        sock.sendto(probe, (_WS_DISCOVER_ADDR, _WS_DISCOVER_PORT))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, _ = sock.recvfrom(65535)
+                text = data.decode('utf-8', errors='ignore')
+                for addr in _xml_text(text, 'XAddrs').split():
+                    if addr.startswith('http'):
+                        xaddrs.add(addr)
+            except socket.timeout:
+                break
+    except Exception as e:
+        warn(f'[onvif-scan] ws-discover: {e}')
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return list(xaddrs)
+
+
+def _onvif_soap(url: str, body: str, timeout: float = 4.0) -> str:
+    """Appel SOAP ONVIF sans authentification (GetDeviceInfo / GetCapabilities fonctionnent en clair)."""
+    envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        f'<s:Body>{body}</s:Body>'
+        '</s:Envelope>'
+    )
+    r = requests.post(
+        url, data=envelope.encode('utf-8'),
+        headers={'Content-Type': 'application/soap+xml; charset=utf-8'},
+        timeout=timeout,
+    )
+    return r.text
+
+
+def _scan_onvif_cameras(timeout: float = 7.0) -> list:
+    """Retourne la liste des caméras ONVIF détectées sur le LAN avec leur URL RTSP."""
+    xaddrs = _ws_discover(timeout=timeout - 2.0)
+    log(f'[onvif-scan] {len(xaddrs)} caméra(s) ONVIF détectée(s)')
+    results = []
+    for xaddr in xaddrs:
+        ip_m = re.search(r'https?://([^:/]+)', xaddr)
+        ip = ip_m.group(1) if ip_m else ''
+        manufacturer = model = rtsp_url = ''
+
+        try:
+            xml = _onvif_soap(
+                xaddr,
+                '<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
+                timeout=3.0,
+            )
+            manufacturer = _xml_text(xml, 'Manufacturer')
+            model        = _xml_text(xml, 'Model')
+        except Exception as e:
+            warn(f'[onvif-scan] GetDeviceInformation {ip}: {e}')
+
+        media_url = ''
+        try:
+            xml = _onvif_soap(
+                xaddr,
+                '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+                '<tds:Category>Media</tds:Category>'
+                '</tds:GetCapabilities>',
+                timeout=3.0,
+            )
+            for xa in _xml_all(xml, 'XAddr'):
+                if xa.startswith('http') and 'media' in xa.lower():
+                    media_url = xa
+                    break
+            if not media_url:
+                for xa in _xml_all(xml, 'XAddr'):
+                    if xa.startswith('http'):
+                        media_url = xa
+                        break
+        except Exception as e:
+            warn(f'[onvif-scan] GetCapabilities {ip}: {e}')
+
+        if media_url:
+            try:
+                xml = _onvif_soap(
+                    media_url,
+                    '<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>',
+                    timeout=3.0,
+                )
+                token = _xml_attr(xml, 'Profiles', 'token')
+                if token:
+                    xml2 = _onvif_soap(
+                        media_url,
+                        '<trt:GetStreamUri xmlns:trt="http://www.onvif.org/ver10/media/wsdl"'
+                        ' xmlns:tt="http://www.onvif.org/ver10/schema">'
+                        '<trt:StreamSetup>'
+                        '<tt:Stream>RTP-Unicast</tt:Stream>'
+                        '<tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport>'
+                        '</trt:StreamSetup>'
+                        f'<trt:ProfileToken>{token}</trt:ProfileToken>'
+                        '</trt:GetStreamUri>',
+                        timeout=3.0,
+                    )
+                    rtsp_url = _xml_text(xml2, 'Uri')
+            except Exception as e:
+                warn(f'[onvif-scan] GetStreamUri {ip}: {e}')
+
+        if not rtsp_url:
+            rtsp_url = _rtsp_fallback(manufacturer, ip)
+
+        results.append({
+            'ip':           ip,
+            'manufacturer': manufacturer,
+            'model':        model,
+            'name':         (f'{manufacturer} {model}'.strip()) or f'Caméra {ip}',
+            'rtspUrl':      rtsp_url,
+        })
+    return results
+
+
 class _CommandHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log(f"[cmd-server] {self.address_string()} — {fmt % args}")
@@ -2678,6 +2952,26 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         d'attendre le prochain cycle périodique (jusqu'à 60s) — bouton "Sync HA"."""
         _sync_requested.set()
         self._ok()
+
+    def do_GET(self):
+        if not INGEST_SECRET:
+            return self._reject(503, "ingest_secret non configuré")
+        if self.headers.get("X-Site-Secret") != INGEST_SECRET:
+            return self._reject(401, "Non autorisé")
+        route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
+        route = route.split("?")[0]
+        if route == "/camera/scan":
+            self._handle_camera_scan()
+        else:
+            self._reject(404, "Route inconnue")
+
+    def _handle_camera_scan(self):
+        try:
+            cameras = _scan_onvif_cameras(timeout=7.0)
+            self._ok({"cameras": cameras})
+        except Exception as e:
+            warn(f"[camera-scan] {e}")
+            self._reject(500, str(e))
 
 
 def run_command_server():
