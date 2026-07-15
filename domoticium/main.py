@@ -1951,14 +1951,11 @@ def run_ha_ws_bridge():
                     state_val = new_state.get("state", "")
                     attributes = new_state.get("attributes", {})
 
-                    # Persiste en DB via /api/ingest/states — seul canal d'état vers l'app
-                    # (Supabase Realtime relaie ensuite vers le navigateur).
+                    # Accumule dans le batch — _flush_state_batch() envoie toutes les 2.5s.
+                    # La déduplication par entity_id conserve uniquement le dernier état.
                     if INGEST_SECRET:
-                        threading.Thread(
-                            target=_post_ingest_state,
-                            args=(entity_id, state_val, attributes),
-                            daemon=True,
-                        ).start()
+                        with _state_batch_lock:
+                            _state_batch[entity_id] = (state_val, attributes)
 
                 elif event_type == "entity_registry_updated":
                     action = data.get("action")
@@ -1981,22 +1978,39 @@ def run_ha_ws_bridge():
         time.sleep(15)
 
 
-def _post_ingest_state(entity_id: str, state: str, attributes: dict):
-    """Appelle /api/ingest/states pour persister un état HA (caméras, alarme)."""
-    try:
-        requests.post(
-            f"{APP_URL}/api/ingest/states",
-            json={
-                "siteSecret": INGEST_SECRET,
-                "siteId": SITE_PREFIX,
-                "entityId": entity_id,
-                "state": state,
-                "attributes": attributes,
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        warn(f"[ingest/states] {entity_id}: {e}")
+# ── Batch d'états : accumule les state_changed, flush toutes les 2.5s ────────
+# Réduit les appels Vercel de ×N (un par event) à 1 par fenêtre temporelle.
+# La déduplication par entity_id garantit qu'on n'envoie que le dernier état connu.
+_state_batch: dict = {}
+_state_batch_lock = threading.Lock()
+
+
+def _flush_state_batch():
+    """Thread de fond : envoie les états accumulés en un seul POST toutes les 2.5s."""
+    while True:
+        time.sleep(2.5)
+        if not INGEST_SECRET or not _state_batch:
+            continue
+        with _state_batch_lock:
+            batch = dict(_state_batch)
+            _state_batch.clear()
+        if not batch:
+            continue
+        try:
+            requests.post(
+                f"{APP_URL}/api/ingest/states",
+                json={
+                    "siteSecret": INGEST_SECRET,
+                    "siteId": SITE_PREFIX,
+                    "states": [
+                        {"entityId": eid, "state": st, "attributes": attrs}
+                        for eid, (st, attrs) in batch.items()
+                    ],
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            warn(f"[ingest/states] batch: {e}")
 
 
 _IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
@@ -2999,6 +3013,8 @@ def run_bridge():
     threading.Thread(target=run_local_bridge, daemon=True).start()
     # Bridge HA WebSocket → Supabase (ingest) : seul canal d'état, remplace EMQX
     threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
+    # Flush du batch d'états toutes les 2.5s (réduit les appels Vercel)
+    threading.Thread(target=_flush_state_batch, daemon=True).start()
 
     # Serveur de commandes — bloquant, tourne dans le thread principal
     run_command_server()
