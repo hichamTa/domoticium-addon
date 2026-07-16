@@ -2346,9 +2346,9 @@ def _start_addon(slug: str, label: str) -> None:
     """Démarre un addon arrêté via l'API Supervisor."""
     r = sup_post(f"/addons/{slug}/start")
     if r.ok:
-        log(f"[matter] {label} démarré ✓")
+        log(f"{label} démarré ✓")
     else:
-        warn(f"[matter] Impossible de démarrer {label}: {r.status_code} {r.text[:100]}")
+        warn(f"Impossible de démarrer {label}: {r.status_code} {r.text[:100]}")
 
 
 def _ensure_matter_integration():
@@ -2556,11 +2556,8 @@ def _ensure_frigate():
                 log(f"[frigate] Frigate absent — installation automatique… (tentative {attempt}/5)")
                 install_frigate()
             elif not _is_addon_running(FRIGATE_SLUG):
-                log("[frigate] Frigate installé mais arrêté — démarrage…")
-                _load_cameras()
-                write_frigate_config()
-                _start_addon(FRIGATE_SLUG, "Frigate")
-                _wait_frigate_ready()
+                log("[frigate] Frigate installé mais arrêté — configuration port + démarrage…")
+                _configure_frigate_and_start()
             elif not _frigate_go2rtc_ready():
                 log("[frigate] Frigate en cours mais go2rtc indisponible — reconfiguration…")
                 _configure_frigate_and_start()
