@@ -731,19 +731,41 @@ def _frigate_state() -> str:
 
 def _configure_frigate_and_start() -> bool:
     """Configure et démarre Frigate. Retourne True si go2rtc est opérationnel."""
+    # Log les ports déclarés par l'addon Frigate (diagnostic)
+    info_r = sup_get(f"/addons/{FRIGATE_SLUG}/info")
+    if info_r.ok:
+        info = info_r.json()
+        if isinstance(info, dict):
+            info = info.get("data", info)
+        log(f"[frigate] ports addon: {info.get('network', {})} / host_network: {info.get('host_network', '?')}")
+
+    # Tentative de mapping port 1984 (ignorée si non déclaré dans config.yaml de Frigate)
     r = sup_post(f"/addons/{FRIGATE_SLUG}/options", {"network": {"1984/tcp": 1984}})
-    mark = "✓" if r.ok else f"✗ {r.status_code} {r.text[:80]}"
-    log(f"{mark} Frigate port 1984 exposé")
+    log(f"[frigate] network/1984 → {r.status_code} {r.text[:120]}")
 
     _load_cameras()
     write_frigate_config()
 
-    r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
+    # start ou restart selon l'état courant
+    state = _frigate_state()
+    action = "restart" if state in ("started", "running") else "start"
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/{action}", timeout=120)
     if not r.ok:
-        warn(f"✗ {r.status_code} Frigate restart : {r.text[:150]}")
+        warn(f"[frigate] ✗ {action} : {r.status_code} {r.text[:150]}")
         return False
+    log(f"[frigate] {action} → {r.status_code}")
 
-    return _wait_frigate_ready()
+    ok = _wait_frigate_ready()
+    if not ok:
+        # Diagnostic : Frigate tourne-t-il sur :5000 ?
+        try:
+            ui = requests.get("http://127.0.0.1:5000/api", timeout=5)
+            warn(f"[frigate] UI :5000 → {ui.status_code} (Frigate tourne mais go2rtc :1984 inaccessible)")
+        except Exception as e:
+            warn(f"[frigate] UI :5000 inaccessible → Frigate ne démarre pas ({e})")
+        # Diagnostic : état Supervisor
+        warn(f"[frigate] état Supervisor : {_frigate_state()}")
+    return ok
 
 
 def install_frigate():
@@ -820,6 +842,9 @@ def write_frigate_config():
         "# Généré par Domoticium — ne pas modifier manuellement",
         "mqtt:",
         "  enabled: false",
+        "",
+        "go2rtc:",
+        "  listen: \":1984\"",
         "",
     ]
 
