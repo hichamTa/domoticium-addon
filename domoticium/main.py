@@ -2194,31 +2194,84 @@ def run_ha_ws_bridge():
 _state_batch: dict = {}
 _state_batch_lock = threading.Lock()
 
+# ── Watchdog caméras ─────────────────────────────────────────────────────────
+# Sonde go2rtc toutes les 60s, envoie les deltas dans le même flush que les états.
+_cam_watch_online: dict[str, bool] = {}   # streamName → dernière valeur connue
+_cam_watch_dirty: set[str] = set()        # streamNames dont le statut a changé
+_cam_watch_lock = threading.Lock()
+
+
+def _probe_cameras_go2rtc() -> dict[str, bool]:
+    """Interroge go2rtc API pour connaître l'état de chaque flux en une requête."""
+    try:
+        r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
+        if not r.ok:
+            return {}
+        result = {}
+        for name, info in r.json().items():
+            producers = (info or {}).get("producers") or []
+            result[name] = any(
+                isinstance(p, dict) and p.get("state") == "online"
+                for p in producers
+            )
+        return result
+    except Exception:
+        return {}
+
+
+def _run_camera_watchdog():
+    """Thread de fond : sonde les caméras via go2rtc toutes les 60s.
+    Les deltas sont injectés dans _cam_watch_dirty pour être envoyés
+    dans le prochain flush de _flush_state_batch."""
+    time.sleep(30)  # laisser go2rtc démarrer
+    while True:
+        if _cameras:
+            probed = _probe_cameras_go2rtc()
+            if probed:
+                with _cam_watch_lock:
+                    for name in list(_cameras):
+                        new_online = probed.get(name, False)
+                        if _cam_watch_online.get(name) != new_online:
+                            _cam_watch_online[name] = new_online
+                            _cam_watch_dirty.add(name)
+        time.sleep(60)
+
 
 def _flush_state_batch():
-    """Thread de fond : envoie les états accumulés en un seul POST toutes les 2.5s."""
+    """Thread de fond : envoie états devices + statuts caméras en un seul POST toutes les 2.5s."""
     while True:
         time.sleep(2.5)
-        if not INGEST_SECRET or not _state_batch:
+        if not INGEST_SECRET:
             continue
+
         with _state_batch_lock:
             batch = dict(_state_batch)
             _state_batch.clear()
-        if not batch:
+
+        with _cam_watch_lock:
+            cam_batch = {
+                n: _cam_watch_online[n]
+                for n in _cam_watch_dirty
+                if n in _cam_watch_online and n in _cameras
+            }
+            _cam_watch_dirty.clear()
+
+        if not batch and not cam_batch:
             continue
+
         try:
-            requests.post(
-                f"{APP_URL}/api/ingest/states",
-                json={
-                    "siteSecret": INGEST_SECRET,
-                    "siteId": SITE_PREFIX,
-                    "states": [
-                        {"entityId": eid, "state": st, "attributes": attrs}
-                        for eid, (st, attrs) in batch.items()
-                    ],
-                },
-                timeout=15,
-            )
+            payload: dict = {"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX}
+            if batch:
+                payload["states"] = [
+                    {"entityId": eid, "state": st, "attributes": attrs}
+                    for eid, (st, attrs) in batch.items()
+                ]
+            if cam_batch:
+                payload["cameras"] = [
+                    {"streamName": name, "online": online}
+                    for name, online in cam_batch.items()
+                ]
+            requests.post(f"{APP_URL}/api/ingest/states", json=payload, timeout=15)
         except Exception as e:
             warn(f"[ingest/states] batch: {e}")
 
@@ -3259,7 +3312,9 @@ def run_bridge():
     # Bridge HA WebSocket → Supabase (ingest) : seul canal d'état, remplace EMQX
     threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
     # Flush du batch d'états toutes les 2.5s (réduit les appels Vercel)
-    threading.Thread(target=_flush_state_batch, daemon=True).start()
+    threading.Thread(target=_flush_state_batch,      daemon=True).start()
+    # Watchdog caméras : sonde go2rtc toutes les 60s, deltas envoyés dans le batch
+    threading.Thread(target=_run_camera_watchdog,    daemon=True).start()
 
     # Serveur de commandes — bloquant, tourne dans le thread principal
     run_command_server()
