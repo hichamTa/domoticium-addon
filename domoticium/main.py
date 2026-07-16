@@ -896,11 +896,17 @@ def write_frigate_config():
         lines.append("cameras: {}")
 
     content = "\n".join(lines) + "\n"
-    with open("/homeassistant/frigate.yml", "w") as fh:
-        fh.write(content)
 
-    log(f"✓ frigate.yml mis à jour ({len(_cameras)} caméra(s))")
-    log(f"[frigate.yml]\n{content}")
+    # Le prepare script de Frigate déplace /homeassistant/frigate.yml →
+    # /config/config.yml (= /homeassistant/config.yml) au premier démarrage.
+    # Frigate lit ensuite exclusivement /config/config.yml.
+    # On écrit les deux pour couvrir la 1ère install ET les redémarrages suivants.
+    for path in ("/homeassistant/frigate.yml", "/homeassistant/config.yml"):
+        with open(path, "w") as fh:
+            fh.write(content)
+
+    log(f"✓ config Frigate mise à jour ({len(_cameras)} caméra(s))")
+    log(f"[frigate.yml / config.yml]\n{content}")
 
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
@@ -3136,10 +3142,15 @@ def _dict_to_yaml(d, indent=0):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Priorité absolue : écrire frigate.yml AVANT tout le reste.
-    # Frigate peut auto-démarrer pendant notre setup et lire ce fichier.
-    # On le fait ici, avant même d'attendre HA, pour éviter le crash de migration
-    # causé par un "cameras: {}" ou "cameras: null" résiduel.
+    log("══════════════════════════════════════════════")
+    log("  DÉMARRAGE DOMOTICIUM v2.3.14")
+    log("══════════════════════════════════════════════")
+
+    # Priorité absolue : écrire la config Frigate AVANT tout le reste.
+    # Le prepare script de Frigate déplace /homeassistant/frigate.yml vers
+    # /config/config.yml (= /homeassistant/config.yml) à la première install.
+    # Frigate lit ensuite toujours depuis /config/config.yml.
+    # On écrit les deux chemins pour couvrir tous les cas (1ère install et suivantes).
     _load_cameras()
     write_frigate_config()
 
