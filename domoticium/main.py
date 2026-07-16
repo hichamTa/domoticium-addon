@@ -866,7 +866,28 @@ def install_frigate():
 
 
 _FRIGATE_AUTH_MARKER = "/data/.frigate_auth_disabled"
-_FRIGATE_API = "http://127.0.0.1:5000"
+_FRIGATE_API_PORTS = (8971, 5000)  # 8971 = Frigate 0.14+, 5000 = legacy
+
+
+def _frigate_wait_api(max_wait: int = 60) -> str | None:
+    """Attend que l'API Frigate réponde sur l'un des ports connus.
+    Retourne l'URL de base (ex: 'http://127.0.0.1:8971') ou None si timeout."""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        for port in _FRIGATE_API_PORTS:
+            url = f"http://127.0.0.1:{port}"
+            try:
+                r = requests.get(f"{url}/api/config", timeout=4)
+                if r.status_code in (200, 401, 403):
+                    log(f"[frigate] API disponible sur port {port} (HTTP {r.status_code})")
+                    return url
+            except Exception:
+                pass
+        remaining = deadline - time.time()
+        if remaining > 0:
+            time.sleep(min(5, remaining))
+    warn(f"[frigate] API injoignable après {max_wait}s (ports {_FRIGATE_API_PORTS})")
+    return None
 
 
 def _generate_frigate_yaml() -> str:
@@ -910,11 +931,14 @@ def _generate_frigate_yaml() -> str:
 def _frigate_push_config(restart: bool = True) -> bool:
     """Pousse la config via l'API REST Frigate (auth désactivée).
     Retourne True si réussi. Si Frigate n'est pas prêt, retourne False sans lever."""
+    api = _frigate_wait_api(max_wait=15)
+    if not api:
+        return False
     content = _generate_frigate_yaml()
     save_option = "restart" if restart else "saveonly"
     try:
         r = requests.post(
-            f"{_FRIGATE_API}/api/config/save?save_option={save_option}",
+            f"{api}/api/config/save?save_option={save_option}",
             data=content.encode("utf-8"),
             headers={"Content-Type": "text/yaml"},
             timeout=30,
@@ -935,9 +959,14 @@ def _setup_frigate_auth_once():
     if os.path.exists(_FRIGATE_AUTH_MARKER):
         return  # déjà désactivée
 
-    # Tester si auth est déjà off (appel sans credentials)
+    # Attendre que l'API Frigate réponde (go2rtc peut être prêt avant nginx)
+    api = _frigate_wait_api(max_wait=90)
+    if not api:
+        return
+
+    # Tester si auth est déjà off (200 = pas d'auth, 401/403 = auth active)
     try:
-        probe = requests.get(f"{_FRIGATE_API}/api/config", timeout=5)
+        probe = requests.get(f"{api}/api/config", timeout=5)
         if probe.ok:
             log("[frigate] auth déjà désactivée (API répond sans credentials)")
             open(_FRIGATE_AUTH_MARKER, "w").close()
@@ -966,7 +995,7 @@ def _setup_frigate_auth_once():
     cookies = None
     try:
         login_r = requests.post(
-            f"{_FRIGATE_API}/api/login",
+            f"{api}/api/login",
             json={"user": "admin", "password": password},
             timeout=10,
         )
@@ -988,7 +1017,7 @@ def _setup_frigate_auth_once():
         hdrs["Authorization"] = f"Bearer {token}"
     try:
         save_r = requests.post(
-            f"{_FRIGATE_API}/api/config/save?save_option=saveonly",
+            f"{api}/api/config/save?save_option=saveonly",
             data=content.encode("utf-8"),
             headers=hdrs,
             cookies=cookies,
