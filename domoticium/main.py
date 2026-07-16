@@ -888,9 +888,12 @@ def write_frigate_config():
                 "    record:",
                 "      enabled: false",
             ]
-    # Intentionnellement PAS de clé "cameras:" quand vide.
-    # La migration Frigate 0.13→0.14 crashe si "cameras: {}" (parsé comme None).
-    # Sans la clé, config.get("cameras", {}) retourne {} et la migration réussit.
+    else:
+        # `cameras: {}` (dict YAML explicite, pas null) évite le crash de migration
+        # Frigate 0.13→0.14 : migrate_014() fait config.get("cameras", {}).items()
+        # qui lève AttributeError si "cameras:" est présent sans valeur (= None).
+        # `cameras: {}` parse en dict vide → .items() = liste vide → pas de crash.
+        lines.append("cameras: {}")
 
     content = "\n".join(lines) + "\n"
     with open("/homeassistant/frigate.yml", "w") as fh:
