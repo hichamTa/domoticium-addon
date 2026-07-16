@@ -832,13 +832,19 @@ def install_frigate():
     state = _frigate_state()
     warn(f"Frigate état={state!r} après timeout — réinstallation propre…")
 
-    # Écrire la config AVANT la désinstallation : elle persiste sur le disque
-    # et Frigate la lira lors de l'auto-démarrage post-réinstallation.
+    # Écrire la config AVANT la désinstallation.
+    # remove_config=True efface l'addon_config privé de Frigate (= /config/config.yml
+    # DANS le conteneur Frigate, stocké dans addon_configs/ccab4aaf_frigate/ sur l'hôte).
+    # Un éventuel stale config.yml avec cameras:null (crash de migration 0.13→0.14) est
+    # ainsi supprimé. Le prepare script de Frigate recopie /homeassistant/frigate.yml →
+    # /config/config.yml dès lors que ce dernier n'existe plus.
+    # Notre config contient version:"0.18-0" → migration entièrement skippée même si
+    # un stale réapparaît d'une source externe.
     _load_cameras()
     write_frigate_config()
 
-    sup_post(f"/addons/{FRIGATE_SLUG}/uninstall")
-    log("Désinstallation Frigate…")
+    r_uninstall = sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", {"remove_config": True})
+    log(f"Désinstallation Frigate (remove_config=True) → {r_uninstall.status_code}")
     time.sleep(20)
 
     r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install", timeout=300)
@@ -857,6 +863,10 @@ def write_frigate_config():
     """Génère /homeassistant/frigate.yml depuis le registre des caméras."""
     lines = [
         "# Généré par Domoticium — ne pas modifier manuellement",
+        # version: "0.18-0" = version courante Frigate → migrate_frigate_config() skip
+        # TOUTE migration si ce champ est présent et correspond à CURRENT_CONFIG_VERSION.
+        # Protège contre le crash 0.13→0.14 même si un stale config.yml réapparaît.
+        'version: "0.18-0"',
         "mqtt:",
         "  enabled: false",
         "",
@@ -889,24 +899,19 @@ def write_frigate_config():
                 "      enabled: false",
             ]
     else:
-        # `cameras: {}` (dict YAML explicite, pas null) évite le crash de migration
-        # Frigate 0.13→0.14 : migrate_014() fait config.get("cameras", {}).items()
-        # qui lève AttributeError si "cameras:" est présent sans valeur (= None).
-        # `cameras: {}` parse en dict vide → .items() = liste vide → pas de crash.
+        # cameras: {} (dict YAML explicite) — évite AttributeError sur None.items()
         lines.append("cameras: {}")
 
     content = "\n".join(lines) + "\n"
 
-    # Le prepare script de Frigate déplace /homeassistant/frigate.yml →
-    # /config/config.yml (= /homeassistant/config.yml) au premier démarrage.
-    # Frigate lit ensuite exclusivement /config/config.yml.
-    # On écrit les deux pour couvrir la 1ère install ET les redémarrages suivants.
-    for path in ("/homeassistant/frigate.yml", "/homeassistant/config.yml"):
-        with open(path, "w") as fh:
-            fh.write(content)
+    # Le prepare script de Frigate copie /homeassistant/frigate.yml →
+    # /config/config.yml (addon_config privé) uniquement si ce dernier n'existe pas.
+    # On écrit seulement frigate.yml — c'est ce chemin que le prepare script lit.
+    with open("/homeassistant/frigate.yml", "w") as fh:
+        fh.write(content)
 
     log(f"✓ config Frigate mise à jour ({len(_cameras)} caméra(s))")
-    log(f"[frigate.yml / config.yml]\n{content}")
+    log(f"[frigate.yml]\n{content}")
 
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
@@ -3143,14 +3148,13 @@ def _dict_to_yaml(d, indent=0):
 
 if __name__ == "__main__":
     log("══════════════════════════════════════════════")
-    log("  DÉMARRAGE DOMOTICIUM v2.3.14")
+    log("  DÉMARRAGE DOMOTICIUM v2.3.15")
     log("══════════════════════════════════════════════")
 
-    # Priorité absolue : écrire la config Frigate AVANT tout le reste.
-    # Le prepare script de Frigate déplace /homeassistant/frigate.yml vers
-    # /config/config.yml (= /homeassistant/config.yml) à la première install.
-    # Frigate lit ensuite toujours depuis /config/config.yml.
-    # On écrit les deux chemins pour couvrir tous les cas (1ère install et suivantes).
+    # Écrire la config Frigate AVANT tout le reste.
+    # Le prepare script Frigate copie /homeassistant/frigate.yml → addon_config privé
+    # (/config/config.yml dans le conteneur Frigate) si ce dernier n'existe pas encore.
+    # La config contient version:"0.18-0" → toute migration Frigate est skippée.
     _load_cameras()
     write_frigate_config()
 
