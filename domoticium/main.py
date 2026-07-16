@@ -694,24 +694,33 @@ def _detect_thread_adapter():
 # ── Frigate NVR ───────────────────────────────────────────────────────────────
 
 def _frigate_go2rtc_ready() -> bool:
-    """Teste si go2rtc écoute sur :1984. Retourne True si opérationnel."""
-    try:
-        return requests.get("http://127.0.0.1:1984/api", timeout=3).status_code < 500
-    except Exception:
-        return False
+    """Teste si Frigate est opérationnel (:1984 go2rtc ou :5000 UI). Retourne True si l'un répond."""
+    for port, path in [(1984, "/api"), (5000, "/api")]:
+        try:
+            r = requests.get(f"http://127.0.0.1:{port}{path}", timeout=3)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _wait_frigate_ready(max_attempts: int = 36) -> bool:
-    """Attend jusqu'à 3 min que go2rtc soit disponible. Retourne True si succès."""
-    log("Attente que go2rtc soit disponible sur :1984…")
+    """Attend jusqu'à 3 min que Frigate soit disponible. Retourne True si succès."""
+    log("Attente que Frigate (go2rtc :1984 ou UI :5000) soit disponible…")
     for i in range(max_attempts):
         time.sleep(5)
-        if _frigate_go2rtc_ready():
-            log(f"✓ Frigate go2rtc opérationnel sur :1984 (~{(i+1)*5}s)")
-            return True
+        for port, path in [(1984, "/api"), (5000, "/api")]:
+            try:
+                r = requests.get(f"http://127.0.0.1:{port}{path}", timeout=3)
+                if r.status_code < 500:
+                    log(f"✓ Frigate opérationnel sur :{port} (~{(i+1)*5}s)")
+                    return True
+            except Exception:
+                pass
         if i % 6 == 5:
             log(f"  … toujours en attente ({(i+1)*5}s)")
-    warn("go2rtc pas disponible après 3 min")
+    warn("Frigate pas disponible après 3 min (:1984 et :5000 inaccessibles)")
     return False
 
 
@@ -846,13 +855,24 @@ def write_frigate_config():
     ]
 
     if _cameras:
+        # Section go2rtc — un stream par caméra (RTSP direct)
+        lines.append("go2rtc:")
+        lines.append("  streams:")
+        for name, rtsp_url in _cameras.items():
+            lines += [
+                f"    {name}:",
+                f"      - {rtsp_url}",
+            ]
+        lines.append("")
+
+        # Section cameras — utilise le relay go2rtc (réduit les connexions RTSP)
         lines.append("cameras:")
         for name, rtsp_url in _cameras.items():
             lines += [
                 f"  {name}:",
                 "    ffmpeg:",
                 "      inputs:",
-                f"        - path: {rtsp_url}",
+                f"        - path: rtsp://127.0.0.1:8554/{name}",
                 "          roles:",
                 "            - detect",
                 "    detect:",
