@@ -2750,6 +2750,7 @@ def _ensure_frigate():
                 _configure_frigate_and_start()
             else:
                 log("[frigate] ✓ Frigate et go2rtc opérationnels")
+                threading.Thread(target=_setup_frigate_auth_once, daemon=True).start()
             return  # succès
         except Exception as e:
             warn(f"[frigate] _ensure_frigate tentative {attempt}/5 : {e}")
@@ -3265,7 +3266,7 @@ def _dict_to_yaml(d, indent=0):
 
 if __name__ == "__main__":
     log("══════════════════════════════════════════════")
-    log("  DÉMARRAGE DOMOTICIUM v2.3.16")
+    log("  DÉMARRAGE DOMOTICIUM v2.3.17")
     log("══════════════════════════════════════════════")
 
     # Écrire la config Frigate AVANT tout le reste.
