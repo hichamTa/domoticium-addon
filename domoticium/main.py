@@ -843,9 +843,6 @@ def write_frigate_config():
         "mqtt:",
         "  enabled: false",
         "",
-        "go2rtc:",
-        "  listen: \":1984\"",
-        "",
     ]
 
     if _cameras:
@@ -2577,8 +2574,14 @@ def _ensure_frigate():
     Réessaie toutes les 5 min en cas d'échec (timeout Supervisor, réseau lent…)."""
     for attempt in range(1, 6):
         try:
+            state = _frigate_state()
             if not _is_addon_installed(FRIGATE_SLUG):
                 log(f"[frigate] Frigate absent — installation automatique… (tentative {attempt}/5)")
+                install_frigate()
+            elif state == "error":
+                warn(f"[frigate] Frigate en état error — réinstallation propre… (tentative {attempt}/5)")
+                sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", timeout=120)
+                time.sleep(15)
                 install_frigate()
             elif not _is_addon_running(FRIGATE_SLUG):
                 log("[frigate] Frigate installé mais arrêté — configuration port + démarrage…")
