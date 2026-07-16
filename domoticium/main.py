@@ -766,13 +766,11 @@ def _configure_frigate_and_start() -> bool:
 
     ok = _wait_frigate_ready()
     if not ok:
-        # Diagnostic : Frigate tourne-t-il sur :5000 ?
         try:
             ui = requests.get("http://127.0.0.1:5000/api", timeout=5)
             warn(f"[frigate] UI :5000 → {ui.status_code} (Frigate tourne mais go2rtc :1984 inaccessible)")
         except Exception as e:
             warn(f"[frigate] UI :5000 inaccessible → Frigate ne démarre pas ({e})")
-        # Diagnostic : état Supervisor + logs Frigate
         warn(f"[frigate] état Supervisor : {_frigate_state()}")
         try:
             lr = sup_get(f"/addons/{FRIGATE_SLUG}/logs")
@@ -782,7 +780,11 @@ def _configure_frigate_and_start() -> bool:
                 warn(f"[frigate] Derniers logs Frigate:\n{excerpt}")
         except Exception as e:
             warn(f"[frigate] impossible de lire les logs Frigate : {e}")
-    return ok
+        return False
+
+    # Frigate prêt → désactiver l'auth une fois pour toutes (si ce n'est déjà fait)
+    threading.Thread(target=_setup_frigate_auth_once, daemon=True).start()
+    return True
 
 
 def install_frigate():
@@ -843,6 +845,10 @@ def install_frigate():
     _load_cameras()
     write_frigate_config()
 
+    # Effacer le marker d'auth désactivée : après remove_config+reinstall, Frigate
+    # recréera un admin avec un nouveau password aléatoire → il faudra refaire le setup.
+    if os.path.exists(_FRIGATE_AUTH_MARKER):
+        os.remove(_FRIGATE_AUTH_MARKER)
     r_uninstall = sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", {"remove_config": True})
     log(f"Désinstallation Frigate (remove_config=True) → {r_uninstall.status_code}")
     time.sleep(20)
@@ -859,31 +865,28 @@ def install_frigate():
     warn("Frigate toujours inopérationnel après réinstallation — vérifier les logs Frigate dans HA")
 
 
-def write_frigate_config():
-    """Génère /homeassistant/frigate.yml depuis le registre des caméras."""
+_FRIGATE_AUTH_MARKER = "/data/.frigate_auth_disabled"
+_FRIGATE_API = "http://127.0.0.1:5000"
+
+
+def _generate_frigate_yaml() -> str:
+    """Génère le YAML complet de config Frigate depuis le registre des caméras."""
     lines = [
         "# Généré par Domoticium — ne pas modifier manuellement",
-        # version: "0.18-0" = version courante Frigate → migrate_frigate_config() skip
-        # TOUTE migration si ce champ est présent et correspond à CURRENT_CONFIG_VERSION.
-        # Protège contre le crash 0.13→0.14 même si un stale config.yml réapparaît.
         'version: "0.18-0"',
+        "auth:",
+        "  enabled: false",
         "mqtt:",
         "  enabled: false",
         "",
     ]
 
     if _cameras:
-        # Section go2rtc — un stream par caméra (RTSP direct)
         lines.append("go2rtc:")
         lines.append("  streams:")
         for name, rtsp_url in _cameras.items():
-            lines += [
-                f"    {name}:",
-                f"      - {rtsp_url}",
-            ]
+            lines += [f"    {name}:", f"      - {rtsp_url}"]
         lines.append("")
-
-        # Section cameras — utilise le relay go2rtc (réduit les connexions RTSP)
         lines.append("cameras:")
         for name, rtsp_url in _cameras.items():
             lines += [
@@ -899,19 +902,124 @@ def write_frigate_config():
                 "      enabled: false",
             ]
     else:
-        # cameras: {} (dict YAML explicite) — évite AttributeError sur None.items()
         lines.append("cameras: {}")
 
-    content = "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
 
-    # Le prepare script de Frigate copie /homeassistant/frigate.yml →
-    # /config/config.yml (addon_config privé) uniquement si ce dernier n'existe pas.
-    # On écrit seulement frigate.yml — c'est ce chemin que le prepare script lit.
+
+def _frigate_push_config(restart: bool = True) -> bool:
+    """Pousse la config via l'API REST Frigate (auth désactivée).
+    Retourne True si réussi. Si Frigate n'est pas prêt, retourne False sans lever."""
+    content = _generate_frigate_yaml()
+    save_option = "restart" if restart else "saveonly"
+    try:
+        r = requests.post(
+            f"{_FRIGATE_API}/api/config/save?save_option={save_option}",
+            data=content.encode("utf-8"),
+            headers={"Content-Type": "text/yaml"},
+            timeout=30,
+        )
+        if r.ok:
+            log(f"[frigate] ✓ Config poussée via API (save_option={save_option})")
+            return True
+        warn(f"[frigate] API config/save: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        warn(f"[frigate] API config/save: {e}")
+    return False
+
+
+def _setup_frigate_auth_once():
+    """Appelé après un démarrage Frigate. Si auth est activée (pas de marker),
+    lit le mot de passe initial depuis les logs, pousse la config avec auth désactivée
+    via l'API Frigate, puis redémarre. Ne s'exécute qu'une fois par install Frigate."""
+    if os.path.exists(_FRIGATE_AUTH_MARKER):
+        return  # déjà désactivée
+
+    # Tester si auth est déjà off (appel sans credentials)
+    try:
+        probe = requests.get(f"{_FRIGATE_API}/api/config", timeout=5)
+        if probe.ok:
+            log("[frigate] auth déjà désactivée (API répond sans credentials)")
+            open(_FRIGATE_AUTH_MARKER, "w").close()
+            return
+    except Exception:
+        pass
+
+    # Parser le password depuis les logs Supervisor
+    password = None
+    try:
+        lr = sup_get(f"/addons/{FRIGATE_SLUG}/logs")
+        if lr.ok:
+            for line in lr.text.splitlines():
+                m = re.search(r"Password:\s+([a-f0-9]{32})", line)
+                if m:
+                    password = m.group(1)
+    except Exception as e:
+        warn(f"[frigate] lecture logs password: {e}")
+
+    if not password:
+        warn("[frigate] password initial introuvable — auth reste activée jusqu'au prochain redémarrage")
+        return
+
+    # Login Frigate
+    token = None
+    cookies = None
+    try:
+        login_r = requests.post(
+            f"{_FRIGATE_API}/api/login",
+            json={"user": "admin", "password": password},
+            timeout=10,
+        )
+        if login_r.ok:
+            body = login_r.json()
+            token = body.get("access_token") or body.get("token")
+            cookies = login_r.cookies
+        else:
+            warn(f"[frigate] login: {login_r.status_code} {login_r.text[:100]}")
+            return
+    except Exception as e:
+        warn(f"[frigate] login: {e}")
+        return
+
+    # Pousser config avec auth désactivée (saveonly — on restart ensuite via Supervisor)
+    content = _generate_frigate_yaml()
+    hdrs = {"Content-Type": "text/yaml"}
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    try:
+        save_r = requests.post(
+            f"{_FRIGATE_API}/api/config/save?save_option=saveonly",
+            data=content.encode("utf-8"),
+            headers=hdrs,
+            cookies=cookies,
+            timeout=30,
+        )
+        if save_r.ok:
+            log("[frigate] ✓ Auth désactivée — redémarrage Frigate…")
+            open(_FRIGATE_AUTH_MARKER, "w").close()
+            time.sleep(2)
+            sup_post(f"/addons/{FRIGATE_SLUG}/restart")
+        else:
+            warn(f"[frigate] save (disable auth): {save_r.status_code} {save_r.text[:200]}")
+    except Exception as e:
+        warn(f"[frigate] save (disable auth): {e}")
+
+
+def write_frigate_config():
+    """Écrit /homeassistant/frigate.yml (pour le prepare script au 1er install)
+    et pousse la config via l'API Frigate si celui-ci tourne avec auth désactivée."""
+    content = _generate_frigate_yaml()
+
+    # Pour le prepare script (1re install / après remove_config)
     with open("/homeassistant/frigate.yml", "w") as fh:
         fh.write(content)
 
     log(f"✓ config Frigate mise à jour ({len(_cameras)} caméra(s))")
     log(f"[frigate.yml]\n{content}")
+
+    # Pousser directement via API si Frigate tourne (auth déjà désactivée)
+    if os.path.exists(_FRIGATE_AUTH_MARKER):
+        _frigate_push_config(restart=False)
 
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
@@ -1263,15 +1371,24 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
             raise ValueError("rtspUrl manquant")
         _cameras[stream_name] = rtsp_url
         _save_cameras()
-        write_frigate_config()
-        restart_frigate()
-        log(f"✓ Caméra ajoutée : '{stream_name}' — Frigate redémarre")
     elif action == "remove":
         _cameras.pop(stream_name, None)
         _save_cameras()
-        write_frigate_config()
+    else:
+        raise ValueError(f"action inconnue: {action!r}")
+
+    write_frigate_config()
+    # Pousser config via API Frigate avec reload (restart=True).
+    # Si auth pas encore désactivée, write_frigate_config() aura écrit frigate.yml
+    # et on fait un restart Supervisor en fallback pour que Frigate recharge.
+    if os.path.exists(_FRIGATE_AUTH_MARKER):
+        threading.Thread(
+            target=lambda: (_frigate_push_config(restart=True), log(f"✓ Caméra {action}: '{stream_name}'")),
+            daemon=True,
+        ).start()
+    else:
         restart_frigate()
-        log(f"✓ Caméra supprimée : '{stream_name}' — Frigate redémarre")
+        log(f"✓ Caméra {action}: '{stream_name}' — restart Supervisor (auth pas encore désactivée)")
 
 
 def _matter_ws_frames(s):
@@ -3148,7 +3265,7 @@ def _dict_to_yaml(d, indent=0):
 
 if __name__ == "__main__":
     log("══════════════════════════════════════════════")
-    log("  DÉMARRAGE DOMOTICIUM v2.3.15")
+    log("  DÉMARRAGE DOMOTICIUM v2.3.16")
     log("══════════════════════════════════════════════")
 
     # Écrire la config Frigate AVANT tout le reste.
