@@ -1603,6 +1603,8 @@ _z2m_online: bool | None = None  # état Z2M courant, None = inconnu
 # ── Sync omnipresente App → HA ────────────────────────────────────────────────
 _sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: device supprimé)
 _mqtt_broker_checked = False          # flag one-shot pour _check_and_fix_mqtt_broker
+_last_ha_status_publish:    float = 0.0   # throttle homeassistant/status online
+_last_z2m_devices_request:  float = 0.0   # throttle bridge/request/devices
 
 
 def _check_and_fix_mqtt_broker():
@@ -1753,17 +1755,19 @@ def _sync_areas_batch(rooms: list, devices: list):
 
             # Résoudre le device_id HA via les identifiers du device registry
             # Les identifiers Z2M ont la forme "zigbee2mqtt_0x8c8b48..." → l'ieee est dedans
+            if not ieee:
+                continue  # entité système sans ieee_address (ex: backup_manager, core) — pas de sync HA
+
             device_id = None
-            if ieee:
-                ieee_lower = ieee.lower()
-                for id_val, did in did_by_uid.items():
-                    if ieee_lower in id_val.lower():
-                        device_id = did
-                        break
+            ieee_lower = ieee.lower()
+            for id_val, did in did_by_uid.items():
+                if ieee_lower in id_val.lower():
+                    device_id = did
+                    break
 
             if not device_id:
                 sample = list(did_by_uid.keys())[:6]
-                warn(f"[sync] Device non trouvé dans HA (ieee={ieee or '?'})"
+                warn(f"[sync] Device non trouvé dans HA (ieee={ieee})"
                      f" — identifiers connus: {sample}"
                      " — sera retentée au prochain cycle")
                 continue
@@ -1789,6 +1793,7 @@ def _sync_areas_batch(rooms: list, devices: list):
 
 def _sync_all_to_ha():
     """Récupère l'état complet depuis l'app et l'applique à HA (idempotent, une session WS)."""
+    global _last_ha_status_publish, _last_z2m_devices_request
     auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
     try:
         r = requests.get(
@@ -1813,8 +1818,11 @@ def _sync_all_to_ha():
 
     # Déclencher Z2M pour republier ses discovery messages HA → HA peuple son device registry.
     # Envoyé EN PREMIER pour laisser à Z2M le temps de répondre pendant qu'on sync scènes/autos.
-    if _local_client:
+    # Throttlé à 1x/5min pour éviter le flood de messages MQTT à chaque cycle 60s.
+    _now = time.time()
+    if _local_client and (_now - _last_ha_status_publish > 300):
         _local_client.publish("homeassistant/status", "online", qos=1)
+        _last_ha_status_publish = _now
         log("[sync] homeassistant/status online → Z2M republiera les discovery HA")
 
     # Scènes + automations via REST HA (rapide, pas de WebSocket)
@@ -1828,8 +1836,10 @@ def _sync_all_to_ha():
 
     # Demander à Z2M de republier bridge/devices → devices-sync webhook
     # → vendor/model/features/z2m_name mis à jour sans redémarrer Z2M
-    if _local_client:
+    # Throttlé à 1x/5min (inutile à chaque cycle 60s).
+    if _local_client and (time.time() - _last_z2m_devices_request > 300):
         _local_client.publish("zigbee2mqtt/bridge/request/devices", "", qos=1)
+        _last_z2m_devices_request = time.time()
         log("[sync] bridge/request/devices publié → Z2M va republier bridge/devices")
 
     # Réconciliation Matter (get_nodes) — même logique que bridge/devices Zigbee,
