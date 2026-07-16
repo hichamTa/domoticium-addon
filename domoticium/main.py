@@ -772,8 +772,16 @@ def _configure_frigate_and_start() -> bool:
             warn(f"[frigate] UI :5000 → {ui.status_code} (Frigate tourne mais go2rtc :1984 inaccessible)")
         except Exception as e:
             warn(f"[frigate] UI :5000 inaccessible → Frigate ne démarre pas ({e})")
-        # Diagnostic : état Supervisor
+        # Diagnostic : état Supervisor + logs Frigate
         warn(f"[frigate] état Supervisor : {_frigate_state()}")
+        try:
+            lr = sup_get(f"/addons/{FRIGATE_SLUG}/logs")
+            if lr.ok:
+                lines = lr.text.strip().splitlines()
+                excerpt = "\n".join(lines[-40:])
+                warn(f"[frigate] Derniers logs Frigate:\n{excerpt}")
+        except Exception as e:
+            warn(f"[frigate] impossible de lire les logs Frigate : {e}")
     return ok
 
 
