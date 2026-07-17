@@ -1683,25 +1683,34 @@ def _check_and_fix_mqtt_broker():
         break
 
 
-def _sync_areas_batch(rooms: list, devices: list):
-    """Crée les areas manquantes et assigne les devices en une seule session WebSocket."""
-    if not rooms and not devices:
-        return
+def _sync_areas_batch(rooms: list, devices: list, all_devices: list) -> list:
+    """Sync bidirectionnel App ↔ HA pour les pièces/areas.
+
+    Push (App → HA) : crée les areas manquantes, assigne Zigbee ET Matter à leur area.
+    Pull (HA → App) : détecte les devices dont l'area HA diverge du room_id DB et
+                      retourne la liste de mises à jour à poster vers ingest/states.
+
+    Retourne : liste de {deviceId, roomId} à appliquer en DB.
+    """
+    if not rooms and not devices and not all_devices:
+        return []
 
     ws_send, ws_recv, ws_close = _ha_ws_connect()
     if not ws_send:
         warn("[sync] Session WebSocket indisponible — sync areas/devices ignorée")
-        return
+        return []
+
+    room_updates: list = []
 
     try:
-        mid = [0]  # compteur de message mutable dans la closure
+        mid = [0]
 
         def call(cmd_type, **params):
             mid[0] += 1
             ws_send({"id": mid[0], "type": cmd_type, **params})
             return ws_recv()
 
-        # 1. Lire les areas HA existantes (une seule fois)
+        # 1. Areas HA existantes
         res = call("config/area_registry/list")
         existing_areas: dict[str, str] = {}  # name → area_id
         if res and res.get("success"):
@@ -1709,14 +1718,13 @@ def _sync_areas_batch(rooms: list, devices: list):
                 existing_areas[a.get("name", "")] = a.get("area_id", "")
         log(f"[sync] Areas HA existantes : {list(existing_areas)}")
 
-        # 2. Lire le registre des DEVICES HA (plus fiable que entity_registry pour Z2M)
-        # Les devices Z2M ont des identifiers comme ["mqtt", "zigbee2mqtt_0x8c8b48..."]
-        # qui contiennent l'adresse IEEE — entity unique_id peut utiliser le friendly_name.
+        # 2. Device registry HA complet (Zigbee + Matter)
         res = call("config/device_registry/list")
-        did_by_entity: dict[str, str] = {}  # entity_id → device_id (non utilisé ici)
-        did_by_uid:    dict[str, str] = {}  # valeur identifier (contient ieee) → device_id
+        ha_devices_full: list = []
+        did_by_uid: dict[str, str] = {}  # identifier_value → ha_device_id
         if res and res.get("success"):
-            for dev in res.get("result", []):
+            ha_devices_full = res.get("result", [])
+            for dev in ha_devices_full:
                 did = dev.get("id")
                 if not did:
                     continue
@@ -1727,14 +1735,13 @@ def _sync_areas_batch(rooms: list, devices: list):
                     if isinstance(conn, (list, tuple)) and len(conn) >= 2:
                         did_by_uid[str(conn[1])] = did
         if not did_by_uid:
-            log("[sync] ⚠ Device registry HA vide — Z2M discovery pas encore reçue par HA"
-                " (sera réessayé au prochain cycle)")
+            log("[sync] ⚠ Device registry HA vide — sera réessayé au prochain cycle")
 
         # 3. Créer les areas manquantes
         for room in rooms:
             name = room["name"]
             if name in existing_areas:
-                continue  # déjà présente, rien à faire
+                continue
             res = call("config/area_registry/create", name=name)
             if res and res.get("success"):
                 existing_areas[name] = res.get("result", {}).get("area_id", "")
@@ -1746,41 +1753,92 @@ def _sync_areas_batch(rooms: list, devices: list):
                 else:
                     warn(f"[sync] Erreur création area '{name}' : {res}")
 
-        # 4. Assigner les devices à leurs areas
+        # ── Helper : résoudre le ha_device_id d'un device ──────────────────
+        def _resolve_ha_device(ieee: str, matter_node_id) -> str | None:
+            if ieee:
+                ieee_l = ieee.lower()
+                for id_val, did in did_by_uid.items():
+                    if ieee_l in id_val.lower():
+                        return did
+            if matter_node_id is not None:
+                hex_node = f"{int(matter_node_id):016x}"
+                for id_val, did in did_by_uid.items():
+                    if hex_node in id_val.lower():
+                        return did
+            return None
+
+        # 4. Push App → HA (Zigbee + Matter)
         for d in devices:
-            ieee      = (d.get("ieee_address") or "").strip()
-            entity_id = (d.get("ha_entity_id") or "").strip()
-            area_name = (d.get("area_name")    or "").strip()
-            area_id   = existing_areas.get(area_name) if area_name else None
+            ieee           = (d.get("ieee_address")   or "").strip()
+            matter_node_id = d.get("matter_node_id")
+            area_name      = (d.get("area_name")      or "").strip()
+            area_id        = existing_areas.get(area_name) if area_name else None
 
-            # Résoudre le device_id HA via les identifiers du device registry
-            # Les identifiers Z2M ont la forme "zigbee2mqtt_0x8c8b48..." → l'ieee est dedans
-            if not ieee:
-                continue  # entité système sans ieee_address (ex: backup_manager, core) — pas de sync HA
+            if not ieee and matter_node_id is None:
+                continue  # entité système sans identifiant — skip
 
-            device_id = None
-            ieee_lower = ieee.lower()
-            for id_val, did in did_by_uid.items():
-                if ieee_lower in id_val.lower():
-                    device_id = did
-                    break
-
+            device_id = _resolve_ha_device(ieee, matter_node_id)
             if not device_id:
-                sample = list(did_by_uid.keys())[:6]
-                warn(f"[sync] Device non trouvé dans HA (ieee={ieee})"
-                     f" — identifiers connus: {sample}"
-                     " — sera retentée au prochain cycle")
+                label = ieee or f"Matter#{matter_node_id}"
+                warn(f"[sync] Device non trouvé dans HA ({label}) — sera retentée au prochain cycle")
                 continue
-
             if not area_id:
-                warn(f"[sync] Area '{area_name}' inconnue pour le device {ieee or entity_id}")
+                warn(f"[sync] Area '{area_name}' inconnue pour {ieee or f'Matter#{matter_node_id}'}")
                 continue
 
             res = call("config/device_registry/update", device_id=device_id, area_id=area_id)
+            label = ieee or f"Matter#{matter_node_id}"
             if res and res.get("success"):
-                log(f"[sync] Device {ieee or entity_id} → area '{area_name}' ✓")
+                log(f"[sync] {label} → area '{area_name}' ✓")
             else:
-                warn(f"[sync] Erreur assignation {ieee or entity_id} → '{area_name}': {res}")
+                warn(f"[sync] Erreur assignation {label} → '{area_name}': {res}")
+
+        # 5. Pull HA → App : détecte les divergences area HA ↔ room_id DB
+        area_id_to_name  = {v: k for k, v in existing_areas.items()}
+        room_name_to_id  = {r["name"]: r["id"] for r in rooms}
+
+        # Index des devices DB par identifiant
+        db_by_ieee   = {(d.get("ieee_address") or "").lower(): d
+                        for d in all_devices if d.get("ieee_address")}
+        db_by_matter = {d["matter_node_id"]: d
+                        for d in all_devices if d.get("matter_node_id") is not None}
+
+        for ha_dev in ha_devices_full:
+            ha_area_id = ha_dev.get("area_id")
+            if not ha_area_id:
+                continue
+            expected_area = area_id_to_name.get(ha_area_id)
+            if not expected_area:
+                continue  # area HA non gérée par Domoticium
+            expected_room_id = room_name_to_id.get(expected_area)
+            if not expected_room_id:
+                continue
+
+            # Trouver le device DB correspondant
+            db_dev = None
+            for ident in ha_dev.get("identifiers", []):
+                if not (isinstance(ident, (list, tuple)) and len(ident) >= 2):
+                    continue
+                val = str(ident[1])
+                m = _IEEE_RE.search(val.lower())
+                if m:
+                    db_dev = db_by_ieee.get(m.group(0))
+                    break
+                # Matter : chercher node_id en hex dans l'identifier
+                for node_id, d in db_by_matter.items():
+                    if f"{int(node_id):016x}" in val.lower():
+                        db_dev = d
+                        break
+                if db_dev:
+                    break
+
+            if not db_dev:
+                continue
+
+            if db_dev.get("room_id") != expected_room_id:
+                label = ha_dev.get("name_by_user") or ha_dev.get("name") or ha_dev.get("id")
+                room_updates.append({"deviceId": db_dev["id"], "roomId": expected_room_id})
+                log(f"[sync] Pull pièce : '{label}' → '{expected_area}'")
 
     except Exception as e:
         warn(f"[sync] Erreur batch areas : {e}")
@@ -1789,6 +1847,8 @@ def _sync_areas_batch(rooms: list, devices: list):
             ws_close()
         except Exception:
             pass
+
+    return room_updates
 
 
 def _sync_all_to_ha():
@@ -1809,12 +1869,14 @@ def _sync_all_to_ha():
         warn(f"[sync] Impossible de récupérer sync-state: {e}")
         return
 
-    rooms   = state.get("rooms", [])
-    devices = state.get("device_assignments", [])
-    scenes  = state.get("scene_commands", [])
-    autos   = state.get("automation_commands", [])
+    rooms       = state.get("rooms", [])
+    devices     = state.get("device_assignments", [])
+    all_devices = state.get("all_devices", [])
+    scenes      = state.get("scene_commands", [])
+    autos       = state.get("automation_commands", [])
 
-    log(f"[sync] Début : {len(rooms)} pièces, {len(devices)} assignations, {len(scenes)} scènes, {len(autos)} automations")
+    log(f"[sync] Début : {len(rooms)} pièces, {len(devices)} assignations, "
+        f"{len(all_devices)} devices total, {len(scenes)} scènes, {len(autos)} automations")
 
     # Déclencher Z2M pour republier ses discovery messages HA → HA peuple son device registry.
     # Envoyé EN PREMIER pour laisser à Z2M le temps de répondre pendant qu'on sync scènes/autos.
@@ -1831,8 +1893,19 @@ def _sync_all_to_ha():
     for auto in autos:
         _handle_ha_command(json.dumps(auto).encode())
 
-    # Areas + device assignments en une seule session WebSocket
-    _sync_areas_batch(rooms, devices)
+    # Areas + device assignments en une seule session WebSocket (bidirectionnel)
+    room_updates = _sync_areas_batch(rooms, devices, all_devices)
+    if room_updates and INGEST_SECRET:
+        try:
+            requests.post(
+                f"{APP_URL}/api/ingest/states",
+                json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX,
+                      "roomAssignments": room_updates},
+                timeout=15,
+            )
+            log(f"[sync] {len(room_updates)} assignation(s) pièce corrigée(s) dans l'app")
+        except Exception as e:
+            warn(f"[sync] Erreur mise à jour pièces : {e}")
 
     # Demander à Z2M de republier bridge/devices → devices-sync webhook
     # → vendor/model/features/z2m_name mis à jour sans redémarrer Z2M
