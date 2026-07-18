@@ -1268,22 +1268,65 @@ def restart_frigate():
     threading.Thread(target=_do, daemon=True).start()
 
 
+def _go2rtc_upsert_stream(name: str, rtsp_url: str, timeout: float = 5.0) -> bool:
+    """Ajoute/remplace un flux go2rtc à chaud (API PUT /api/streams) — les autres
+    caméras (et sessions WebRTC/HLS actives) ne sont pas coupées, contrairement à un
+    restart complet de l'add-on Frigate."""
+    try:
+        r = requests.put(
+            "http://127.0.0.1:1984/api/streams",
+            params={"name": name, "src": rtsp_url},
+            timeout=timeout,
+        )
+        return r.ok
+    except Exception as e:
+        warn(f"[go2rtc] upsert stream '{name}' : {e}")
+        return False
+
+
+def _go2rtc_remove_stream(name: str, timeout: float = 5.0) -> bool:
+    """Retire un flux go2rtc à chaud (API DELETE /api/streams)."""
+    try:
+        r = requests.delete(
+            "http://127.0.0.1:1984/api/streams",
+            params={"src": name},
+            timeout=timeout,
+        )
+        return r.ok
+    except Exception as e:
+        warn(f"[go2rtc] remove stream '{name}' : {e}")
+        return False
+
+
 def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None):
-    """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP."""
+    """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
+    Met à jour go2rtc à chaud en priorité (aucune coupure des autres caméras) ; le
+    restart complet de Frigate (write_frigate_config + restart_frigate) ne sert que de
+    filet de secours si l'appel à chaud échoue, et assure la persistance après un
+    redémarrage HA (frigate.yml reste la source de vérité au boot)."""
     if action == "add":
         if not rtsp_url:
             raise ValueError("rtspUrl manquant")
         _cameras[stream_name] = rtsp_url
         _save_cameras()
+        write_frigate_config()
+        if _go2rtc_upsert_stream(stream_name, rtsp_url):
+            log(f"✓ Caméra add (à chaud, go2rtc) : '{stream_name}'")
+            return
+        warn(f"[go2rtc] upsert à chaud échoué pour '{stream_name}' — restart Frigate en secours")
     elif action == "remove":
         _cameras.pop(stream_name, None)
         _save_cameras()
+        write_frigate_config()
+        if _go2rtc_remove_stream(stream_name):
+            log(f"✓ Caméra remove (à chaud, go2rtc) : '{stream_name}'")
+            return
+        warn(f"[go2rtc] remove à chaud échoué pour '{stream_name}' — restart Frigate en secours")
     else:
         raise ValueError(f"action inconnue: {action!r}")
 
-    write_frigate_config()
     restart_frigate()
-    log(f"✓ Caméra {action}: '{stream_name}'")
+    log(f"✓ Caméra {action} (via restart complet) : '{stream_name}'")
 
 
 def _matter_ws_frames(s):
