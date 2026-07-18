@@ -1347,50 +1347,67 @@ def _probe_rtsp_url(rtsp_url: str, timeout: float = 6.0) -> bool:
     return ok
 
 
-_GENERIC_RTSP_SUFFIX_RE = re.compile(r':554/stream/?$')
-
-
-def _guess_working_rtsp_url(rtsp_url: str, timeout: float = 6.0) -> str | None:
-    """Si rtsp_url utilise le chemin générique de repli (fabricant non identifié au scan
-    ONVIF, cf. _rtsp_fallback) et échoue, retente avec le chemin Reolink connu
-    (/h264Preview_01_main) et les mêmes identifiants — corrige silencieusement le cas
-    déjà rencontré en pratique : les caméras Reolink ne répondent pas à
-    GetDeviceInformation sans authentification, donc le fabricant reste non détecté au
-    scan et le chemin générique (faux) est proposé/pré-rempli à l'utilisateur.
-    Une seule tentative séquentielle (pas de sondes en parallèle) : certaines caméras
-    d'entrée de gamme n'acceptent qu'UNE connexion RTSP à la fois — des tentatives
-    concurrentes se percutent (observé en test réel : erreur go2rtc trompeuse
-    "wrong response on DESCRIBE")."""
-    if not _GENERIC_RTSP_SUFFIX_RE.search(rtsp_url):
-        return None
-    m = re.match(r'^rtsp://([^:@]+):([^@]*)@([^:/]+):554/stream/?$', rtsp_url)
-    if not m:
-        return None
-    user, password, host = m.groups()
-    candidate = f"rtsp://{user}:{password}@{host}:554/h264Preview_01_main"
-    return candidate if _probe_rtsp_url(candidate, timeout=timeout) else None
-
-
-def _go2rtc_test_stream(rtsp_url: str, timeout: float = 8.0) -> tuple[bool, str, str | None]:
-    """Teste une URL RTSP via un flux go2rtc temporaire AVANT tout enregistrement
-    définitif — évite d'ajouter en base une caméra dont le mot de passe est faux ou
-    injoignable. Retourne (ok, message, corrected_url) — corrected_url est non-None si
-    l'URL fournie a échoué mais qu'un chemin alternatif connu a fonctionné avec les
-    mêmes identifiants (cf. _guess_working_rtsp_url) ; le caller doit alors enregistrer
-    corrected_url plutôt que l'URL d'origine."""
+def _go2rtc_test_stream(rtsp_url: str, timeout: float = 8.0) -> tuple[bool, str]:
+    """Teste une URL RTSP explicite (mode "URL manuelle" du formulaire) — aucune
+    tentative de correction : l'utilisateur a fourni l'URL exacte, on la respecte telle
+    quelle."""
     if _probe_rtsp_url(rtsp_url, timeout=timeout):
-        return True, "ok", None
+        return True, "ok"
+    reason = _recent_go2rtc_error_hint()
+    return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'URL"
 
-    corrected = _guess_working_rtsp_url(rtsp_url, timeout=6.0)
-    if corrected:
-        return True, "ok (chemin RTSP corrigé automatiquement)", corrected
+
+def _normalize_brand(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+# Ordre de test pour une marque "Inconnue" — marques grand public les plus courantes
+# d'abord, pour que le cas fréquent se résolve vite ; le budget temps total est borné
+# (cf. _test_camera_by_brand), donc les marques en fin de liste ne seront pas toujours
+# toutes essayées si aucune des premières ne répond.
+_BRAND_GUESS_ORDER = [
+    "tplink", "reolink", "dahua", "hikvision", "imou", "ezviz", "foscam",
+    "amcrest", "lorex", "swann", "annke", "uniview", "dlink", "hanwha",
+    "axis", "vivotek", "bosch", "pelco", "flir",
+]
+
+
+def _test_camera_by_brand(
+    ip: str, password: str, manufacturer: str, timeout: float = 8.0
+) -> tuple[bool, str, str | None]:
+    """Teste une caméra IP+mot de passe selon la marque choisie par l'utilisateur
+    (menu déroulant du formulaire d'ajout) — une seule tentative directe, la bonne URL
+    étant connue d'avance. Si aucune marque n'est choisie ("Inconnue"), teste tous les
+    chemins RTSP connus l'un après l'autre (jamais en parallèle : certaines caméras
+    d'entrée de gamme n'acceptent qu'UNE connexion RTSP à la fois — des tentatives
+    concurrentes se percutent, observé en test réel : erreur go2rtc trompeuse "wrong
+    response on DESCRIBE"), bornées à ~25s au total quel que soit le nombre de marques
+    dans la table, pour rester dans le budget de la requête HTTP appelante.
+    Retourne (ok, message, url_qui_fonctionne)."""
+    norm = _normalize_brand(manufacturer)
+    if norm and norm in _RTSP_TEMPLATES:
+        url = _RTSP_TEMPLATES[norm].format(ip=ip).replace("MOTDEPASSE", password)
+        if _probe_rtsp_url(url, timeout=timeout):
+            return True, "ok", url
+        reason = _recent_go2rtc_error_hint()
+        return False, reason or f"Impossible de se connecter avec le chemin {manufacturer}", None
+
+    candidates = [f"rtsp://admin:{password}@{ip}:554/stream"] + [
+        _RTSP_TEMPLATES[k].format(ip=ip).replace("MOTDEPASSE", password)
+        for k in _BRAND_GUESS_ORDER
+    ]
+    deadline = time.time() + 25.0
+    for url in candidates:
+        if time.time() > deadline:
+            break
+        if _probe_rtsp_url(url, timeout=3.0):
+            return True, "ok", url
 
     reason = _recent_go2rtc_error_hint()
-    # Ne pas mentionner "mot de passe" ici : le frontend matche ce mot pour décider de
-    # vider le champ mot de passe, seulement quand la cause EST confirmée (branche
-    # "Mot de passe incorrect" ci-dessus). Un message générique qui contiendrait la même
-    # phrase déclencherait ce comportement à tort pour n'importe quelle autre panne.
-    return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'adresse IP, le port et que la caméra est allumée", None
+    return False, reason or (
+        "Aucun chemin RTSP connu n'a fonctionné — vérifiez l'adresse IP et le mot de "
+        "passe, ou saisissez l'URL manuellement"
+    ), None
 
 
 def _ha_remove_camera_entities(stream_name: str):
@@ -3165,6 +3182,8 @@ _RTSP_TEMPLATES = {
     "hikvision": "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/101",
     "dahua":     "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=0",
     "amcrest":   "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=0",
+    "imou":      "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=0",  # marque Dahua, même SDK
+    "lorex":     "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=0",  # OEM Dahua
     "axis":      "rtsp://root:MOTDEPASSE@{ip}/axis-media/media.amp",
     "reolink":   "rtsp://admin:MOTDEPASSE@{ip}:554/h264Preview_01_main",
     "uniview":   "rtsp://admin:MOTDEPASSE@{ip}:554/media/video1",
@@ -3173,12 +3192,28 @@ _RTSP_TEMPLATES = {
     "bosch":     "rtsp://admin:MOTDEPASSE@{ip}:554/video?inst=1",
     "pelco":     "rtsp://admin:MOTDEPASSE@{ip}:554/stream1",
     "flir":      "rtsp://admin:MOTDEPASSE@{ip}:554/avc",
+    "tplink":    "rtsp://admin:MOTDEPASSE@{ip}:554/stream1",                # Tapo / VIGI
+    "foscam":    "rtsp://admin:MOTDEPASSE@{ip}:554/videoMain",
+    "ezviz":     "rtsp://admin:MOTDEPASSE@{ip}:554/h264/ch1/main/av_stream",
+    "dlink":     "rtsp://admin:MOTDEPASSE@{ip}:554/play1.sdp",
+    "swann":     "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/101",  # OEM Hikvision
+    "annke":     "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/101",  # OEM Hikvision
 }
 
 
 def _rtsp_fallback(manufacturer: str, ip: str) -> str:
-    key = manufacturer.lower().split()[0] if manufacturer else ""
-    tpl = _RTSP_TEMPLATES.get(key, "rtsp://admin:MOTDEPASSE@{ip}:554/stream")
+    """Cherche le chemin RTSP connu pour un fabricant ONVIF (ex: 'TP-Link Systems Inc.',
+    'Reolink' — le libellé exact varie selon la caméra). Normalise en supprimant tout ce
+    qui n'est pas alphanumérique pour matcher malgré espaces/tirets/casse."""
+    norm = _normalize_brand(manufacturer)
+    tpl = None
+    if norm:
+        for key, candidate in _RTSP_TEMPLATES.items():
+            if norm.startswith(key) or key in norm:
+                tpl = candidate
+                break
+    if not tpl:
+        tpl = "rtsp://admin:MOTDEPASSE@{ip}:554/stream"
     return tpl.format(ip=ip)
 
 
@@ -3520,10 +3555,18 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_camera_test_route(self, data):
         rtsp_url = data.get("rtspUrl")
-        if not rtsp_url:
-            return self._reject(400, "rtspUrl manquant")
-        ok, detail, corrected_url = _go2rtc_test_stream(rtsp_url)
-        self._ok({"ok": ok, "detail": detail, "correctedUrl": corrected_url})
+        if rtsp_url:
+            # Mode "URL manuelle" — l'utilisateur a fourni l'URL exacte, aucune devinette.
+            ok, detail = _go2rtc_test_stream(rtsp_url)
+            return self._ok({"ok": ok, "detail": detail, "correctedUrl": None})
+
+        ip = data.get("ip")
+        password = data.get("password")
+        if not ip or password is None:
+            return self._reject(400, "ip et password requis (ou rtspUrl)")
+        manufacturer = data.get("manufacturer") or ""
+        ok, detail, url = _test_camera_by_brand(ip, password, manufacturer)
+        self._ok({"ok": ok, "detail": detail, "correctedUrl": url})
 
     def _handle_sync_now(self, data):
         """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
