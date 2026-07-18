@@ -3264,9 +3264,40 @@ def _ws_discover(timeout: float = 5.0) -> list:
     return list(xaddrs)
 
 
-def _subnet_onvif_scan(onvif_ports: tuple = (8000, 80), connect_timeout: float = 0.35) -> list:
+def _subnet_onvif_scan_pass(base: str, onvif_ports: tuple, connect_timeout: float) -> list:
+    """Un seul passage de scan TCP parallèle sur base.1-254."""
+    found: list = []
+    lock = threading.Lock()
+
+    def _probe(octet: int):
+        ip = f'{base}.{octet}'
+        for port in onvif_ports:
+            try:
+                with socket.create_connection((ip, port), timeout=connect_timeout):
+                    with lock:
+                        found.append(f'http://{ip}:{port}/onvif/device_service')
+                    return
+            except OSError:
+                pass
+
+    threads = [threading.Thread(target=_probe, args=(i,), daemon=True) for i in range(1, 255)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=connect_timeout + 0.5)
+    return found
+
+
+def _subnet_onvif_scan(onvif_ports: tuple = (8000, 80), connect_timeout: float = 0.5) -> list:
     """Fallback : scan TCP parallèle du /24 local sur les ports ONVIF courants.
-    Utilisé quand WS-Discovery ne retourne rien (Reolink derrière switch, IGMP absent…)."""
+    Utilisé quand WS-Discovery ne retourne rien (Reolink derrière switch, IGMP absent…).
+    Deux passages si le premier ne trouve rien : le tout premier scan peut échouer sur
+    des IP dont l'entrée ARP est froide (le connect() attend la résolution ARP en plus
+    du délai réseau, dépassant parfois connect_timeout) — observé en pratique : le
+    scan échouait au 1er clic sur l'app et réussissait au 2e. Le premier passage
+    réchauffe le cache ARP pour toutes les IP actives du réseau, donc un second passage
+    immédiat est quasi instantané et beaucoup plus fiable, sans que l'utilisateur ait à
+    recliquer manuellement."""
     my_ip = ''
     try:
         out = subprocess.check_output(
@@ -3287,25 +3318,10 @@ def _subnet_onvif_scan(onvif_ports: tuple = (8000, 80), connect_timeout: float =
 
     base = '.'.join(my_ip.split('.')[:3])
     log(f'[onvif-scan] Fallback subnet scan {base}.1-254 sur ports {onvif_ports}')
-    found: list = []
-    lock = threading.Lock()
-
-    def _probe(octet: int):
-        ip = f'{base}.{octet}'
-        for port in onvif_ports:
-            try:
-                with socket.create_connection((ip, port), timeout=connect_timeout):
-                    with lock:
-                        found.append(f'http://{ip}:{port}/onvif/device_service')
-                    return
-            except OSError:
-                pass
-
-    threads = [threading.Thread(target=_probe, args=(i,), daemon=True) for i in range(1, 255)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=connect_timeout + 0.5)
+    found = _subnet_onvif_scan_pass(base, onvif_ports, connect_timeout)
+    if not found:
+        log('[onvif-scan] 1er passage vide — nouveau passage (cache ARP réchauffé)')
+        found = _subnet_onvif_scan_pass(base, onvif_ports, connect_timeout)
     return found
 
 
