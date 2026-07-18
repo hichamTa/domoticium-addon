@@ -3053,6 +3053,27 @@ def _ensure_matter_ble_proxy():
         warn(f"[matter] _ensure_matter_ble_proxy: {e}")
 
 
+def _resync_go2rtc_streams():
+    """Repousse chaque caméra suivie (_cameras) vers go2rtc via l'API à chaud (PUT
+    /api/streams, idempotent). Nécessaire après TOUT (re)démarrage de Frigate : le
+    prepare script de Frigate ne recopie /homeassistant/frigate.yml vers sa config
+    privée QUE si celle-ci est absente (1er démarrage seulement) — jamais ensuite,
+    y compris sur un simple restart de l'add-on. go2rtc (embarqué dans Frigate) repart
+    donc avec le registre de flux de cette config privée, potentiellement périmée
+    (vide, ou obsolète) — alors que notre suivi interne (_cameras/cameras.json) dit
+    toujours "la caméra existe". La réconciliation périodique (_reconcile_cameras) ne
+    détecte jamais cet écart puisqu'elle ne compare qu'à notre propre bookkeeping, pas
+    à l'état réel de go2rtc — d'où une caméra qui reste invisible/hors-service après
+    un redémarrage, sans que rien ne se corrige tout seul, jusqu'à ce fix."""
+    if not _cameras:
+        return
+    for name, rtsp_url in _cameras.items():
+        if _go2rtc_upsert_stream(name, rtsp_url):
+            log(f"[frigate] ✓ Flux go2rtc resynchronisé : '{name}'")
+        else:
+            warn(f"[frigate] Échec resynchronisation go2rtc : '{name}'")
+
+
 def _ensure_frigate():
     """Installe et démarre Frigate + go2rtc s'ils sont absents ou arrêtés.
     Appelé en thread de fond au démarrage du bridge — permet de lancer Frigate
@@ -3078,6 +3099,7 @@ def _ensure_frigate():
             else:
                 log("[frigate] ✓ Frigate et go2rtc opérationnels")
                 threading.Thread(target=_setup_frigate_auth_once, daemon=True).start()
+            _resync_go2rtc_streams()
             return  # succès
         except Exception as e:
             warn(f"[frigate] _ensure_frigate tentative {attempt}/5 : {e}")
