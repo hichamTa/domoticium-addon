@@ -3052,6 +3052,7 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
         ip_m = re.search(r'https?://([^:/]+)', xaddr)
         ip = ip_m.group(1) if ip_m else ''
         manufacturer = model = rtsp_url = ''
+        onvif_confirmed = False  # True si au moins un appel ONVIF a répondu
 
         try:
             xml = _onvif_soap(
@@ -3061,6 +3062,8 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
             )
             manufacturer = _xml_text(xml, 'Manufacturer')
             model        = _xml_text(xml, 'Model')
+            if manufacturer or model:
+                onvif_confirmed = True
         except Exception as e:
             warn(f'[onvif-scan] GetDeviceInformation {ip}: {e}')
 
@@ -3082,6 +3085,8 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
                     if xa.startswith('http'):
                         media_url = xa
                         break
+            if media_url:
+                onvif_confirmed = True
         except Exception as e:
             warn(f'[onvif-scan] GetCapabilities {ip}: {e}')
 
@@ -3110,6 +3115,11 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
             except Exception as e:
                 warn(f'[onvif-scan] GetStreamUri {ip}: {e}')
 
+        # Ignorer les appareils non-ONVIF (routeur, NAS, etc. avec port 80/8000 ouvert)
+        if not onvif_confirmed:
+            warn(f'[onvif-scan] {ip} : port ouvert mais pas de réponse ONVIF — ignoré')
+            continue
+
         if not rtsp_url:
             rtsp_url = _rtsp_fallback(manufacturer, ip)
 
@@ -3120,6 +3130,7 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
             'name':         (f'{manufacturer} {model}'.strip()) or f'Caméra {ip}',
             'rtspUrl':      rtsp_url,
         })
+    log(f'[onvif-scan] {len(results)} caméra(s) ONVIF confirmée(s) sur {len(xaddrs)} IP(s) scannée(s)')
     return results
 
 
