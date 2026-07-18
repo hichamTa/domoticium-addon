@@ -2412,13 +2412,35 @@ _cam_watch_dirty: set[str] = set()        # streamNames dont le statut a changé
 _cam_watch_lock = threading.Lock()
 
 
+def _go2rtc_active_consumers() -> dict[str, bool]:
+    """Liste (via /api/streams, une seule requête légère, aucune nouvelle connexion
+    ouverte) les flux ayant au moins un consommateur actif (quelqu'un regarde le direct
+    en ce moment — HLS/WebRTC). Retourne {stream_name: bool}."""
+    try:
+        r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
+        if not r.ok:
+            return {}
+        return {name: bool((info or {}).get("consumers")) for name, info in r.json().items()}
+    except Exception:
+        return {}
+
+
 def _probe_cameras_go2rtc() -> dict[str, bool]:
     """Sonde chaque caméra enregistrée en forçant une connexion RTSP à chaud, en
     parallèle (cf. _go2rtc_probe_online). Une simple lecture de /api/streams ne suffit
-    pas : go2rtc ne garde une connexion ouverte que s'il y a un consommateur actif
-    (WebRTC/HLS en cours de visionnage), donc son champ producer 'state' est absent la
-    quasi-totalité du temps même quand la caméra est parfaitement joignable."""
+    pas en général : go2rtc ne garde une connexion ouverte que s'il y a un consommateur
+    actif (WebRTC/HLS en cours de visionnage), donc son champ producer 'state' est
+    absent la quasi-totalité du temps même quand la caméra est parfaitement joignable.
+    EXCEPTION : si un consommateur est déjà actif (quelqu'un regarde le direct), on
+    saute la sonde active pour cette caméra — elle est forcément déjà joignable
+    (un flux en cours de lecture le prouve), et une sonde en parallèle risquerait
+    d'ouvrir une 2e connexion RTSP concurrente vers la caméra. Certaines caméras
+    d'entrée de gamme n'acceptent qu'UNE connexion à la fois : la sonde entrait alors
+    en collision avec la session de visionnage en cours et la coupait (observé en
+    réel : erreur go2rtc "wrong response on DESCRIBE" pile au moment du visionnage,
+    répétée à chaque cycle watchdog de 60s)."""
     names = list(_cameras)
+    active_consumers = _go2rtc_active_consumers()
     result: dict[str, bool] = {}
     lock = threading.Lock()
 
@@ -2427,7 +2449,14 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
         with lock:
             result[name] = online
 
-    threads = [threading.Thread(target=_probe, args=(n,), daemon=True) for n in names]
+    to_probe = []
+    for name in names:
+        if active_consumers.get(name):
+            result[name] = True
+        else:
+            to_probe.append(name)
+
+    threads = [threading.Thread(target=_probe, args=(n,), daemon=True) for n in to_probe]
     for t in threads:
         t.start()
     for t in threads:
