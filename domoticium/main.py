@@ -1417,6 +1417,39 @@ def _ha_remove_camera_entities(stream_name: str):
             pass
 
 
+def _reconcile_cameras(app_cameras: list):
+    """Réconciliation bidirectionnelle caméras — même principe que bridge/devices pour
+    Zigbee/Matter. handle_camera_configure() est normalement appelé en direct par la
+    route /camera/configure, mais si le Pi était hors-ligne au moment de l'action côté
+    app (add/remove/mot de passe changé), l'appel direct est perdu : ce cycle de sync
+    (toutes les ~5 min) rattrape la divergence en comparant l'état encore en DB avec
+    l'état local (_cameras)."""
+    app_by_name = {
+        c["streamName"]: c.get("rtspUrl")
+        for c in app_cameras
+        if c.get("streamName") and c.get("rtspUrl")
+    }
+
+    # Caméras manquantes localement ou dont l'URL a changé (mot de passe mis à jour
+    # pendant que le Pi était injoignable) → (ré)ajout.
+    for name, rtsp_url in app_by_name.items():
+        if _cameras.get(name) != rtsp_url:
+            log(f"[sync/cameras] '{name}' manquante ou désynchronisée localement — ajout")
+            try:
+                handle_camera_configure("add", name, rtsp_url)
+            except Exception as e:
+                warn(f"[sync/cameras] add '{name}': {e}")
+
+    # Caméras encore locales mais supprimées côté app (delete manqué par l'addon).
+    for name in list(_cameras):
+        if name not in app_by_name:
+            log(f"[sync/cameras] '{name}' supprimée côté app mais encore locale — nettoyage")
+            try:
+                handle_camera_configure("remove", name)
+            except Exception as e:
+                warn(f"[sync/cameras] remove '{name}': {e}")
+
+
 def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None):
     """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
     Met à jour go2rtc à chaud en priorité (aucune coupure des autres caméras) ; le
@@ -2037,6 +2070,7 @@ def _sync_all_to_ha():
     all_devices = state.get("all_devices", [])
     scenes      = state.get("scene_commands", [])
     autos       = state.get("automation_commands", [])
+    app_cameras = state.get("cameras", [])
 
     log(f"[sync] Début : {len(rooms)} pièces, {len(devices)} assignations, "
         f"{len(all_devices)} devices total, {len(scenes)} scènes, {len(autos)} automations")
@@ -2081,6 +2115,11 @@ def _sync_all_to_ha():
     # Réconciliation Matter (get_nodes) — même logique que bridge/devices Zigbee,
     # auto-réparatrice si l'enregistrement post-commissioning a échoué ou a été manqué.
     _sync_matter_devices_to_app()
+
+    # Réconciliation caméras — rattrape un ajout/suppression manqué par l'addon si le Pi
+    # était hors-ligne au moment de l'action côté app (sinon une caméra supprimée dans
+    # l'app pendant une coupure réseau resterait fantôme sur le Pi indéfiniment).
+    _reconcile_cameras(app_cameras)
 
     _backfill_ha_entity_links()
     _backfill_camera_entity_links()
