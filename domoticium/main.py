@@ -3577,7 +3577,7 @@ def _dict_to_yaml(d, indent=0):
 
 if __name__ == "__main__":
     log("══════════════════════════════════════════════")
-    log("  DÉMARRAGE DOMOTICIUM v2.3.17")
+    log("  DÉMARRAGE DOMOTICIUM")
     log("══════════════════════════════════════════════")
 
     # Écrire la config Frigate AVANT tout le reste.
