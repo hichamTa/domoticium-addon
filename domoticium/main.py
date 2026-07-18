@@ -2933,51 +2933,95 @@ def _rtsp_fallback(manufacturer: str, ip: str) -> str:
 
 
 def _ws_discover(timeout: float = 5.0) -> list:
-    """WS-Discovery UDP multicast 239.255.255.250:3702 → liste d'XAddrs ONVIF."""
-    msg_id = str(uuid.uuid4())
-    probe = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
-        ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
-        ' xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01"'
-        ' xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
-        '<s:Header>'
-        '<a:Action>http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01/Probe</a:Action>'
-        f'<a:MessageID>uuid:{msg_id}</a:MessageID>'
-        '<a:To>urn:docs-oasis-open-org:ws-dd:ns:discovery:2009:01</a:To>'
-        '</s:Header>'
-        '<s:Body><d:Probe>'
-        '<d:Types>dn:NetworkVideoTransmitter</d:Types>'
-        '</d:Probe></s:Body>'
-        '</s:Envelope>'
-    ).encode('utf-8')
-
+    """WS-Discovery UDP multicast — deux probes (avec et sans filtre Types) pour compat Reolink."""
     xaddrs: set = set()
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        sock.settimeout(timeout)
-        sock.sendto(probe, (_WS_DISCOVER_ADDR, _WS_DISCOVER_PORT))
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                data, _ = sock.recvfrom(65535)
-                text = data.decode('utf-8', errors='ignore')
-                for addr in _xml_text(text, 'XAddrs').split():
-                    if addr.startswith('http'):
-                        xaddrs.add(addr)
-            except socket.timeout:
-                break
-    except Exception as e:
-        warn(f'[onvif-scan] ws-discover: {e}')
-    finally:
-        if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
+    # Reolink répond mieux au probe sans filtre Types ; on essaie les deux
+    for types_filter in ('<d:Types>dn:NetworkVideoTransmitter</d:Types>', ''):
+        msg_id = str(uuid.uuid4())
+        probe = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+            ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+            ' xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01"'
+            ' xmlns:dn="http://www.onvif.org/ver10/network/wsdl">'
+            '<s:Header>'
+            '<a:Action>http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01/Probe</a:Action>'
+            f'<a:MessageID>uuid:{msg_id}</a:MessageID>'
+            '<a:To>urn:docs-oasis-open-org:ws-dd:ns:discovery:2009:01</a:To>'
+            '</s:Header>'
+            f'<s:Body><d:Probe>{types_filter}</d:Probe></s:Body>'
+            '</s:Envelope>'
+        ).encode('utf-8')
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.settimeout(min(timeout, 3.0))
+            sock.sendto(probe, (_WS_DISCOVER_ADDR, _WS_DISCOVER_PORT))
+            deadline = time.time() + min(timeout, 3.0)
+            while time.time() < deadline:
+                try:
+                    data, _ = sock.recvfrom(65535)
+                    text = data.decode('utf-8', errors='ignore')
+                    for addr in _xml_text(text, 'XAddrs').split():
+                        if addr.startswith('http'):
+                            xaddrs.add(addr)
+                except socket.timeout:
+                    break
+        except Exception as e:
+            warn(f'[onvif-scan] ws-discover: {e}')
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
     return list(xaddrs)
+
+
+def _subnet_onvif_scan(onvif_ports: tuple = (8000, 80), connect_timeout: float = 0.35) -> list:
+    """Fallback : scan TCP parallèle du /24 local sur les ports ONVIF courants.
+    Utilisé quand WS-Discovery ne retourne rien (Reolink derrière switch, IGMP absent…)."""
+    my_ip = ''
+    try:
+        out = subprocess.check_output(
+            ['ip', 'route', 'get', '1.1.1.1'], text=True, timeout=2
+        )
+        m = re.search(r'src\s+(\d+\.\d+\.\d+\.\d+)', out)
+        my_ip = m.group(1) if m else ''
+    except Exception:
+        pass
+    if not my_ip:
+        try:
+            my_ip = socket.gethostbyname(socket.getfqdn())
+        except Exception:
+            pass
+    if not my_ip or my_ip.startswith('127.'):
+        warn('[onvif-scan] subnet-scan: impossible de déterminer l\'IP locale')
+        return []
+
+    base = '.'.join(my_ip.split('.')[:3])
+    log(f'[onvif-scan] Fallback subnet scan {base}.1-254 sur ports {onvif_ports}')
+    found: list = []
+    lock = threading.Lock()
+
+    def _probe(octet: int):
+        ip = f'{base}.{octet}'
+        for port in onvif_ports:
+            try:
+                with socket.create_connection((ip, port), timeout=connect_timeout):
+                    with lock:
+                        found.append(f'http://{ip}:{port}/onvif/device_service')
+                    return
+            except OSError:
+                pass
+
+    threads = [threading.Thread(target=_probe, args=(i,), daemon=True) for i in range(1, 255)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=connect_timeout + 0.5)
+    return found
 
 
 def _onvif_soap(url: str, body: str, timeout: float = 4.0) -> str:
@@ -2996,9 +3040,12 @@ def _onvif_soap(url: str, body: str, timeout: float = 4.0) -> str:
     return r.text
 
 
-def _scan_onvif_cameras(timeout: float = 7.0) -> list:
+def _scan_onvif_cameras(timeout: float = 12.0) -> list:
     """Retourne la liste des caméras ONVIF détectées sur le LAN avec leur URL RTSP."""
-    xaddrs = _ws_discover(timeout=timeout - 2.0)
+    xaddrs = _ws_discover(timeout=5.0)
+    if not xaddrs:
+        log('[onvif-scan] WS-Discovery: 0 résultat — fallback scan subnet direct')
+        xaddrs = _subnet_onvif_scan()
     log(f'[onvif-scan] {len(xaddrs)} caméra(s) ONVIF détectée(s)')
     results = []
     for xaddr in xaddrs:
