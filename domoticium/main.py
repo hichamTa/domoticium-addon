@@ -1351,6 +1351,72 @@ def _go2rtc_test_stream(rtsp_url: str, timeout: float = 8.0) -> tuple[bool, str]
     return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'adresse IP et le mot de passe"
 
 
+def _ha_remove_camera_entities(stream_name: str):
+    """Supprime dans HA toutes les entités liées à une caméra Frigate (camera.* et ses
+    siblings : micro, IR, PTZ, détection mouvement…) lors du retrait d'une caméra côté
+    app. Frigate slugifie le nom de la caméra déclaré dans frigate.yml pour construire
+    l'unique_id/entity_id de son entité camera.* — on matche par nom normalisé (le
+    stream_name inclut un suffixe timestamp, donc quasi-unique, pas de faux positif
+    attendu). Best-effort : ne bloque jamais la suppression du flux vidéo lui-même si
+    HA est injoignable ou si rien n'est trouvé (device jamais rattaché, HA down…)."""
+    result = _ha_ws_call("config/entity_registry/list")
+    if not result or not result.get("success"):
+        return
+    entities = result.get("result", [])
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    target = _norm(stream_name)
+    if not target:
+        return
+
+    device_id = None
+    for e in entities:
+        if not e.get("entity_id", "").startswith("camera."):
+            continue
+        uid = _norm(e.get("unique_id", ""))
+        eid = _norm(e.get("entity_id", ""))
+        if target in uid or target in eid or (uid and uid in target):
+            device_id = e.get("device_id")
+            break
+
+    if not device_id:
+        log(f"[ha-cleanup] Aucune entité HA trouvée pour '{stream_name}' — rien à nettoyer")
+        return
+
+    ws_send, ws_recv, ws_close = _ha_ws_connect()
+    if not ws_send:
+        warn(f"[ha-cleanup] Session WS indisponible — nettoyage HA de '{stream_name}' ignoré")
+        return
+    try:
+        mid = [0]
+
+        def call(cmd_type, **params):
+            mid[0] += 1
+            ws_send({"id": mid[0], "type": cmd_type, **params})
+            return ws_recv()
+
+        removed = 0
+        for e in entities:
+            if e.get("device_id") != device_id:
+                continue
+            eid = e.get("entity_id")
+            res = call("config/entity_registry/remove", entity_id=eid)
+            if res and res.get("success"):
+                removed += 1
+            else:
+                warn(f"[ha-cleanup] Suppression entité HA '{eid}' échouée : {res}")
+        log(f"[ha-cleanup] {removed} entité(s) HA supprimée(s) pour '{stream_name}'")
+    except Exception as e:
+        warn(f"[ha-cleanup] {e}")
+    finally:
+        try:
+            ws_close()
+        except Exception:
+            pass
+
+
 def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None):
     """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
     Met à jour go2rtc à chaud en priorité (aucune coupure des autres caméras) ; le
@@ -1371,6 +1437,7 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
         _cameras.pop(stream_name, None)
         _save_cameras()
         write_frigate_config()
+        threading.Thread(target=_ha_remove_camera_entities, args=(stream_name,), daemon=True).start()
         if _go2rtc_remove_stream(stream_name):
             log(f"✓ Caméra remove (à chaud, go2rtc) : '{stream_name}'")
             return
