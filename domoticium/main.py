@@ -1349,7 +1349,11 @@ def _go2rtc_test_stream(rtsp_url: str, timeout: float = 8.0) -> tuple[bool, str]
         return True, "ok"
     reason = _recent_go2rtc_error_hint()
     _go2rtc_remove_stream(test_name)
-    return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'adresse IP et le mot de passe"
+    # Ne pas mentionner "mot de passe" ici : le frontend matche ce mot pour décider de
+    # vider le champ mot de passe, seulement quand la cause EST confirmée (branche
+    # "Mot de passe incorrect" ci-dessus). Un message générique qui contiendrait la même
+    # phrase déclencherait ce comportement à tort pour n'importe quelle autre panne.
+    return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'adresse IP, le port et que la caméra est allumée"
 
 
 def _ha_remove_camera_entities(stream_name: str):
