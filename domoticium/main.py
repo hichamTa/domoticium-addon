@@ -1336,24 +1336,61 @@ def _recent_go2rtc_error_hint() -> str:
     return ""
 
 
-def _go2rtc_test_stream(rtsp_url: str, timeout: float = 8.0) -> tuple[bool, str]:
-    """Teste une URL RTSP via un flux go2rtc temporaire AVANT tout enregistrement
-    définitif — évite d'ajouter en base une caméra dont le mot de passe est faux ou
-    injoignable. Retourne (ok, message)."""
+def _probe_rtsp_url(rtsp_url: str, timeout: float = 6.0) -> bool:
+    """Teste une URL RTSP via un flux go2rtc temporaire (pull d'une image JPEG),
+    nettoyé après coup."""
     test_name = f"_test_{secrets.token_hex(6)}"
     ok = False
     if _go2rtc_upsert_stream(test_name, rtsp_url, timeout=5.0):
         ok = _go2rtc_probe_online(test_name, timeout=timeout)
-    if ok:
-        _go2rtc_remove_stream(test_name)
-        return True, "ok"
-    reason = _recent_go2rtc_error_hint()
     _go2rtc_remove_stream(test_name)
+    return ok
+
+
+_GENERIC_RTSP_SUFFIX_RE = re.compile(r':554/stream/?$')
+
+
+def _guess_working_rtsp_url(rtsp_url: str, timeout: float = 6.0) -> str | None:
+    """Si rtsp_url utilise le chemin générique de repli (fabricant non identifié au scan
+    ONVIF, cf. _rtsp_fallback) et échoue, retente avec le chemin Reolink connu
+    (/h264Preview_01_main) et les mêmes identifiants — corrige silencieusement le cas
+    déjà rencontré en pratique : les caméras Reolink ne répondent pas à
+    GetDeviceInformation sans authentification, donc le fabricant reste non détecté au
+    scan et le chemin générique (faux) est proposé/pré-rempli à l'utilisateur.
+    Une seule tentative séquentielle (pas de sondes en parallèle) : certaines caméras
+    d'entrée de gamme n'acceptent qu'UNE connexion RTSP à la fois — des tentatives
+    concurrentes se percutent (observé en test réel : erreur go2rtc trompeuse
+    "wrong response on DESCRIBE")."""
+    if not _GENERIC_RTSP_SUFFIX_RE.search(rtsp_url):
+        return None
+    m = re.match(r'^rtsp://([^:@]+):([^@]*)@([^:/]+):554/stream/?$', rtsp_url)
+    if not m:
+        return None
+    user, password, host = m.groups()
+    candidate = f"rtsp://{user}:{password}@{host}:554/h264Preview_01_main"
+    return candidate if _probe_rtsp_url(candidate, timeout=timeout) else None
+
+
+def _go2rtc_test_stream(rtsp_url: str, timeout: float = 8.0) -> tuple[bool, str, str | None]:
+    """Teste une URL RTSP via un flux go2rtc temporaire AVANT tout enregistrement
+    définitif — évite d'ajouter en base une caméra dont le mot de passe est faux ou
+    injoignable. Retourne (ok, message, corrected_url) — corrected_url est non-None si
+    l'URL fournie a échoué mais qu'un chemin alternatif connu a fonctionné avec les
+    mêmes identifiants (cf. _guess_working_rtsp_url) ; le caller doit alors enregistrer
+    corrected_url plutôt que l'URL d'origine."""
+    if _probe_rtsp_url(rtsp_url, timeout=timeout):
+        return True, "ok", None
+
+    corrected = _guess_working_rtsp_url(rtsp_url, timeout=6.0)
+    if corrected:
+        return True, "ok (chemin RTSP corrigé automatiquement)", corrected
+
+    reason = _recent_go2rtc_error_hint()
     # Ne pas mentionner "mot de passe" ici : le frontend matche ce mot pour décider de
     # vider le champ mot de passe, seulement quand la cause EST confirmée (branche
     # "Mot de passe incorrect" ci-dessus). Un message générique qui contiendrait la même
     # phrase déclencherait ce comportement à tort pour n'importe quelle autre panne.
-    return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'adresse IP, le port et que la caméra est allumée"
+    return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'adresse IP, le port et que la caméra est allumée", None
 
 
 def _ha_remove_camera_entities(stream_name: str):
@@ -3485,8 +3522,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         rtsp_url = data.get("rtspUrl")
         if not rtsp_url:
             return self._reject(400, "rtspUrl manquant")
-        ok, detail = _go2rtc_test_stream(rtsp_url)
-        self._ok({"ok": ok, "detail": detail})
+        ok, detail, corrected_url = _go2rtc_test_stream(rtsp_url)
+        self._ok({"ok": ok, "detail": detail, "correctedUrl": corrected_url})
 
     def _handle_sync_now(self, data):
         """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
