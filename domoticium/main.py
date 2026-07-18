@@ -72,6 +72,11 @@ else:
 
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
 
+# Identifiants ICE WebRTC (STUN + TURN Cloudflare Realtime) injectés dans go2rtc via
+# frigate.yml — rafraîchis périodiquement par _turn_refresh_loop() (cf. plus bas).
+_TURN_REFRESH_INTERVAL = 24 * 3600  # 24h — identifiants Cloudflare valables 48h max
+_turn_ice_servers: list[dict] = []
+
 # Client MQTT local (Mosquitto, Z2M ↔ HA) — plus de client cloud, EMQX est retiré.
 _local_client: mqtt.Client | None = None
 
@@ -868,6 +873,55 @@ def install_frigate():
 _FRIGATE_AUTH_MARKER = "/data/.frigate_auth_disabled"
 
 
+def _has_turn(servers: list[dict]) -> bool:
+    """True si la liste contient un vrai serveur TURN (pas seulement le repli STUN)."""
+    return any(s.get("credential") for s in servers)
+
+
+def _fetch_turn_ice_servers() -> list[dict]:
+    """Récupère des identifiants TURN Cloudflare Realtime de courte durée via le
+    backend (secret Cloudflare — TURN_KEY_API_TOKEN — jamais exposé à l'addon, cf.
+    /api/ingest/webrtc-credentials). Repli STUN seul si indisponible : n'impacte que
+    les clients derrière un NAT symétrique/CGNAT, les autres continuent en P2P direct."""
+    fallback = [{"urls": ["stun:stun.cloudflare.com:3478"]}]
+    if not INGEST_SECRET:
+        return fallback
+    try:
+        r = requests.post(
+            f"{APP_URL}/api/ingest/webrtc-credentials",
+            json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX},
+            timeout=15,
+        )
+        if not r.ok:
+            warn(f"[webrtc] identifiants TURN : {r.status_code} {r.text[:200]}")
+            return fallback
+        ice = r.json().get("iceServers")
+        if not ice or not ice.get("urls"):
+            return fallback
+        return fallback + [ice]
+    except Exception as e:
+        warn(f"[webrtc] identifiants TURN : {e}")
+        return fallback
+
+
+def _webrtc_config_yaml_lines() -> list[str]:
+    """Section go2rtc.webrtc.ice_servers — go2rtc ne charge ice_servers qu'au
+    démarrage (pas de rechargement à chaud), d'où le restart Frigate après chaque
+    rafraîchissement périodique des identifiants TURN (cf. _turn_refresh_loop)."""
+    lines = ["  webrtc:", "    ice_servers:"]
+    for server in (_turn_ice_servers or [{"urls": ["stun:stun.cloudflare.com:3478"]}]):
+        urls = server.get("urls", [])
+        if isinstance(urls, str):
+            urls = [urls]
+        urls_str = ", ".join(f'"{u}"' for u in urls)
+        lines.append(f"      - urls: [{urls_str}]")
+        if server.get("username"):
+            lines.append(f"        username: \"{server['username']}\"")
+        if server.get("credential"):
+            lines.append(f"        credential: \"{server['credential']}\"")
+    return lines
+
+
 def _generate_frigate_yaml() -> str:
     """Génère le YAML complet de config Frigate depuis le registre des caméras."""
     lines = [
@@ -885,6 +939,7 @@ def _generate_frigate_yaml() -> str:
         lines.append("  streams:")
         for name, rtsp_url in _cameras.items():
             lines += [f"    {name}:", f"      - {rtsp_url}"]
+        lines += _webrtc_config_yaml_lines()
         lines.append("")
         lines.append("cameras:")
         for name, rtsp_url in _cameras.items():
@@ -3678,10 +3733,29 @@ def run_command_server():
         warn(f"[cmd-server] Erreur fatale : {e}")
 
 
+def _turn_refresh_loop():
+    """Rafraîchit les identifiants TURN Cloudflare avant leur expiration (48h max) et
+    redémarre Frigate pour que go2rtc les recharge. Nouvel essai dans 5 min si le
+    dernier fetch n'a renvoyé que le repli STUN (échec réseau probable), sinon
+    attend _TURN_REFRESH_INTERVAL (24h) avant le prochain rafraîchissement."""
+    global _turn_ice_servers
+    while True:
+        time.sleep(_TURN_REFRESH_INTERVAL if _has_turn(_turn_ice_servers) else 300)
+        servers = _fetch_turn_ice_servers()
+        if servers != _turn_ice_servers:
+            _turn_ice_servers = servers
+            log("[webrtc] Identifiants TURN mis à jour — rafraîchissement config Frigate")
+            write_frigate_config()
+            restart_frigate()
+
+
 def run_bridge():
     _load_cameras()
+    global _turn_ice_servers
+    _turn_ice_servers = _fetch_turn_ice_servers()  # synchrone — requis avant la 1ère écriture frigate.yml
     start_cloudflared()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
+    threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
