@@ -1298,6 +1298,59 @@ def _go2rtc_remove_stream(name: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def _go2rtc_probe_online(name: str, timeout: float = 6.0) -> bool:
+    """Force une connexion RTSP à chaud (pull d'une image JPEG) pour vérifier qu'un flux
+    déjà enregistré est réellement accessible. go2rtc ne maintient aucune connexion
+    permanente sans consommateur actif (WebRTC/HLS en cours de visionnage) — lire
+    /api/streams seul ne reflète donc PAS l'état réel de la caméra la plupart du temps
+    (le champ producer 'state' n'apparaît que pendant une connexion active)."""
+    try:
+        r = requests.get(
+            "http://127.0.0.1:1984/api/frame.jpeg",
+            params={"src": name},
+            timeout=timeout,
+        )
+        return r.ok and r.headers.get("Content-Type", "").startswith("image")
+    except Exception:
+        return False
+
+
+def _recent_go2rtc_error_hint() -> str:
+    """Best-effort : cherche la dernière erreur go2rtc pertinente dans les logs Frigate
+    (go2rtc y écrit ses erreurs de connexion RTSP, ex: 'wrong user/pass') pour donner un
+    message plus précis que 'caméra injoignable' — notamment distinguer un mauvais mot
+    de passe d'un problème réseau, seul cas où on redemande explicitement la saisie."""
+    try:
+        r = sup_get(f"/addons/{FRIGATE_SLUG}/logs")
+        if not r.ok:
+            return ""
+        for line in reversed(r.text.strip().splitlines()[-60:]):
+            low = line.lower()
+            if "wrong user/pass" in low or "unauthorized" in low or " 401" in line:
+                return "Mot de passe incorrect — veuillez le ressaisir"
+            if "connection refused" in low or "no route to host" in low:
+                return "Caméra injoignable — vérifiez l'adresse IP et que la caméra est allumée"
+    except Exception:
+        pass
+    return ""
+
+
+def _go2rtc_test_stream(rtsp_url: str, timeout: float = 8.0) -> tuple[bool, str]:
+    """Teste une URL RTSP via un flux go2rtc temporaire AVANT tout enregistrement
+    définitif — évite d'ajouter en base une caméra dont le mot de passe est faux ou
+    injoignable. Retourne (ok, message)."""
+    test_name = f"_test_{secrets.token_hex(6)}"
+    ok = False
+    if _go2rtc_upsert_stream(test_name, rtsp_url, timeout=5.0):
+        ok = _go2rtc_probe_online(test_name, timeout=timeout)
+    if ok:
+        _go2rtc_remove_stream(test_name)
+        return True, "ok"
+    reason = _recent_go2rtc_error_hint()
+    _go2rtc_remove_stream(test_name)
+    return False, reason or "Impossible de se connecter au flux vidéo — vérifiez l'adresse IP et le mot de passe"
+
+
 def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None):
     """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
     Met à jour go2rtc à chaud en priorité (aucune coupure des autres caméras) ; le
@@ -2194,21 +2247,26 @@ _cam_watch_lock = threading.Lock()
 
 
 def _probe_cameras_go2rtc() -> dict[str, bool]:
-    """Interroge go2rtc API pour connaître l'état de chaque flux en une requête."""
-    try:
-        r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
-        if not r.ok:
-            return {}
-        result = {}
-        for name, info in r.json().items():
-            producers = (info or {}).get("producers") or []
-            result[name] = any(
-                isinstance(p, dict) and p.get("state") == "online"
-                for p in producers
-            )
-        return result
-    except Exception:
-        return {}
+    """Sonde chaque caméra enregistrée en forçant une connexion RTSP à chaud, en
+    parallèle (cf. _go2rtc_probe_online). Une simple lecture de /api/streams ne suffit
+    pas : go2rtc ne garde une connexion ouverte que s'il y a un consommateur actif
+    (WebRTC/HLS en cours de visionnage), donc son champ producer 'state' est absent la
+    quasi-totalité du temps même quand la caméra est parfaitement joignable."""
+    names = list(_cameras)
+    result: dict[str, bool] = {}
+    lock = threading.Lock()
+
+    def _probe(name: str):
+        online = _go2rtc_probe_online(name)
+        with lock:
+            result[name] = online
+
+    threads = [threading.Thread(target=_probe, args=(n,), daemon=True) for n in names]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=8.0)
+    return result
 
 
 def _run_camera_watchdog():
@@ -3220,6 +3278,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/zigbee/set-attribute": self._handle_set_attribute,
                 "/ha-command":           self._handle_ha_command_route,
                 "/camera/configure":     self._handle_camera_configure_route,
+                "/camera/test":          self._handle_camera_test_route,
                 "/sync-now":             self._handle_sync_now,
             }
             handler = handlers.get(route)
@@ -3306,6 +3365,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             return self._reject(400, "streamName manquant")
         handle_camera_configure(action, stream_name, data.get("rtspUrl"))
         self._ok()
+
+    def _handle_camera_test_route(self, data):
+        rtsp_url = data.get("rtspUrl")
+        if not rtsp_url:
+            return self._reject(400, "rtspUrl manquant")
+        ok, detail = _go2rtc_test_stream(rtsp_url)
+        self._ok({"ok": ok, "detail": detail})
 
     def _handle_sync_now(self, data):
         """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
