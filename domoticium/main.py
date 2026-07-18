@@ -1257,15 +1257,16 @@ def start_cloudflared():
         warn(f"cloudflared: {e}")
 
 
-def restart_frigate():
-    """Redémarre Frigate en arrière-plan pour recharger frigate.yml."""
-    def _do():
-        time.sleep(1)
-        r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
-        mark = "✓" if r.ok else f"✗ {r.status_code}"
-        log(f"{mark} Frigate redémarré")
-
-    threading.Thread(target=_do, daemon=True).start()
+def restart_frigate() -> bool:
+    """Redémarre Frigate — bloquant sur la commande Supervisor (acceptée en quelques
+    secondes). Le réponse HTTP appelante ne doit dire 'ok' que si cette commande a
+    réellement été acceptée, pas avant qu'un thread de fond ait fini par l'envoyer.
+    N'attend PAS la disponibilité complète du service (jusqu'à 3 min, cf.
+    _wait_frigate_ready) — seulement que Supervisor a accepté la demande de restart."""
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/restart")
+    mark = "✓" if r.ok else f"✗ {r.status_code}"
+    log(f"{mark} Frigate redémarré (commande Supervisor)")
+    return r.ok
 
 
 def _go2rtc_upsert_stream(name: str, rtsp_url: str, timeout: float = 5.0) -> bool:
@@ -1450,12 +1451,12 @@ def _reconcile_cameras(app_cameras: list):
                 warn(f"[sync/cameras] remove '{name}': {e}")
 
 
-def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None):
+def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None) -> bool:
     """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
-    Met à jour go2rtc à chaud en priorité (aucune coupure des autres caméras) ; le
-    restart complet de Frigate (write_frigate_config + restart_frigate) ne sert que de
-    filet de secours si l'appel à chaud échoue, et assure la persistance après un
-    redémarrage HA (frigate.yml reste la source de vérité au boot)."""
+    Entièrement bloquant, de bout en bout — la réponse HTTP appelante ne doit dire 'ok'
+    que si le travail a réellement été fait (go2rtc à chaud OU restart complet, +
+    nettoyage HA à la suppression), jamais avant qu'une tâche de fond ait fini. Retourne
+    True si l'opération a effectivement abouti."""
     if action == "add":
         if not rtsp_url:
             raise ValueError("rtspUrl manquant")
@@ -1464,22 +1465,23 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
         write_frigate_config()
         if _go2rtc_upsert_stream(stream_name, rtsp_url):
             log(f"✓ Caméra add (à chaud, go2rtc) : '{stream_name}'")
-            return
+            return True
         warn(f"[go2rtc] upsert à chaud échoué pour '{stream_name}' — restart Frigate en secours")
     elif action == "remove":
         _cameras.pop(stream_name, None)
         _save_cameras()
         write_frigate_config()
-        threading.Thread(target=_ha_remove_camera_entities, args=(stream_name,), daemon=True).start()
+        _ha_remove_camera_entities(stream_name)  # bloquant — cf. docstring
         if _go2rtc_remove_stream(stream_name):
             log(f"✓ Caméra remove (à chaud, go2rtc) : '{stream_name}'")
-            return
+            return True
         warn(f"[go2rtc] remove à chaud échoué pour '{stream_name}' — restart Frigate en secours")
     else:
         raise ValueError(f"action inconnue: {action!r}")
 
-    restart_frigate()
-    log(f"✓ Caméra {action} (via restart complet) : '{stream_name}'")
+    ok = restart_frigate()
+    log(f"{'✓' if ok else '⚠'} Caméra {action} (via restart complet) : '{stream_name}'")
+    return ok
 
 
 def _matter_ws_frames(s):
@@ -3469,8 +3471,11 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         stream_name = data.get("streamName")
         if not stream_name:
             return self._reject(400, "streamName manquant")
-        handle_camera_configure(action, stream_name, data.get("rtspUrl"))
-        self._ok()
+        ok = handle_camera_configure(action, stream_name, data.get("rtspUrl"))
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, "Échec de configuration Frigate/go2rtc — voir les logs de l'add-on")
 
     def _handle_camera_test_route(self, data):
         rtsp_url = data.get("rtspUrl")
