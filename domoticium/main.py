@@ -2361,8 +2361,10 @@ def _ha_sync_loop():
             _sync_all_to_ha()
         except Exception as e:
             warn(f"[sync] Erreur inattendue : {e}")
-        # Attend 5 min OU un déclenchement immédiat (reconnexion EMQX, etc.)
-        _sync_requested.wait(timeout=60)
+        # Attend 5 min OU un déclenchement immédiat (reconnexion EMQX, etc.) — le
+        # timeout était resté à 60s (bug, 5x plus d'appels que prévu à /sync-state,
+        # constaté en creusant le dépassement de quota Vercel du 2026-07-18).
+        _sync_requested.wait(timeout=300)
         _sync_requested.clear()
 
 
@@ -2644,12 +2646,14 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
 
 
 def _heartbeat_loop():
-    """Envoie un heartbeat toutes les 30 secondes via webhook API — met à jour
-    sites.last_heartbeat_at, relayé au navigateur par Supabase Realtime."""
+    """Envoie un heartbeat toutes les 60 secondes via webhook API — met à jour
+    sites.last_heartbeat_at, relayé au navigateur par Supabase Realtime.
+    Était à 30s (réduit après dépassement de quota Vercel Hobby le 2026-07-18) —
+    cf. seuils "online" côté web (2 min de marge, largement suffisant à 60s)."""
     time.sleep(10)
     while True:
         call_heartbeat_api()
-        time.sleep(30)
+        time.sleep(60)
 
 
 def on_local_connect(client, userdata, flags, reason_code, properties):
