@@ -878,14 +878,17 @@ def _has_turn(servers: list[dict]) -> bool:
     return any(s.get("credential") for s in servers)
 
 
-def _fetch_turn_ice_servers() -> list[dict]:
+def _fetch_turn_ice_servers() -> list[dict] | None:
     """Récupère des identifiants TURN Cloudflare Realtime de courte durée via le
     backend (secret Cloudflare — TURN_KEY_API_TOKEN — jamais exposé à l'addon, cf.
-    /api/ingest/webrtc-credentials). Repli STUN seul si indisponible : n'impacte que
-    les clients derrière un NAT symétrique/CGNAT, les autres continuent en P2P direct."""
-    fallback = [{"urls": ["stun:stun.cloudflare.com:3478"]}]
+    /api/ingest/webrtc-credentials). Retourne None en cas d'échec (réseau, quota
+    Vercel, etc.) — à distinguer d'un repli STUN volontaire : _turn_refresh_loop()
+    ne doit PAS redémarrer Frigate sur un échec transitoire de ce fetch (bug corrigé
+    le 2026-07-19 : un simple hoquet réseau faisait passer _turn_ice_servers d'un
+    vrai TURN à un repli STUN, détecté comme un "changement" → redémarrage Frigate
+    inutile → coupure caméra réelle → fausse alerte "hors ligne" envoyée au client)."""
     if not INGEST_SECRET:
-        return fallback
+        return None
     try:
         r = requests.post(
             f"{APP_URL}/api/ingest/webrtc-credentials",
@@ -894,14 +897,14 @@ def _fetch_turn_ice_servers() -> list[dict]:
         )
         if not r.ok:
             warn(f"[webrtc] identifiants TURN : {r.status_code} {r.text[:200]}")
-            return fallback
+            return None
         ice = r.json().get("iceServers")
         if not ice or not ice.get("urls"):
-            return fallback
-        return fallback + [ice]
+            return [{"urls": ["stun:stun.cloudflare.com:3478"]}]
+        return [{"urls": ["stun:stun.cloudflare.com:3478"]}, ice]
     except Exception as e:
         warn(f"[webrtc] identifiants TURN : {e}")
-        return fallback
+        return None
 
 
 def _webrtc_config_yaml_lines() -> list[str]:
@@ -3740,12 +3743,21 @@ def run_command_server():
 def _turn_refresh_loop():
     """Rafraîchit les identifiants TURN Cloudflare avant leur expiration (48h max) et
     redémarre Frigate pour que go2rtc les recharge. Nouvel essai dans 5 min si le
-    dernier fetch n'a renvoyé que le repli STUN (échec réseau probable), sinon
-    attend _TURN_REFRESH_INTERVAL (24h) avant le prochain rafraîchissement."""
+    dernier fetch a échoué (repli STUN encore actif), sinon attend
+    _TURN_REFRESH_INTERVAL (24h) avant le prochain rafraîchissement.
+    Un échec de fetch (None) ne touche JAMAIS _turn_ice_servers ni ne redémarre
+    Frigate — les identifiants en place restent valides jusqu'à expiration réelle.
+    Sans cette garde, un simple hoquet réseau/quota Vercel faisait passer un vrai
+    TURN à un repli STUN, vu comme un "changement" → restart Frigate inutile →
+    coupure caméra réelle → fausse alerte "hors ligne" envoyée au client (bug
+    identifié le 2026-07-19 après 2 fausses alertes en une nuit)."""
     global _turn_ice_servers
     while True:
         time.sleep(_TURN_REFRESH_INTERVAL if _has_turn(_turn_ice_servers) else 300)
         servers = _fetch_turn_ice_servers()
+        if servers is None:
+            warn("[webrtc] échec du rafraîchissement TURN — identifiants actuels conservés")
+            continue
         if servers != _turn_ice_servers:
             _turn_ice_servers = servers
             log("[webrtc] Identifiants TURN mis à jour — rafraîchissement config Frigate")
@@ -3756,7 +3768,9 @@ def _turn_refresh_loop():
 def run_bridge():
     _load_cameras()
     global _turn_ice_servers
-    _turn_ice_servers = _fetch_turn_ice_servers()  # synchrone — requis avant la 1ère écriture frigate.yml
+    # synchrone — requis avant la 1ère écriture frigate.yml ; repli STUN local si le
+    # 1er fetch échoue (pas de restart en jeu ici, juste la valeur initiale)
+    _turn_ice_servers = _fetch_turn_ice_servers() or [{"urls": ["stun:stun.cloudflare.com:3478"]}]
     start_cloudflared()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
