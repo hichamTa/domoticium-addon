@@ -1134,15 +1134,11 @@ def create_automations():
 
     # domoticium_state_stream et domoticium_command_handler (MQTT/EMQX) retirées —
     # remplacées par run_ha_ws_bridge() (état) et le serveur de commandes HTTP (commandes).
+    # domoticium_heartbeat retirée (2026-07-19) — dupliquait _heartbeat_loop() (Python,
+    # 60s) en appelant le même endpoint toutes les 30s indépendamment, doublant le
+    # trafic heartbeat pour rien. Cf. _remove_legacy_heartbeat_automation_once() pour
+    # le nettoyage des installations où elle est déjà enregistrée dans HA.
     automations = [
-        {
-            "id": "domoticium_heartbeat",
-            "alias": "Domoticium — Heartbeat",
-            "description": "Notifie l'API toutes les 30 secondes",
-            "mode": "single",
-            "trigger": [{"platform": "time_pattern", "seconds": "/30"}],
-            "action": [{"service": "rest_command.domoticium_heartbeat"}],
-        },
         {
             "id": "domoticium_camera_status",
             "alias": "Domoticium — Camera Status Reporter",
@@ -1171,6 +1167,31 @@ def create_automations():
         log(f"{mark} {auto['alias']}")
 
     ha_post("/services/automation/reload")
+
+
+_LEGACY_HEARTBEAT_AUTO_MARKER = "/data/.legacy_heartbeat_automation_removed"
+
+
+def _remove_legacy_heartbeat_automation_once():
+    """Supprime l'automation HA 'domoticium_heartbeat' sur les installations où elle
+    a déjà été enregistrée (avant le 2026-07-19) — dupliquait le heartbeat Python
+    toutes les 30s. Idempotent via marker, tourne à chaque démarrage de l'addon
+    (pas seulement au setup initial, contrairement à create_automations())."""
+    if os.path.exists(_LEGACY_HEARTBEAT_AUTO_MARKER):
+        return
+    try:
+        r = requests.delete(f"{API}/config/automation/config/domoticium_heartbeat",
+                            headers=HDRS, timeout=15)
+        if r.status_code in (200, 404):
+            ha_post("/services/automation/reload")
+            log("✓ Automation HA 'domoticium_heartbeat' (dupliquée, 30s) supprimée")
+        else:
+            warn(f"Suppression automation heartbeat legacy : HTTP {r.status_code}")
+            return  # retente au prochain démarrage
+    except Exception as e:
+        warn(f"Suppression automation heartbeat legacy : {e}")
+        return  # retente au prochain démarrage
+    open(_LEGACY_HEARTBEAT_AUTO_MARKER, "w").close()
 
 
 def remove_legacy_mqtt_discovery_prefix():
@@ -3772,6 +3793,7 @@ def run_bridge():
     # 1er fetch échoue (pas de restart en jeu ici, juste la valeur initiale)
     _turn_ice_servers = _fetch_turn_ice_servers() or [{"urls": ["stun:stun.cloudflare.com:3478"]}]
     start_cloudflared()
+    threading.Thread(target=_remove_legacy_heartbeat_automation_once, daemon=True).start()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
