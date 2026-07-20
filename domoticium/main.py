@@ -2907,8 +2907,12 @@ def _get_ha_areas():
     return []
 
 
-def _get_ha_device_id(entity_id=None, ieee_address=None):
-    """Retourne le device_id HA depuis entity_id ou ieee_address Z2M (WebSocket)."""
+def _get_ha_device_id(entity_id=None, ieee_address=None, matter_node_id=None):
+    """Retourne le device_id HA depuis entity_id, ieee_address (Zigbee) ou
+    matter_node_id (WebSocket) — matter_node_id est le repli nécessaire pour un
+    device Matter dont l'entité principale n'est pas encore liée (ha_entity_id
+    NULL), symétrique au repli ieee_address déjà utilisé côté Zigbee (observé en
+    réel : set_device_area échouait silencieusement pour ces devices)."""
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         warn(f"[ha/command] entity registry inaccessible: {result}")
@@ -2920,6 +2924,13 @@ def _get_ha_device_id(entity_id=None, ieee_address=None):
             return e["device_id"]
     if ieee_address:
         e = next((x for x in entities if ieee_address in (x.get("unique_id") or "")), None)
+        if e and e.get("device_id"):
+            return e["device_id"]
+    if matter_node_id is not None:
+        e = next(
+            (x for x in entities if _matter_node_id_from_unique_id(x.get("unique_id")) == matter_node_id),
+            None,
+        )
         if e and e.get("device_id"):
             return e["device_id"]
     return None
@@ -3033,13 +3044,17 @@ def _handle_ha_command(payload: bytes):
             warn(f"[ha/command] Erreur suppression area '{name}' : {result}")
 
     elif cmd_type == "set_device_area":
-        entity_id    = data.get("entity_id")    or None
-        ieee_address = data.get("ieee_address") or None
-        area_name    = data.get("area_name")    or None
+        entity_id      = data.get("entity_id")      or None
+        ieee_address   = data.get("ieee_address")   or None
+        matter_node_id = data.get("matter_node_id")
+        area_name      = data.get("area_name")      or None
 
-        device_id = _get_ha_device_id(entity_id=entity_id, ieee_address=ieee_address)
+        device_id = _get_ha_device_id(
+            entity_id=entity_id, ieee_address=ieee_address, matter_node_id=matter_node_id
+        )
         if not device_id:
-            warn(f"[ha/command] set_device_area: device non trouvé (entity={entity_id}, ieee={ieee_address})")
+            warn(f"[ha/command] set_device_area: device non trouvé "
+                 f"(entity={entity_id}, ieee={ieee_address}, matter_node_id={matter_node_id})")
             return
 
         area_id = None
