@@ -2252,13 +2252,22 @@ def _sync_all_to_ha():
     if room_updates and INGEST_SECRET:
         _report_room_assignments_direct(room_updates)
 
-    # Demander à Z2M de republier bridge/devices → devices-sync webhook
-    # → vendor/model/features/z2m_name mis à jour sans redémarrer Z2M
+    # Forcer la redélivrance du retained zigbee2mqtt/bridge/devices → vendor/model/
+    # features/z2m_name mis à jour sans redémarrer Z2M. Z2M n'expose AUCUN topic de
+    # requête pour republier sa liste de devices à la demande (contrairement à
+    # bridge/request/permit_join, bridge/request/restart, etc. — vérifié dans la doc
+    # officielle Z2M le 2026-07-20 : bridge/devices n'est republié qu'au démarrage de
+    # Z2M ou à un vrai événement device join/leave/rename). Se désabonner puis se
+    # réabonner au topic exact force le broker MQTT (Mosquitto) à redélivrer
+    # immédiatement le dernier message retained, qui déclenche on_local_message()
+    # exactement comme un vrai événement Z2M — sans dépendre d'un mécanisme de
+    # requête qui n'existe pas côté Z2M.
     # Throttlé à 1x/5min (inutile à chaque cycle 60s).
     if _local_client and (time.time() - _last_z2m_devices_request > 300):
-        _local_client.publish("zigbee2mqtt/bridge/request/devices", "", qos=1)
+        _local_client.unsubscribe("zigbee2mqtt/bridge/devices")
+        _local_client.subscribe([("zigbee2mqtt/bridge/devices", 1)])
         _last_z2m_devices_request = time.time()
-        log("[sync] bridge/request/devices publié → Z2M va republier bridge/devices")
+        log("[sync] Re-souscription bridge/devices → retained message redélivré (sync Zigbee)")
 
     # Réconciliation Matter (get_nodes) — même logique que bridge/devices Zigbee,
     # auto-réparatrice si l'enregistrement post-commissioning a échoué ou a été manqué.
