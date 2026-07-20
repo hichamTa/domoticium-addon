@@ -942,10 +942,20 @@ def _fetch_turn_ice_servers() -> list[dict] | None:
 
 
 def _webrtc_config_yaml_lines() -> list[str]:
-    """Section go2rtc.webrtc.ice_servers — go2rtc ne charge ice_servers qu'au
-    démarrage (pas de rechargement à chaud), d'où le restart Frigate après chaque
-    rafraîchissement périodique des identifiants TURN (cf. _turn_refresh_loop)."""
-    lines = ["  webrtc:", "    ice_servers:"]
+    """Section go2rtc.webrtc — go2rtc ne charge ice_servers qu'au démarrage (pas de
+    rechargement à chaud), d'où le restart Frigate après chaque rafraîchissement
+    périodique des identifiants TURN (cf. _turn_refresh_loop).
+    filters.networks: [udp4, tcp4] — contourne un bug connu de go2rtc 1.9.10 (notre
+    version, corrigé en 1.9.14) où le listener WebRTC tente de se lier à une adresse
+    IPv6 locale (fe80::...%eth0) instable côté hôte et échoue avec "cannot assign
+    requested address", empêchant le module WebRTC de s'initialiser DU TOUT (silence
+    total sur toute offre — observé en réel le 2026-07-20, cf. HANDOFF)."""
+    lines = [
+        "  webrtc:",
+        "    filters:",
+        "      networks: [udp4, tcp4]",
+        "    ice_servers:",
+    ]
     for server in (_turn_ice_servers or [{"urls": ["stun:stun.cloudflare.com:3478"]}]):
         urls = server.get("urls", [])
         if isinstance(urls, str):
