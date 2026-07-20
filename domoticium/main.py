@@ -2250,16 +2250,7 @@ def _sync_all_to_ha():
     # Areas + device assignments en une seule session WebSocket (bidirectionnel)
     room_updates = _sync_areas_batch(rooms, devices, all_devices)
     if room_updates and INGEST_SECRET:
-        try:
-            requests.post(
-                f"{APP_URL}/api/ingest/states",
-                json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX,
-                      "roomAssignments": room_updates},
-                timeout=15,
-            )
-            log(f"[sync] {len(room_updates)} assignation(s) pièce corrigée(s) dans l'app")
-        except Exception as e:
-            warn(f"[sync] Erreur mise à jour pièces : {e}")
+        _report_room_assignments_direct(room_updates)
 
     # Demander à Z2M de republier bridge/devices → devices-sync webhook
     # → vendor/model/features/z2m_name mis à jour sans redémarrer Z2M
@@ -3065,9 +3056,30 @@ def _sync_devices_to_app(devices_list):
     _sync_zigbee_devices_direct(devices_list)
 
 
+def _report_room_assignments_direct(room_updates) -> bool:
+    """pi_report_room_assignments via Supabase direct — corrige côté app un device dont
+    la pièce a été changée directement dans HA (pas dans l'app). True si réussi."""
+    try:
+        ts = int(time.time())
+        key = ",".join(sorted(f"{u['deviceId']}:{u['roomId']}" for u in room_updates))
+        message = f"{SITE_PREFIX}:{ts}:room_assignments:{key}"
+        r = _supabase_rpc("pi_report_room_assignments", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_assignments": [{"deviceId": u["deviceId"], "roomId": u["roomId"]} for u in room_updates],
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_room_assignments {r.status_code}: {r.text[:200]}")
+            return False
+        log(f"[supabase] pi_report_room_assignments — {len(room_updates)} assignation(s)")
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_room_assignments: {e}")
+        return False
+
+
 def on_local_message(client, userdata, msg):
     """Messages reçus depuis Mosquitto local (Z2M). Plus de relay cloud —
-    l'état passe uniquement par run_ha_ws_bridge() → /api/ingest/states."""
+    l'état passe uniquement par run_ha_ws_bridge() → Supabase direct (pi_report_device_state)."""
     global _z2m_online
     topic   = msg.topic
     payload = msg.payload
