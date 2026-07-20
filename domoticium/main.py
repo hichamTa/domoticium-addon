@@ -952,6 +952,7 @@ def _webrtc_config_yaml_lines() -> list[str]:
     total sur toute offre — observé en réel le 2026-07-20, cf. HANDOFF)."""
     lines = [
         "  webrtc:",
+        '    listen: ":8555"',
         "    filters:",
         "      networks: [udp4, tcp4]",
         "    ice_servers:",
