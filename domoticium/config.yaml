@@ -7,7 +7,7 @@ description: >
   service pont permanent (état → Supabase, commandes → HA locale).
   Supporte les coordinateurs USB et réseau PoE (SLZB-MR4U, SLZB-06…).
   À lancer une seule fois après la création du compte admin HA.
-version: "2.4.3"
+version: "2.5.0"
 slug: "domoticium"
 init: false
 arch:
@@ -37,6 +37,7 @@ options:
   cloudflare_tunnel_token: ""
   force_setup: false
   ingest_secret: ""
+  use_direct_supabase: false
 schema:
   site_prefix: str
   pi_username: str
@@ -52,3 +53,4 @@ schema:
   cloudflare_tunnel_token: str
   force_setup: bool
   ingest_secret: str
+  use_direct_supabase: bool

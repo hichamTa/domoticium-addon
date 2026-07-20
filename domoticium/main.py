@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, http.server, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, uuid
+import base64, hashlib, hmac, http.server, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, uuid
 import paho.mqtt.client as mqtt
 import requests
 
@@ -34,6 +34,18 @@ APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
 FORCE_SETUP             = cfg.get("force_setup", False)
 INGEST_SECRET           = cfg.get("ingest_secret", "")
+USE_DIRECT_SUPABASE     = cfg.get("use_direct_supabase", False)
+
+# Appels directs Pi → Supabase (remplace des appels Vercel fréquents — heartbeat,
+# sync Zigbee/Matter, états devices, statut caméra — cf. HANDOFF §36). URL et clé
+# publique "anon" : pas des secrets, mêmes valeurs pour tous les sites, embarquées
+# ici comme APP_URL plutôt qu'en option addon. L'authentification par site passe
+# par une signature HMAC calculée avec INGEST_SECRET (cf. _pi_sign/_supabase_rpc),
+# jamais par cette clé anon seule.
+SUPABASE_URL        = "https://oomiihobburvajrypeqc.supabase.co"
+SUPABASE_ANON_KEY   = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6"
+                       "Im9vbWlpaG9iYnVydmFqcnlwZXFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIwODA3"
+                       "MDMsImV4cCI6MjA5NzY1NjcwM30.tlNndai0Nw_cyoLDuemP7gsna_r8WW2f0O0VhmHuMg0")
 
 # Serveur de commandes local (127.0.0.1 uniquement, exposé via le tunnel Cloudflare
 # existant sous un hostname dédié ha-{slug}.domoticium.fr). Remplace EMQX entièrement :
@@ -50,6 +62,28 @@ HDRS = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "applicat
 
 SETUP_DONE   = "/data/.setup_done"
 CAMERAS_FILE = "/data/cameras.json"
+
+
+def _pi_sign(message: str) -> str:
+    """Signature HMAC-SHA256 d'un message avec INGEST_SECRET — authentifie les
+    appels directs vers les fonctions Postgres pi_* (cf. HANDOFF §36). Le secret
+    n'est jamais transmis lui-même, seulement cette signature."""
+    return hmac.new(INGEST_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+
+def _supabase_rpc(fn_name: str, payload: dict, timeout: float = 10.0) -> requests.Response:
+    """Appelle une fonction Postgres pi_* via PostgREST (clé publique anon — la vraie
+    autorisation vient de la signature HMAC incluse dans payload, vérifiée côté DB)."""
+    return requests.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/{fn_name}",
+        json=payload,
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+        },
+        timeout=timeout,
+    )
 
 Z2M_REPO       = "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt"
 Z2M_SLUG       = "45df7312_zigbee2mqtt"
@@ -1781,10 +1815,37 @@ def _extract_matter_device_info(node: dict):
     return node_id, vendor, product, device_type
 
 
+def _sync_matter_devices_direct(devices_payload) -> bool:
+    """pi_sync_matter_devices via Supabase direct — True si réussi."""
+    try:
+        rpc_devices = [{
+            "node_id": d["node_id"], "name": d["name"],
+            "type": d["device_type"], "vendor": d.get("vendor_name") or "",
+            "model": d.get("product_name") or "",
+        } for d in devices_payload]
+
+        ts = int(time.time())
+        id_sorted = ",".join(sorted(str(d["node_id"]) for d in rpc_devices))
+        message = f"{SITE_PREFIX}:{ts}:matter_sync:{id_sorted}"
+        r = _supabase_rpc("pi_sync_matter_devices", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_devices": rpc_devices,
+        }, timeout=30)
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_sync_matter_devices {r.status_code}: {r.text[:200]}")
+            return False
+        log(f"[supabase] pi_sync_matter_devices — {len(rpc_devices)} devices, réponse: {r.text[:120]}")
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_sync_matter_devices: {e}")
+        return False
+
+
 def _sync_matter_devices_to_app():
     """Réconciliation périodique Matter → Supabase (analogue à bridge/devices Zigbee).
     Envoie la liste COMPLÈTE des nodes commissionnés — le webhook réconcilie (upsert +
-    suppression des devices absents), pas juste un ajout ponctuel."""
+    suppression des devices absents), pas juste un ajout ponctuel. Direct Supabase si
+    activé (repli sur l'ancien chemin Vercel en cas d'échec)."""
     nodes = _matter_get_nodes()
     if nodes is None:
         return
@@ -1800,6 +1861,9 @@ def _sync_matter_devices_to_app():
             "product_name": product,
             "device_type": device_type,
         })
+
+    if USE_DIRECT_SUPABASE and _sync_matter_devices_direct(devices_payload):
+        return
     try:
         auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
         r = requests.post(
@@ -2392,8 +2456,33 @@ def _ha_sync_loop():
         _sync_requested.clear()
 
 
+def _heartbeat_direct() -> bool:
+    """Heartbeat via pi_report_heartbeat (Supabase direct) — True si réussi."""
+    try:
+        ts = int(time.time())
+        z2m_part = "null" if _z2m_online is None else str(_z2m_online).lower()
+        message = f"{SITE_PREFIX}:{ts}:heartbeat:{z2m_part}"
+        payload: dict = {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+        }
+        if _z2m_online is not None:
+            payload["p_z2m_online"] = _z2m_online
+        r = _supabase_rpc("pi_report_heartbeat", payload)
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_heartbeat {r.status_code}: {r.text[:120]}")
+            return False
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_heartbeat: {e}")
+        return False
+
+
 def call_heartbeat_api():
-    """Envoie le heartbeat (+ état Z2M courant) au webhook API."""
+    """Envoie le heartbeat (+ état Z2M courant). Direct Supabase si activé (repli
+    automatique sur l'ancien chemin Vercel en cas d'échec — cf. HANDOFF §36)."""
+    if USE_DIRECT_SUPABASE and _heartbeat_direct():
+        return
+
     creds = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
     payload: dict = {"siteId": SITE_PREFIX}
     if _z2m_online is not None:
@@ -2480,6 +2569,78 @@ def run_ha_ws_bridge():
         time.sleep(15)
 
 
+# ── Normalisation état HA → format Device Domoticium ─────────────────────────
+# Port Python de web/src/lib/ha/normalize.ts (haEntityToNormalizedPatch) — utilisé
+# uniquement par le chemin direct Supabase (cf. HANDOFF §36) : la fonction Postgres
+# pi_report_device_state() reçoit un patch déjà normalisé plutôt que de dupliquer
+# cette table de correspondance une 3e fois en SQL. À garder synchronisé avec le
+# fichier TS d'origine si la logique de normalisation évolue.
+def _ha_state_to_normalized(entity_id: str, state: str) -> dict:
+    domain = entity_id.split(".")[0]
+    if domain in ("light", "switch", "input_boolean"):
+        return {"on": state == "on"}
+    if domain == "binary_sensor":
+        return {"on": state == "on"}
+    if domain == "cover":
+        return {"on": state not in ("closed", "unavailable")}
+    if domain == "sensor":
+        try:
+            return {"value": float(state)}
+        except ValueError:
+            return {}
+    if domain == "climate":
+        return {"on": state != "off"}
+    return {"on": state == "on"}
+
+
+def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> dict:
+    domain = entity_id.split(".")[0]
+    result: dict = {}
+
+    if domain == "light":
+        brightness = attrs.get("brightness")
+        if isinstance(brightness, (int, float)):
+            result["brightness"] = round((brightness / 255) * 100)
+        return result
+
+    if domain == "sensor":
+        dc = attrs.get("device_class")
+        val = merged.get("value")
+        if val is not None:
+            if dc == "temperature": result["temperature"] = val
+            elif dc == "humidity": result["humidity"] = val
+            elif dc == "battery": result["battery"] = val
+            elif dc in ("power", "energy"): result["power"] = val
+            else: result["value"] = val
+        return result
+
+    if domain == "binary_sensor":
+        dc = attrs.get("device_class")
+        is_on = merged.get("on")
+        if dc in ("motion", "occupancy", "presence"):
+            result["motion"] = is_on
+        elif dc in ("door", "window", "opening", "contact", "garage_door"):
+            result["contact"] = (not is_on) if is_on is not None else None
+        return result
+
+    if domain == "climate":
+        cur_temp = attrs.get("current_temperature")
+        if isinstance(cur_temp, (int, float)):
+            result["temperature"] = cur_temp
+        target_temp = attrs.get("temperature")
+        if isinstance(target_temp, (int, float)):
+            result["targetTemperature"] = target_temp
+        return result
+
+    return result
+
+
+def _ha_entity_to_normalized_patch(entity_id: str, state: str, attributes: dict) -> dict:
+    state_patch = _ha_state_to_normalized(entity_id, state)
+    attr_patch = _ha_attributes_to_normalized(entity_id, attributes, state_patch)
+    return {**state_patch, **attr_patch}
+
+
 # ── Batch d'états : accumule les state_changed, flush toutes les 2.5s ────────
 # Réduit les appels Vercel de ×N (un par event) à 1 par fenêtre temporelle.
 # La déduplication par entity_id garantit qu'on n'envoie que le dernier état connu.
@@ -2563,8 +2724,47 @@ def _run_camera_watchdog():
         time.sleep(60)
 
 
+def _report_device_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
+    """pi_report_device_state via Supabase direct — True si réussi."""
+    try:
+        patch = _ha_entity_to_normalized_patch(entity_id, state, attributes)
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:device_state:{entity_id}"
+        r = _supabase_rpc("pi_report_device_state", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_ha_entity_id": entity_id, "p_patch": patch,
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_device_state({entity_id}) {r.status_code}: {r.text[:120]}")
+            return False
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_device_state({entity_id}): {e}")
+        return False
+
+
+def _report_camera_status_direct(stream_name: str, online: bool) -> bool:
+    """pi_report_camera_status via Supabase direct — True si réussi."""
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:camera_status:{stream_name}:{str(online).lower()}"
+        r = _supabase_rpc("pi_report_camera_status", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_online": online, "p_stream_name": stream_name,
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_camera_status({stream_name}) {r.status_code}: {r.text[:120]}")
+            return False
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_camera_status({stream_name}): {e}")
+        return False
+
+
 def _flush_state_batch():
-    """Thread de fond : envoie états devices + statuts caméras en un seul POST toutes les 2.5s."""
+    """Thread de fond : envoie états devices + statuts caméras toutes les 2.5s.
+    Direct Supabase par item si activé — un item qui échoue est réintégré au batch
+    Vercel groupé en repli (cf. HANDOFF §36), les items réussis ne sont pas renvoyés."""
     while True:
         time.sleep(2.5)
         if not INGEST_SECRET:
@@ -2581,6 +2781,16 @@ def _flush_state_batch():
                 if n in _cam_watch_online and n in _cameras
             }
             _cam_watch_dirty.clear()
+
+        if USE_DIRECT_SUPABASE:
+            batch = {
+                eid: (st, attrs) for eid, (st, attrs) in batch.items()
+                if not _report_device_state_direct(eid, st, attrs)
+            }
+            cam_batch = {
+                name: online for name, online in cam_batch.items()
+                if not _report_camera_status_direct(name, online)
+            }
 
         if not batch and not cam_batch:
             continue
@@ -2850,8 +3060,69 @@ def _handle_ha_command(payload: bytes):
         warn(f"[ha/command] Type inconnu : {cmd_type}")
 
 
+def _detect_device_type(exposes: list[dict]) -> str:
+    """Port Python de detectDeviceType() (web/src/app/api/webhooks/pi/devices-sync/route.ts)
+    — utilisé uniquement par le chemin direct Supabase, cf. HANDOFF §36."""
+    types = [e.get("type", "") for e in exposes]
+    names = [e.get("name", "") for e in exposes]
+    if "light" in types: return "light"
+    if "switch" in types: return "switch"
+    if "cover" in types: return "cover"
+    if "climate" in types or "thermostat" in types: return "thermostat"
+    if "lock" in types: return "switch"
+    if "occupancy" in names or "motion" in names: return "sensor-motion"
+    if "contact" in names: return "sensor-contact"
+    if "temperature" in names or "humidity" in names: return "sensor-temp"
+    if "outlet" in types: return "plug"
+    return "switch"
+
+
+def _sync_zigbee_devices_direct(devices_list) -> bool:
+    """pi_sync_zigbee_devices via Supabase direct — True si réussi. Réplique le
+    filtrage (coordinateur/interview non terminée exclus) fait par la route Vercel."""
+    try:
+        payload_devices = []
+        for d in devices_list:
+            if d.get("type") == "Coordinator": continue
+            if not d.get("interview_completed"): continue
+            ieee = d.get("ieee_address")
+            if not ieee: continue
+
+            definition = d.get("definition") or {}
+            exposes = definition.get("exposes") or []
+            device_type = _detect_device_type(exposes)
+            friendly_name = d.get("friendly_name")
+            default_name = friendly_name if (friendly_name and friendly_name != ieee) \
+                else (definition.get("model") or ieee)
+
+            payload_devices.append({
+                "ieee_address": ieee, "name": default_name, "z2m_name": friendly_name,
+                "type": device_type, "vendor": definition.get("vendor") or "",
+                "model": definition.get("model") or "", "features": exposes,
+            })
+
+        ts = int(time.time())
+        ieee_sorted = ",".join(sorted(d["ieee_address"] for d in payload_devices))
+        message = f"{SITE_PREFIX}:{ts}:zigbee_sync:{ieee_sorted}"
+        r = _supabase_rpc("pi_sync_zigbee_devices", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_devices": payload_devices,
+        }, timeout=30)
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_sync_zigbee_devices {r.status_code}: {r.text[:200]}")
+            return False
+        log(f"[supabase] pi_sync_zigbee_devices — {len(payload_devices)} devices, réponse: {r.text[:120]}")
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_sync_zigbee_devices: {e}")
+        return False
+
+
 def _sync_devices_to_app(devices_list):
-    """Background thread : envoie la liste bridge/devices au backend pour upsert auto."""
+    """Background thread : envoie la liste bridge/devices pour upsert auto. Direct
+    Supabase si activé (repli sur l'ancien chemin Vercel en cas d'échec)."""
+    if USE_DIRECT_SUPABASE and _sync_zigbee_devices_direct(devices_list):
+        return
     try:
         auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
         r = requests.post(
