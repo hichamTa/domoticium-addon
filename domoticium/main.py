@@ -34,14 +34,16 @@ APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
 FORCE_SETUP             = cfg.get("force_setup", False)
 INGEST_SECRET           = cfg.get("ingest_secret", "")
-USE_DIRECT_SUPABASE     = cfg.get("use_direct_supabase", False)
 
-# Appels directs Pi → Supabase (remplace des appels Vercel fréquents — heartbeat,
-# sync Zigbee/Matter, états devices, statut caméra — cf. HANDOFF §36). URL et clé
-# publique "anon" : pas des secrets, mêmes valeurs pour tous les sites, embarquées
-# ici comme APP_URL plutôt qu'en option addon. L'authentification par site passe
-# par une signature HMAC calculée avec INGEST_SECRET (cf. _pi_sign/_supabase_rpc),
-# jamais par cette clé anon seule.
+# Appels directs Pi → Supabase (heartbeat, sync Zigbee/Matter, états devices,
+# statut caméra — cf. HANDOFF §36/§37) : seul chemin, plus de repli Vercel. URL et
+# clé publique "anon" : pas des secrets, mêmes valeurs pour tous les sites,
+# embarquées ici comme APP_URL plutôt qu'en option addon. L'authentification par
+# site passe par une signature HMAC calculée avec INGEST_SECRET (cf.
+# _pi_sign/_supabase_rpc), jamais par cette clé anon seule. En cas d'échec d'un
+# appel (réseau, Supabase indisponible) : log + nouvelle tentative au prochain
+# cycle (heartbeat/sync périodiques, ou réintégration dans le batch pour les
+# états/statuts caméra) — aucune donnée n'est perdue silencieusement.
 SUPABASE_URL        = "https://oomiihobburvajrypeqc.supabase.co"
 SUPABASE_ANON_KEY   = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6"
                        "Im9vbWlpaG9iYnVydmFqcnlwZXFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIwODA3"
@@ -1174,44 +1176,15 @@ def configure_mqtt(force: bool = False):
         warn(f"[MQTT] Type inattendu : {flow_type}")
 
 
-def create_automations():
-    log("── Automations ──────────────────────────────")
-
-    # domoticium_state_stream et domoticium_command_handler (MQTT/EMQX) retirées —
-    # remplacées par run_ha_ws_bridge() (état) et le serveur de commandes HTTP (commandes).
-    # domoticium_heartbeat retirée (2026-07-19) — dupliquait _heartbeat_loop() (Python,
-    # 60s) en appelant le même endpoint toutes les 30s indépendamment, doublant le
-    # trafic heartbeat pour rien. Cf. _remove_legacy_heartbeat_automation_once() pour
-    # le nettoyage des installations où elle est déjà enregistrée dans HA.
-    automations = [
-        {
-            "id": "domoticium_camera_status",
-            "alias": "Domoticium — Camera Status Reporter",
-            "description": "Notifie l'API quand une caméra change d'état",
-            "mode": "parallel", "max": 10,
-            "trigger": [{"platform": "event", "event_type": "state_changed"}],
-            "condition": [
-                {"condition": "template",
-                 "value_template": "{{ trigger.event.data.entity_id.startswith('camera.') }}"},
-                {"condition": "template",
-                 "value_template": "{{ trigger.event.data.old_state is not none and trigger.event.data.new_state is not none }}"},
-                {"condition": "template",
-                 "value_template": "{{ trigger.event.data.old_state.state != trigger.event.data.new_state.state }}"},
-            ],
-            "action": [{"service": "rest_command.domoticium_camera_status", "data": {
-                "ha_entity_id": "{{ trigger.event.data.entity_id }}",
-                "online": "{{ trigger.event.data.new_state.state != 'unavailable' }}",
-            }}],
-        },
-    ]
-
-    for auto in automations:
-        r = requests.post(f"{API}/config/automation/config/{auto['id']}",
-                          headers=HDRS, json=auto, timeout=15)
-        mark = "✓" if r.status_code in (200, 201) else f"✗ {r.status_code}"
-        log(f"{mark} {auto['alias']}")
-
-    ha_post("/services/automation/reload")
+# Anciennes automations HA (domoticium_state_stream/domoticium_command_handler MQTT/EMQX,
+# domoticium_heartbeat, domoticium_camera_status) toutes retirées — remplacées par
+# run_ha_ws_bridge() + le serveur de commandes HTTP local et les appels Supabase directs
+# (cf. HANDOFF §36/§37). domoticium_camera_status en particulier n'a jamais servi en
+# pratique : Frigate ne publie aucune entité camera.* dans HA (mqtt.enabled: false), et
+# le jour où une intégration HACS en créera, "camera" fait déjà partie des domaines
+# relayés par run_ha_ws_bridge() → aucun rest_command dédié ne sera nécessaire.
+# Cf. _remove_legacy_heartbeat_automation_once() et _remove_legacy_rest_commands_once()
+# pour le nettoyage des installations où ces automations/rest_commands existent déjà.
 
 
 _LEGACY_HEARTBEAT_AUTO_MARKER = "/data/.legacy_heartbeat_automation_removed"
@@ -1220,8 +1193,7 @@ _LEGACY_HEARTBEAT_AUTO_MARKER = "/data/.legacy_heartbeat_automation_removed"
 def _remove_legacy_heartbeat_automation_once():
     """Supprime l'automation HA 'domoticium_heartbeat' sur les installations où elle
     a déjà été enregistrée (avant le 2026-07-19) — dupliquait le heartbeat Python
-    toutes les 30s. Idempotent via marker, tourne à chaque démarrage de l'addon
-    (pas seulement au setup initial, contrairement à create_automations())."""
+    toutes les 30s. Idempotent via marker, tourne à chaque démarrage de l'addon."""
     if os.path.exists(_LEGACY_HEARTBEAT_AUTO_MARKER):
         return
     try:
@@ -1237,6 +1209,44 @@ def _remove_legacy_heartbeat_automation_once():
         warn(f"Suppression automation heartbeat legacy : {e}")
         return  # retente au prochain démarrage
     open(_LEGACY_HEARTBEAT_AUTO_MARKER, "w").close()
+
+
+_LEGACY_REST_COMMANDS_MARKER = "/data/.legacy_rest_commands_removed"
+
+
+def _remove_legacy_rest_commands_once():
+    """Nettoyage one-shot (2026-07-20) : supprime l'automation HA 'domoticium_camera_status'
+    et le fichier rest_command associé (écrits par une version antérieure de l'addon pour
+    notifier /api/webhooks/pi/camera-status au changement d'état d'une entité camera.* —
+    jamais déclenché en pratique, Frigate ne publie aucune entité camera.* dans HA).
+    Idempotent via marker, tourne à chaque démarrage."""
+    if os.path.exists(_LEGACY_REST_COMMANDS_MARKER):
+        return
+    try:
+        r = requests.delete(f"{API}/config/automation/config/domoticium_camera_status",
+                            headers=HDRS, timeout=15)
+        if r.status_code not in (200, 404):
+            warn(f"Suppression automation camera_status legacy : HTTP {r.status_code}")
+            return  # retente au prochain démarrage
+
+        rest_file = "/homeassistant/domoticium_rest_commands.yaml"
+        main_cfg = "/homeassistant/configuration.yaml"
+        if os.path.exists(rest_file):
+            os.remove(rest_file)
+        if os.path.exists(main_cfg):
+            with open(main_cfg) as f:
+                existing = f.read()
+            cleaned = existing.replace("rest_command: !include domoticium_rest_commands.yaml\n", "")
+            if cleaned != existing:
+                with open(main_cfg, "w") as f:
+                    f.write(cleaned)
+
+        ha_post("/services/automation/reload")
+        log("✓ Automation HA 'domoticium_camera_status' + rest_commands obsolètes supprimés")
+    except Exception as e:
+        warn(f"Suppression rest_commands legacy : {e}")
+        return  # retente au prochain démarrage
+    open(_LEGACY_REST_COMMANDS_MARKER, "w").close()
 
 
 def remove_legacy_mqtt_discovery_prefix():
@@ -1269,59 +1279,6 @@ def remove_legacy_mqtt_discovery_prefix():
         warn(f"remove_legacy_mqtt_discovery_prefix: {e}")
 
 
-def write_rest_commands():
-    log("── rest_commands ─────────────────────────────")
-    creds = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
-    p = SITE_PREFIX
-
-    # Le fichier NE doit PAS contenir la clé "rest_command:" — elle est dans configuration.yaml.
-    # Format correct HA : configuration.yaml → "rest_command: !include domoticium_rest_commands.yaml"
-    content = (
-        "domoticium_camera_status:\n"
-        f'  url: "{APP_URL}/api/webhooks/pi/camera-status"\n'
-        "  method: POST\n"
-        "  headers:\n"
-        '    Content-Type: "application/json"\n'
-        f'    Authorization: "Basic {creds}"\n'
-        "  payload: "
-        f"'{{\"siteId\":\"{p}\",\"haEntityId\":\"{{{{ ha_entity_id }}}}\",\"online\":{{{{ online }}}}}}'\n"
-        '  content_type: "application/json"\n'
-        "domoticium_heartbeat:\n"
-        f'  url: "{APP_URL}/api/webhooks/pi/heartbeat"\n'
-        "  method: POST\n"
-        "  headers:\n"
-        '    Content-Type: "application/json"\n'
-        f'    Authorization: "Basic {creds}"\n'
-        f"  payload: '{{\"siteId\":\"{p}\"}}'\n"
-        '  content_type: "application/json"\n'
-    )
-
-    rest_file = "/homeassistant/domoticium_rest_commands.yaml"
-    # Format correct : clé + include sur la même ligne
-    new_include = "rest_command: !include domoticium_rest_commands.yaml"
-    # Ancienne forme incorrecte (include nu) à migrer si présente
-    old_include = "!include domoticium_rest_commands.yaml"
-    main_cfg  = "/homeassistant/configuration.yaml"
-
-    with open(rest_file, "w") as f:
-        f.write(content)
-
-    with open(main_cfg) as f:
-        existing = f.read()
-
-    if new_include not in existing:
-        # Remplacer l'ancienne forme bare si présente, sinon ajouter en fin de fichier
-        if old_include in existing:
-            existing = existing.replace(old_include, new_include)
-            with open(main_cfg, "w") as f:
-                f.write(existing)
-        else:
-            with open(main_cfg, "a") as f:
-                f.write(f"\n{new_include}\n")
-
-    log("✓ rest_commands configuré")
-
-
 def run_setup():
     wait_for_ha()
     log("═══ Début de la configuration Domoticium ═══")
@@ -1342,8 +1299,6 @@ def run_setup():
     if INSTALL_THREAD_ROUTER:
         install_thread_border_router()
     install_frigate()
-    create_automations()
-    write_rest_commands()
 
     ha_post("/services/homeassistant/reload_all")
     with open(SETUP_DONE, "w") as f:
@@ -1854,9 +1809,9 @@ def _sync_matter_devices_direct(devices_payload) -> bool:
 
 def _sync_matter_devices_to_app():
     """Réconciliation périodique Matter → Supabase (analogue à bridge/devices Zigbee).
-    Envoie la liste COMPLÈTE des nodes commissionnés — le webhook réconcilie (upsert +
-    suppression des devices absents), pas juste un ajout ponctuel. Direct Supabase si
-    activé (repli sur l'ancien chemin Vercel en cas d'échec)."""
+    Envoie la liste COMPLÈTE des nodes commissionnés — `pi_sync_matter_devices`
+    réconcilie (upsert + suppression des devices absents), pas juste un ajout
+    ponctuel. En cas d'échec : log, retenté au prochain cycle périodique."""
     nodes = _matter_get_nodes()
     if nodes is None:
         return
@@ -1873,19 +1828,7 @@ def _sync_matter_devices_to_app():
             "device_type": device_type,
         })
 
-    if USE_DIRECT_SUPABASE and _sync_matter_devices_direct(devices_payload):
-        return
-    try:
-        auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
-        r = requests.post(
-            f"{APP_URL}/api/webhooks/pi/devices-sync",
-            json={"siteId": SITE_PREFIX, "source": "matter", "devices": devices_payload},
-            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        log(f"[devices-sync/matter] HTTP {r.status_code} — {len(devices_payload)} devices, réponse: {r.text[:200]}")
-    except Exception as e:
-        warn(f"[devices-sync/matter] {e}")
+    _sync_matter_devices_direct(devices_payload)
 
 
 def _matter_commission_ws(code: str, timeout_s: int = 200):
@@ -2489,26 +2432,9 @@ def _heartbeat_direct() -> bool:
 
 
 def call_heartbeat_api():
-    """Envoie le heartbeat (+ état Z2M courant). Direct Supabase si activé (repli
-    automatique sur l'ancien chemin Vercel en cas d'échec — cf. HANDOFF §36)."""
-    if USE_DIRECT_SUPABASE and _heartbeat_direct():
-        return
-
-    creds = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
-    payload: dict = {"siteId": SITE_PREFIX}
-    if _z2m_online is not None:
-        payload["z2mOnline"] = _z2m_online
-    try:
-        r = requests.post(
-            f"{APP_URL}/api/webhooks/pi/heartbeat",
-            json=payload,
-            headers={"Authorization": f"Basic {creds}", "Content-Type": "application/json"},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            warn(f"Heartbeat API {r.status_code}: {r.text[:120]}")
-    except Exception as e:
-        warn(f"Heartbeat API: {e}")
+    """Envoie le heartbeat (+ état Z2M courant) via Supabase direct. En cas d'échec :
+    log, retenté au prochain cycle (_heartbeat_loop, 60s)."""
+    _heartbeat_direct()
 
 
 def run_ha_ws_bridge():
@@ -2773,9 +2699,10 @@ def _report_camera_status_direct(stream_name: str, online: bool) -> bool:
 
 
 def _flush_state_batch():
-    """Thread de fond : envoie états devices + statuts caméras toutes les 2.5s.
-    Direct Supabase par item si activé — un item qui échoue est réintégré au batch
-    Vercel groupé en repli (cf. HANDOFF §36), les items réussis ne sont pas renvoyés."""
+    """Thread de fond : envoie états devices + statuts caméras toutes les 2.5s via
+    Supabase direct (un appel HMAC par item). Un item qui échoue (réseau, Supabase
+    indisponible) est réintégré au batch pour être retenté au prochain cycle — pas
+    de repli Vercel, aucune donnée perdue silencieusement."""
     while True:
         time.sleep(2.5)
         if not INGEST_SECRET:
@@ -2793,34 +2720,22 @@ def _flush_state_batch():
             }
             _cam_watch_dirty.clear()
 
-        if USE_DIRECT_SUPABASE:
-            batch = {
-                eid: (st, attrs) for eid, (st, attrs) in batch.items()
-                if not _report_device_state_direct(eid, st, attrs)
-            }
-            cam_batch = {
-                name: online for name, online in cam_batch.items()
-                if not _report_camera_status_direct(name, online)
-            }
+        failed_states = {
+            eid: (st, attrs) for eid, (st, attrs) in batch.items()
+            if not _report_device_state_direct(eid, st, attrs)
+        }
+        failed_cams = {
+            name: online for name, online in cam_batch.items()
+            if not _report_camera_status_direct(name, online)
+        }
 
-        if not batch and not cam_batch:
-            continue
-
-        try:
-            payload: dict = {"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX}
-            if batch:
-                payload["states"] = [
-                    {"entityId": eid, "state": st, "attributes": attrs}
-                    for eid, (st, attrs) in batch.items()
-                ]
-            if cam_batch:
-                payload["cameras"] = [
-                    {"streamName": name, "online": online}
-                    for name, online in cam_batch.items()
-                ]
-            requests.post(f"{APP_URL}/api/ingest/states", json=payload, timeout=15)
-        except Exception as e:
-            warn(f"[ingest/states] batch: {e}")
+        if failed_states:
+            with _state_batch_lock:
+                for eid, v in failed_states.items():
+                    _state_batch.setdefault(eid, v)
+        if failed_cams:
+            with _cam_watch_lock:
+                _cam_watch_dirty.update(failed_cams.keys())
 
 
 _IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
@@ -3145,21 +3060,9 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
 
 
 def _sync_devices_to_app(devices_list):
-    """Background thread : envoie la liste bridge/devices pour upsert auto. Direct
-    Supabase si activé (repli sur l'ancien chemin Vercel en cas d'échec)."""
-    if USE_DIRECT_SUPABASE and _sync_zigbee_devices_direct(devices_list):
-        return
-    try:
-        auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
-        r = requests.post(
-            f"{APP_URL}/api/webhooks/pi/devices-sync",
-            json={"siteId": SITE_PREFIX, "source": "zigbee", "devices": devices_list},
-            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        log(f"[devices-sync] HTTP {r.status_code} — {len(devices_list)} devices, réponse: {r.text[:120]}")
-    except Exception as e:
-        warn(f"[devices-sync] {e}")
+    """Background thread : envoie la liste bridge/devices pour upsert auto (Supabase
+    direct). En cas d'échec : log, retenté au prochain cycle périodique."""
+    _sync_zigbee_devices_direct(devices_list)
 
 
 def on_local_message(client, userdata, msg):
@@ -4091,6 +3994,7 @@ def run_bridge():
     _turn_ice_servers = _fetch_turn_ice_servers() or [{"urls": ["stun:stun.cloudflare.com:3478"]}]
     start_cloudflared()
     threading.Thread(target=_remove_legacy_heartbeat_automation_once, daemon=True).start()
+    threading.Thread(target=_remove_legacy_rest_commands_once, daemon=True).start()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
