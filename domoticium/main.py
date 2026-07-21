@@ -108,6 +108,13 @@ else:
 
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
 
+# Caméras avec audio bidirectionnel ("parler") activé — dict séparé plutôt que
+# d'étendre _cameras (type dict[str,str] déjà lu/écrit à de nombreux endroits, risque
+# de casser le flux vidéo principal déjà validé en conditions réelles). Persisté à
+# part, cf. _load_camera_talk/_save_camera_talk.
+CAMERA_TALK_FILE = "/data/camera_talk.json"
+_camera_talk_enabled: set = set()
+
 # Identifiants ICE WebRTC (STUN + TURN Cloudflare Realtime) injectés dans go2rtc via
 # frigate.yml — rafraîchis périodiquement par _turn_refresh_loop() (cf. plus bas).
 _TURN_REFRESH_INTERVAL = 24 * 3600  # 24h — identifiants Cloudflare valables 48h max
@@ -305,10 +312,23 @@ def _load_cameras():
         log(f"Caméras chargées : {list(_cameras.keys()) or '(aucune)'}")
     except FileNotFoundError:
         _cameras = {}
+    _load_camera_talk()
 
 def _save_cameras():
     with open(CAMERAS_FILE, "w") as f:
         json.dump(_cameras, f)
+
+def _load_camera_talk():
+    global _camera_talk_enabled
+    try:
+        with open(CAMERA_TALK_FILE) as f:
+            _camera_talk_enabled = set(json.load(f))
+    except FileNotFoundError:
+        _camera_talk_enabled = set()
+
+def _save_camera_talk():
+    with open(CAMERA_TALK_FILE, "w") as f:
+        json.dump(sorted(_camera_talk_enabled), f)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -989,6 +1009,13 @@ def _generate_frigate_yaml() -> str:
         lines.append("  streams:")
         for name, rtsp_url in _cameras.items():
             lines += [f"    {name}:", f"      - {rtsp_url}"]
+            if name in _camera_talk_enabled:
+                # Deuxième source = même caméra, marquée #backchannel=0 → go2rtc y
+                # envoie l'audio reçu du navigateur (bouton "parler") au lieu de le
+                # lire. Combinaison confirmée par la doc communautaire go2rtc pour les
+                # caméras Reolink — PAS testée en conditions réelles ici (cf. HANDOFF),
+                # certains modèles n'acceptent qu'un seul client RTSP à la fois.
+                lines.append(f"      - {rtsp_url}#backchannel=0")
         lines += _webrtc_config_yaml_lines()
         lines.append("")
         lines.append("cameras:")
@@ -1563,18 +1590,20 @@ def _reconcile_cameras(app_cameras: list):
     (toutes les ~5 min) rattrape la divergence en comparant l'état encore en DB avec
     l'état local (_cameras)."""
     app_by_name = {
-        c["streamName"]: c.get("rtspUrl")
+        c["streamName"]: c
         for c in app_cameras
         if c.get("streamName") and c.get("rtspUrl")
     }
 
     # Caméras manquantes localement ou dont l'URL a changé (mot de passe mis à jour
     # pendant que le Pi était injoignable) → (ré)ajout.
-    for name, rtsp_url in app_by_name.items():
-        if _cameras.get(name) != rtsp_url:
+    for name, cam in app_by_name.items():
+        rtsp_url = cam["rtspUrl"]
+        has_talk = bool(cam.get("hasTalk"))
+        if _cameras.get(name) != rtsp_url or (name in _camera_talk_enabled) != has_talk:
             log(f"[sync/cameras] '{name}' manquante ou désynchronisée localement — ajout")
             try:
-                handle_camera_configure("add", name, rtsp_url)
+                handle_camera_configure("add", name, rtsp_url, has_talk)
             except Exception as e:
                 warn(f"[sync/cameras] add '{name}': {e}")
 
@@ -1588,7 +1617,7 @@ def _reconcile_cameras(app_cameras: list):
                 warn(f"[sync/cameras] remove '{name}': {e}")
 
 
-def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None) -> bool:
+def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None, has_talk: bool = False) -> bool:
     """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
     Entièrement bloquant, de bout en bout — la réponse HTTP appelante ne doit dire 'ok'
     que si le travail a réellement été fait (go2rtc à chaud OU restart complet, +
@@ -1599,14 +1628,25 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
             raise ValueError("rtspUrl manquant")
         _cameras[stream_name] = rtsp_url
         _save_cameras()
+        if has_talk:
+            _camera_talk_enabled.add(stream_name)
+        else:
+            _camera_talk_enabled.discard(stream_name)
+        _save_camera_talk()
         write_frigate_config()
-        if _go2rtc_upsert_stream(stream_name, rtsp_url):
+        # backchannel audio (cf. _generate_frigate_yaml) change le nombre de sources
+        # go2rtc du stream — l'upsert à chaud ne gère qu'une source, donc on force un
+        # restart complet dans ce cas plutôt qu'un upsert partiel potentiellement bancal.
+        if not has_talk and _go2rtc_upsert_stream(stream_name, rtsp_url):
             log(f"✓ Caméra add (à chaud, go2rtc) : '{stream_name}'")
             return True
-        warn(f"[go2rtc] upsert à chaud échoué pour '{stream_name}' — restart Frigate en secours")
+        if not has_talk:
+            warn(f"[go2rtc] upsert à chaud échoué pour '{stream_name}' — restart Frigate en secours")
     elif action == "remove":
         _cameras.pop(stream_name, None)
+        _camera_talk_enabled.discard(stream_name)
         _save_cameras()
+        _save_camera_talk()
         write_frigate_config()
         _ha_remove_camera_entities(stream_name)  # bloquant — cf. docstring
         if _go2rtc_remove_stream(stream_name):
@@ -3687,12 +3727,15 @@ def _subnet_onvif_scan(onvif_ports: tuple = (8000, 80), connect_timeout: float =
     return found
 
 
-def _onvif_soap(url: str, body: str, timeout: float = 4.0) -> str:
-    """Appel SOAP ONVIF sans authentification (GetDeviceInfo / GetCapabilities fonctionnent en clair)."""
+def _onvif_soap(url: str, body: str, timeout: float = 4.0, header: str = '') -> str:
+    """Appel SOAP ONVIF. GetDeviceInfo/GetCapabilities répondent en clair ; les
+    commandes qui changent un réglage (PTZ, Imaging) exigent en général le header
+    WS-Security ci-dessous (cf. _onvif_ws_security_header) — sinon 401/SOAP Fault."""
     envelope = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
-        f'<s:Body>{body}</s:Body>'
+        + (f'<s:Header>{header}</s:Header>' if header else '')
+        + f'<s:Body>{body}</s:Body>'
         '</s:Envelope>'
     )
     r = requests.post(
@@ -3701,6 +3744,38 @@ def _onvif_soap(url: str, body: str, timeout: float = 4.0) -> str:
         timeout=timeout,
     )
     return r.text
+
+
+def _onvif_ws_security_header(username: str, password: str) -> str:
+    """UsernameToken WS-Security (PasswordDigest) — méthode d'authentification standard
+    ONVIF pour les commandes qui modifient un réglage caméra (PTZ, vision nocturne...)."""
+    nonce = os.urandom(16)
+    created = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    digest = base64.b64encode(hashlib.sha1(nonce + created.encode() + password.encode()).digest()).decode()
+    nonce_b64 = base64.b64encode(nonce).decode()
+    return (
+        '<Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" '
+        'xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">'
+        '<UsernameToken>'
+        f'<Username>{username}</Username>'
+        '<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+        f'{digest}</Password>'
+        '<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
+        f'{nonce_b64}</Nonce>'
+        f'<wsu:Created>{created}</wsu:Created>'
+        '</UsernameToken>'
+        '</Security>'
+    )
+
+
+def _onvif_credentials_from_rtsp(rtsp_url: str) -> tuple:
+    """Extrait (ip, username, password) d'une URL RTSP déjà stockée — les commandes
+    ONVIF authentifiées utilisent en général les mêmes identifiants que le flux vidéo
+    chez le matériel grand public (hypothèse, pas garantie par le standard)."""
+    m = re.match(r'rtsp://(?:([^:@]*):([^@]*)@)?([^:/]+)', rtsp_url)
+    if not m:
+        raise ValueError('URL RTSP invalide')
+    return m.group(3), (m.group(1) or ''), (m.group(2) or '')
 
 
 def _scan_onvif_cameras(timeout: float = 12.0) -> list:
@@ -3862,6 +3937,116 @@ def _safe_probe_capabilities(ip: str) -> list:
         return []
 
 
+# ── Commandes ONVIF authentifiées (PTZ, vision nocturne) ────────────────────────
+# Contrairement à la détection de capacités (lecture seule, non authentifiée), ces
+# commandes modifient un réglage caméra et exigent en général le WS-Security
+# UsernameToken ci-dessus. Résolution des services à chaque appel (pas de cache —
+# fréquence d'appel faible, un clic utilisateur, la latence supplémentaire est
+# négligeable en pratique).
+
+def _onvif_locate_services(ip: str, timeout: float = 3.0) -> dict:
+    """Retrouve device_xaddr/ptz_xaddr/media_xaddr/imaging_xaddr/profile_token/
+    video_source_token pour une caméra — lève une exception explicite si le service
+    demandé n'existe pas (PTZ/Imaging non supportés) plutôt que d'échouer en silence."""
+    device_xaddr = ''
+    xml = ''
+    for port in (8000, 80):
+        candidate = f'http://{ip}:{port}/onvif/device_service'
+        try:
+            xml = _onvif_soap(candidate, '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>', timeout=timeout)
+        except Exception:
+            continue
+        if xml:
+            device_xaddr = candidate
+            break
+    if not device_xaddr:
+        raise RuntimeError('caméra injoignable en ONVIF')
+
+    services = {'device_xaddr': device_xaddr, 'ptz_xaddr': '', 'media_xaddr': '', 'imaging_xaddr': ''}
+    for xa in _xml_all(xml, 'XAddr'):
+        low = xa.lower()
+        if 'ptz' in low: services['ptz_xaddr'] = xa
+        elif 'media' in low: services['media_xaddr'] = xa
+        elif 'imaging' in low: services['imaging_xaddr'] = xa
+    if not services['media_xaddr']:
+        raise RuntimeError('service Media ONVIF introuvable')
+
+    pxml = _onvif_soap(services['media_xaddr'], '<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>', timeout=timeout)
+    services['profile_token'] = _xml_attr(pxml, 'Profiles', 'token')
+    if not services['profile_token']:
+        raise RuntimeError('aucun profil média ONVIF trouvé')
+
+    try:
+        vxml = _onvif_soap(services['media_xaddr'], '<trt:GetVideoSources xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>', timeout=timeout)
+        services['video_source_token'] = _xml_attr(vxml, 'VideoSources', 'token')
+    except Exception:
+        services['video_source_token'] = ''
+
+    return services
+
+
+def _onvif_ptz_move(ip: str, username: str, password: str, direction: str) -> tuple:
+    """direction: up/down/left/right/zoom_in/zoom_out/stop. True/detail."""
+    services = _onvif_locate_services(ip)
+    if not services['ptz_xaddr']:
+        return False, 'Cette caméra ne propose pas de service PTZ en ONVIF'
+    token = services['profile_token']
+    header = _onvif_ws_security_header(username, password)
+
+    if direction == 'stop':
+        body = (
+            '<tptz:Stop xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">'
+            f'<tptz:ProfileToken>{token}</tptz:ProfileToken>'
+            '<tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom>'
+            '</tptz:Stop>'
+        )
+    else:
+        speed = {
+            'up': (0, 0.5, 0), 'down': (0, -0.5, 0),
+            'left': (-0.5, 0, 0), 'right': (0.5, 0, 0),
+            'zoom_in': (0, 0, 0.5), 'zoom_out': (0, 0, -0.5),
+        }.get(direction)
+        if not speed:
+            return False, f'Direction inconnue : {direction}'
+        x, y, z = speed
+        body = (
+            '<tptz:ContinuousMove xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">'
+            f'<tptz:ProfileToken>{token}</tptz:ProfileToken>'
+            '<tptz:Velocity>'
+            f'<tt:PanTilt xmlns:tt="http://www.onvif.org/ver10/schema" x="{x}" y="{y}"/>'
+            f'<tt:Zoom xmlns:tt="http://www.onvif.org/ver10/schema" x="{z}"/>'
+            '</tptz:Velocity>'
+            '</tptz:ContinuousMove>'
+        )
+    xml = _onvif_soap(services['ptz_xaddr'], body, header=header)
+    if 'Fault' in xml:
+        return False, _xml_text(xml, 'Text') or 'La caméra a refusé la commande PTZ'
+    return True, 'ok'
+
+
+def _onvif_set_night_vision(ip: str, username: str, password: str, mode: str) -> tuple:
+    """mode: on/off/auto → IrCutFilter ON/OFF/AUTO."""
+    ir_mode = {'on': 'ON', 'off': 'OFF', 'auto': 'AUTO'}.get(mode)
+    if not ir_mode:
+        return False, f'Mode inconnu : {mode}'
+    services = _onvif_locate_services(ip)
+    if not services['imaging_xaddr'] or not services.get('video_source_token'):
+        return False, "Cette caméra ne propose pas de réglage vision nocturne en ONVIF"
+    header = _onvif_ws_security_header(username, password)
+    body = (
+        '<timg:SetImagingSettings xmlns:timg="http://www.onvif.org/ver20/imaging/wsdl">'
+        f'<timg:VideoSourceToken>{services["video_source_token"]}</timg:VideoSourceToken>'
+        '<timg:ImagingSettings>'
+        f'<tt:IrCutFilter xmlns:tt="http://www.onvif.org/ver10/schema">{ir_mode}</tt:IrCutFilter>'
+        '</timg:ImagingSettings>'
+        '</timg:SetImagingSettings>'
+    )
+    xml = _onvif_soap(services['imaging_xaddr'], body, header=header)
+    if 'Fault' in xml:
+        return False, _xml_text(xml, 'Text') or 'La caméra a refusé le réglage vision nocturne'
+    return True, 'ok'
+
+
 class _CommandHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log(f"[cmd-server] {self.address_string()} — {fmt % args}")
@@ -3906,6 +4091,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/ha-command":           self._handle_ha_command_route,
                 "/camera/configure":     self._handle_camera_configure_route,
                 "/camera/test":          self._handle_camera_test_route,
+                "/camera/ptz":           self._handle_camera_ptz_route,
+                "/camera/night-vision":  self._handle_camera_night_vision_route,
                 "/sync-now":             self._handle_sync_now,
             }
             handler = handlers.get(route)
@@ -3990,7 +4177,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         stream_name = data.get("streamName")
         if not stream_name:
             return self._reject(400, "streamName manquant")
-        ok = handle_camera_configure(action, stream_name, data.get("rtspUrl"))
+        ok = handle_camera_configure(action, stream_name, data.get("rtspUrl"), bool(data.get("hasTalk")))
         if ok:
             self._ok()
         else:
@@ -4012,6 +4199,49 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         manufacturer = data.get("manufacturer") or ""
         ok, detail, url = _test_camera_by_brand(ip, password, manufacturer)
         self._ok({"ok": ok, "detail": detail, "correctedUrl": url, "detectedCapabilities": _safe_probe_capabilities(ip)})
+
+    def _camera_onvif_credentials(self, stream_name):
+        """Retrouve (ip, username, password) à partir du streamName — réutilise les
+        identifiants déjà stockés pour le flux vidéo (cf. _onvif_credentials_from_rtsp)."""
+        rtsp_url = _cameras.get(stream_name)
+        if not rtsp_url:
+            return None
+        try:
+            return _onvif_credentials_from_rtsp(rtsp_url)
+        except Exception:
+            return None
+
+    def _handle_camera_ptz_route(self, data):
+        stream_name = data.get("streamName")
+        direction = data.get("direction")
+        if not stream_name or not direction:
+            return self._reject(400, "streamName et direction requis")
+        creds = self._camera_onvif_credentials(stream_name)
+        if not creds:
+            return self._reject(404, "Caméra inconnue")
+        ip, username, password = creds
+        try:
+            ok, detail = _onvif_ptz_move(ip, username, password, direction)
+        except Exception as e:
+            warn(f"[camera-ptz] {stream_name} ({direction}): {e}")
+            return self._ok({"ok": False, "detail": str(e)})
+        self._ok({"ok": ok, "detail": detail})
+
+    def _handle_camera_night_vision_route(self, data):
+        stream_name = data.get("streamName")
+        mode = data.get("mode")
+        if not stream_name or not mode:
+            return self._reject(400, "streamName et mode requis")
+        creds = self._camera_onvif_credentials(stream_name)
+        if not creds:
+            return self._reject(404, "Caméra inconnue")
+        ip, username, password = creds
+        try:
+            ok, detail = _onvif_set_night_vision(ip, username, password, mode)
+        except Exception as e:
+            warn(f"[camera-night-vision] {stream_name} ({mode}): {e}")
+            return self._ok({"ok": False, "detail": str(e)})
+        self._ok({"ok": ok, "detail": detail})
 
     def _handle_sync_now(self, data):
         """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
