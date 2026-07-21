@@ -3873,15 +3873,57 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
     return results
 
 
-# ── Capacités caméra (PTZ, audio bidirectionnel) — pré-remplissage, jamais activation
-# automatique : le matériel grand public annonce parfois des capacités ONVIF qu'il ne
-# supporte pas réellement (cf. lib/cameras/capabilities.ts côté web), donc ceci ne fait
-# que pré-cocher des cases dans le formulaire d'ajout — l'installateur confirme.
+# ── Capacités caméra (PTZ, audio bidirectionnel, sortie relais) — pré-remplissage,
+# jamais activation automatique : le matériel grand public annonce parfois des
+# capacités ONVIF qu'il ne supporte pas réellement (cf. lib/cameras/capabilities.ts
+# côté web), donc ceci ne fait que pré-cocher des cases dans le formulaire d'ajout —
+# l'installateur confirme.
+
+def _onvif_deviceio_xaddr(device_xaddr: str, timeout: float = 3.0) -> str:
+    """Localise le service DeviceIO (sorties relais — souvent câblées sur une sirène ou
+    un projecteur côté matériel grand public) via GetServices : contrairement à
+    PTZ/Media/Imaging, DeviceIO n'est pas une "Category" du GetCapabilities catégorisé
+    ci-dessous, il faut la liste complète des services exposés par la caméra."""
+    try:
+        xml = _onvif_soap(
+            device_xaddr,
+            '<tds:GetServices xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+            '<tds:IncludeCapability>false</tds:IncludeCapability>'
+            '</tds:GetServices>',
+            timeout=timeout,
+        )
+    except Exception:
+        return ''
+    for xa in _xml_all(xml, 'XAddr'):
+        if 'deviceio' in xa.lower():
+            return xa
+    return ''
+
+
+def _onvif_has_relay_output(device_xaddr: str, timeout: float = 3.0) -> bool:
+    """True si la caméra expose au moins une sortie relais ONVIF pilotable. Pas de
+    service ONVIF standard "Sirène" — DeviceIO/RelayOutput est le seul mécanisme
+    générique, et rien ne dit qu'il est câblé sur une sirène plutôt qu'un projecteur
+    ou une gâche électrique : signal best-effort, pas une garantie de sémantique."""
+    deviceio_xaddr = _onvif_deviceio_xaddr(device_xaddr, timeout=timeout)
+    if not deviceio_xaddr:
+        return False
+    try:
+        xml = _onvif_soap(
+            deviceio_xaddr,
+            '<tmd:GetRelayOutputs xmlns:tmd="http://www.onvif.org/ver10/deviceIO/wsdl"/>',
+            timeout=timeout,
+        )
+    except Exception:
+        return False
+    return bool(_xml_attr(xml, 'RelayOutputs', 'token'))
+
 
 def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> list:
-    """Détecte PTZ/zoom (service PTZ présent dans GetCapabilities) et talk/speaker
-    (AudioOutputConfiguration dans un profil média) à partir d'un device_service ONVIF
-    déjà connu. Best-effort : liste vide si la caméra ne répond pas ou n'expose rien."""
+    """Détecte PTZ/zoom (service PTZ présent dans GetCapabilities), talk/speaker
+    (AudioOutputConfiguration dans un profil média) et siren (sortie relais DeviceIO)
+    à partir d'un device_service ONVIF déjà connu. Best-effort : liste vide si la
+    caméra ne répond pas ou n'expose rien."""
     caps = set()
     try:
         xml = _onvif_soap(
@@ -3913,6 +3955,9 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
                 caps.add('speaker')
         except Exception:
             pass
+
+    if _onvif_has_relay_output(device_xaddr, timeout=timeout):
+        caps.add('siren')
 
     return sorted(caps)
 
@@ -3982,6 +4027,15 @@ def _onvif_locate_services(ip: str, timeout: float = 3.0) -> dict:
     except Exception:
         services['video_source_token'] = ''
 
+    services['deviceio_xaddr'] = _onvif_deviceio_xaddr(device_xaddr, timeout=timeout)
+    services['relay_token'] = ''
+    if services['deviceio_xaddr']:
+        try:
+            rxml = _onvif_soap(services['deviceio_xaddr'], '<tmd:GetRelayOutputs xmlns:tmd="http://www.onvif.org/ver10/deviceIO/wsdl"/>', timeout=timeout)
+            services['relay_token'] = _xml_attr(rxml, 'RelayOutputs', 'token')
+        except Exception:
+            pass
+
     return services
 
 
@@ -4047,6 +4101,29 @@ def _onvif_set_night_vision(ip: str, username: str, password: str, mode: str) ->
     return True, 'ok'
 
 
+def _onvif_set_relay_output(ip: str, username: str, password: str, active: bool) -> tuple:
+    """Active/désactive la première sortie relais ONVIF trouvée. Pas de service ONVIF
+    standard "Sirène" : DeviceIO/RelayOutput est le seul mécanisme générique, câblé côté
+    matériel sur une sirène, un projecteur ou une gâche selon le modèle — la capacité
+    'siren' déclarée par l'installateur (cf. lib/cameras/capabilities.ts) porte la
+    sémantique, cette fonction ne fait qu'actionner le relais détecté."""
+    services = _onvif_locate_services(ip)
+    if not services.get('deviceio_xaddr') or not services.get('relay_token'):
+        return False, "Cette caméra ne propose pas de sortie relais (sirène) en ONVIF"
+    header = _onvif_ws_security_header(username, password)
+    state = 'active' if active else 'inactive'
+    body = (
+        '<tmd:SetRelayOutputState xmlns:tmd="http://www.onvif.org/ver10/deviceIO/wsdl">'
+        f'<tmd:RelayOutputToken>{services["relay_token"]}</tmd:RelayOutputToken>'
+        f'<tmd:LogicalState>{state}</tmd:LogicalState>'
+        '</tmd:SetRelayOutputState>'
+    )
+    xml = _onvif_soap(services['deviceio_xaddr'], body, header=header)
+    if 'Fault' in xml:
+        return False, _xml_text(xml, 'Text') or 'La caméra a refusé la commande sirène'
+    return True, 'ok'
+
+
 class _CommandHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log(f"[cmd-server] {self.address_string()} — {fmt % args}")
@@ -4093,6 +4170,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/camera/test":          self._handle_camera_test_route,
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/camera/night-vision":  self._handle_camera_night_vision_route,
+                "/camera/siren":         self._handle_camera_siren_route,
                 "/sync-now":             self._handle_sync_now,
             }
             handler = handlers.get(route)
@@ -4240,6 +4318,22 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             ok, detail = _onvif_set_night_vision(ip, username, password, mode)
         except Exception as e:
             warn(f"[camera-night-vision] {stream_name} ({mode}): {e}")
+            return self._ok({"ok": False, "detail": str(e)})
+        self._ok({"ok": ok, "detail": detail})
+
+    def _handle_camera_siren_route(self, data):
+        stream_name = data.get("streamName")
+        active = data.get("active")
+        if not stream_name or active is None:
+            return self._reject(400, "streamName et active requis")
+        creds = self._camera_onvif_credentials(stream_name)
+        if not creds:
+            return self._reject(404, "Caméra inconnue")
+        ip, username, password = creds
+        try:
+            ok, detail = _onvif_set_relay_output(ip, username, password, bool(active))
+        except Exception as e:
+            warn(f"[camera-siren] {stream_name}: {e}")
             return self._ok({"ok": False, "detail": str(e)})
         self._ok({"ok": ok, "detail": detail})
 
