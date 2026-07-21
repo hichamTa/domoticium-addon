@@ -3528,6 +3528,13 @@ def _xml_attr(text: str, tag: str, attr: str) -> str:
     return m.group(1) if m else ''
 
 
+def _xml_has_tag(text: str, tag: str) -> bool:
+    """True si un élément de ce nom local existe (avec ou sans enfants — contrairement
+    à _xml_text/_xml_all qui exigent du texte direct, utile pour des sections comme
+    <tt:PTZ><tt:XAddr>...</tt:XAddr></tt:PTZ> qui n'ont pas de texte propre)."""
+    return re.search(r'<(?:[^:>\s]+:)?' + re.escape(tag) + r'(?:[\s/>])', text) is not None
+
+
 # ── Découverte ONVIF ─────────────────────────────────────────────────────────
 
 _WS_DISCOVER_ADDR = "239.255.255.250"
@@ -3785,9 +3792,74 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
             'model':        model,
             'name':         (f'{manufacturer} {model}'.strip()) or f'Caméra {ip}',
             'rtspUrl':      rtsp_url,
+            'capabilities': _onvif_capabilities_from_xaddr(xaddr),
         })
     log(f'[onvif-scan] {len(results)} caméra(s) ONVIF confirmée(s) sur {len(xaddrs)} IP(s) scannée(s)')
     return results
+
+
+# ── Capacités caméra (PTZ, audio bidirectionnel) — pré-remplissage, jamais activation
+# automatique : le matériel grand public annonce parfois des capacités ONVIF qu'il ne
+# supporte pas réellement (cf. lib/cameras/capabilities.ts côté web), donc ceci ne fait
+# que pré-cocher des cases dans le formulaire d'ajout — l'installateur confirme.
+
+def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> list:
+    """Détecte PTZ/zoom (service PTZ présent dans GetCapabilities) et talk/speaker
+    (AudioOutputConfiguration dans un profil média) à partir d'un device_service ONVIF
+    déjà connu. Best-effort : liste vide si la caméra ne répond pas ou n'expose rien."""
+    caps = set()
+    try:
+        xml = _onvif_soap(
+            device_xaddr,
+            '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
+            timeout=timeout,
+        )
+    except Exception:
+        return []
+
+    if _xml_has_tag(xml, 'PTZ'):
+        caps.add('ptz')
+        caps.add('zoom')
+
+    media_url = ''
+    for xa in _xml_all(xml, 'XAddr'):
+        if xa.startswith('http') and 'media' in xa.lower():
+            media_url = xa
+            break
+    if media_url:
+        try:
+            pxml = _onvif_soap(
+                media_url,
+                '<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>',
+                timeout=timeout,
+            )
+            if _xml_has_tag(pxml, 'AudioOutputConfiguration'):
+                caps.add('talk')
+                caps.add('speaker')
+        except Exception:
+            pass
+
+    return sorted(caps)
+
+
+def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0) -> list:
+    """Variante pour l'ajout manuel (IP connue, device_service ONVIF pas encore
+    localisé) — essaie les ports ONVIF courants avant d'abandonner silencieusement."""
+    for port in (8000, 80):
+        caps = _onvif_capabilities_from_xaddr(f'http://{ip}:{port}/onvif/device_service', timeout=timeout)
+        if caps:
+            return caps
+    return []
+
+
+def _safe_probe_capabilities(ip: str) -> list:
+    """Ne doit jamais faire échouer le test de connexion caméra (résultat principal)
+    si la sonde ONVIF de capacités plante ou traîne — pure best-effort."""
+    try:
+        return _probe_onvif_capabilities_by_ip(ip)
+    except Exception as e:
+        warn(f'[onvif-capabilities] {ip}: {e}')
+        return []
 
 
 class _CommandHandler(http.server.BaseHTTPRequestHandler):
@@ -3929,7 +4001,9 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         if rtsp_url:
             # Mode "URL manuelle" — l'utilisateur a fourni l'URL exacte, aucune devinette.
             ok, detail = _go2rtc_test_stream(rtsp_url)
-            return self._ok({"ok": ok, "detail": detail, "correctedUrl": None})
+            ip_m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', rtsp_url)
+            caps = _safe_probe_capabilities(ip_m.group(1)) if ip_m else []
+            return self._ok({"ok": ok, "detail": detail, "correctedUrl": None, "detectedCapabilities": caps})
 
         ip = data.get("ip")
         password = data.get("password")
@@ -3937,7 +4011,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             return self._reject(400, "ip et password requis (ou rtspUrl)")
         manufacturer = data.get("manufacturer") or ""
         ok, detail, url = _test_camera_by_brand(ip, password, manufacturer)
-        self._ok({"ok": ok, "detail": detail, "correctedUrl": url})
+        self._ok({"ok": ok, "detail": detail, "correctedUrl": url, "detectedCapabilities": _safe_probe_capabilities(ip)})
 
     def _handle_sync_now(self, data):
         """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
