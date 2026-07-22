@@ -91,8 +91,17 @@ Z2M_REPO       = "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt"
 Z2M_SLUG       = "45df7312_zigbee2mqtt"
 MATTER_SLUG    = "core_matter_server"
 THREAD_SLUG    = "core_openthread_border_router"
-FRIGATE_REPO   = "https://github.com/blakeblackshear/frigate-hass-addons"
-FRIGATE_SLUG   = "ccab4aaf_frigate"
+FRIGATE_REPO   = "https://github.com/hichamTa/frigate-hass-addons"
+FRIGATE_SLUG   = "582436be_frigate"
+# Ancien dépôt Frigate (officiel, upstream) — Frigate n'y lit JAMAIS notre frigate.yml
+# (CONFIG_FILE non défini dans son config.yaml, donc find_config_file() résout vers son
+# stockage privé addon_config, jamais /homeassistant/frigate.yml — confirmé en réel le
+# 2026-07-22, cf. HANDOFF §55). Notre fork (repo ci-dessus) ajoute juste CONFIG_FILE:
+# /homeassistant/frigate.yml à la config officielle de l'add-on, rien d'autre — même
+# image Docker, mêmes options. Le slug d'un add-on HA dépend d'un hash de l'URL du
+# dépôt (sha1(url)[:8] + "_" + slug interne) : changer de dépôt change donc le slug
+# installé, d'où la migration one-shot ci-dessous (_migrate_frigate_repo_once).
+OLD_FRIGATE_SLUG = "ccab4aaf_frigate"
 MOSQUITTO_SLUG = "core_mosquitto"
 MOSQUITTO_USER = "domoticium"
 
@@ -870,8 +879,27 @@ def _configure_frigate_and_start() -> bool:
     return True
 
 
+def _migrate_frigate_repo_once():
+    """Migration one-shot : bascule de l'add-on Frigate officiel (dépôt upstream, slug
+    OLD_FRIGATE_SLUG) vers notre fork (FRIGATE_REPO/FRIGATE_SLUG, cf. commentaire à leur
+    définition) — nécessaire pour que Frigate lise enfin /homeassistant/frigate.yml.
+    Désinstalle l'ancien avec remove_config=True : sa config privée ne nous sert à rien
+    (jamais synchronisée avec la nôtre) et ne doit pas laisser de résidu. Rien de notre
+    propre état n'est perdu : caméras/capacités/scènes vivent dans Supabase et nos
+    fichiers /data/, jamais dans Frigate lui-même. install_frigate() enchaîne ensuite
+    normalement (nouveau dépôt pas encore ajouté → ajouté, pas installé → installé)."""
+    if not _is_addon_installed(OLD_FRIGATE_SLUG):
+        return
+    log(f"[frigate] Migration vers le fork Domoticium — désinstallation de l'ancien Frigate ({OLD_FRIGATE_SLUG})…")
+    r = sup_post(f"/addons/{OLD_FRIGATE_SLUG}/uninstall", {"remove_config": True}, timeout=120)
+    log(f"[frigate] Désinstallation ancien Frigate → {r.status_code} {r.text[:150]}")
+    time.sleep(10)
+
+
 def install_frigate():
     log("── Frigate NVR ──────────────────────────────")
+
+    _migrate_frigate_repo_once()
 
     # 1. Nettoyer un go2rtc.yml résiduel de l'ancienne architecture standalone
     old_go2rtc = "/homeassistant/go2rtc.yml"
@@ -1031,24 +1059,24 @@ def _webrtc_config_yaml_lines() -> list[str]:
 def _generate_frigate_yaml() -> str:
     """Génère le YAML complet de config Frigate depuis le registre des caméras.
 
-    ⚠️ Ce fichier n'est en réalité JAMAIS lu par Frigate — confirmé le 2026-07-22 :
-    l'add-on Frigate (config.yaml officiel sur GitHub) ne définit pas de variable
-    d'environnement CONFIG_FILE, donc find_config_file() (côté Frigate) résout
-    systématiquement vers /config/config.yml, qui pointe sur le stockage privé PROPRE
-    À L'ADD-ON FRIGATE (map addon_config), jamais vers /homeassistant/frigate.yml —
-    deux fichiers physiquement différents, jamais connectés. Ce qui fonctionne
-    aujourd'hui (flux vidéo, webrtc) passe par des mécanismes qui ne dépendent PAS de
-    ce fichier (API go2rtc, cf. _ensure_go2rtc_webrtc_persisted/_resync_go2rtc_streams).
-    Ne plus y ajouter de réglage dont Frigate aurait besoin de prendre connaissance
-    (ex: mqtt.enabled, onvif par caméra — tenté en v2.9.1-v2.9.7, abandonné, cf.
-    _onvif_ptz_move) : ça ne serait jamais appliqué. Conservé pour le moment
-    uniquement pour la partie go2rtc (streams/webrtc), déjà de toute façon persistée
-    séparément via API — simple redondance, pas une dépendance active."""
+    Jusqu'au 2026-07-22, ce fichier n'était en réalité JAMAIS lu par Frigate : l'add-on
+    officiel ne définit pas CONFIG_FILE, donc find_config_file() (côté Frigate) résolvait
+    vers son stockage privé (/config/config.yml), jamais vers /homeassistant/frigate.yml.
+    Corrigé en migrant vers notre propre fork de l'add-on (cf. FRIGATE_REPO/FRIGATE_SLUG
+    et _migrate_frigate_repo_once) qui ajoute CONFIG_FILE=/homeassistant/frigate.yml à la
+    config officielle — Frigate lit désormais réellement ce fichier. mqtt/onvif ci-dessous
+    ne sont donc plus des réglages morts (cf. HANDOFF §55/§56)."""
     lines = [
         "# Généré par Domoticium — ne pas modifier manuellement",
         'version: "0.18-0"',
         "auth:",
         "  enabled: false",
+        "mqtt:",
+        "  enabled: true",
+        "  host: core-mosquitto",
+        "  port: 1883",
+        f'  user: "{MOSQUITTO_USER}"',
+        f'  password: "{MOSQUITTO_PASS}"',
         "",
     ]
 
@@ -1080,6 +1108,22 @@ def _generate_frigate_yaml() -> str:
                 "    record:",
                 "      enabled: false",
             ]
+            # Identifiants ONVIF réutilisés depuis l'URL RTSP déjà stockée (même
+            # hypothèse qu'ailleurs dans le fichier : matériel grand public utilise
+            # en général les mêmes identifiants pour RTSP et ONVIF). Port par défaut
+            # Frigate (8000) — pas de champ dédié pour un port ONVIF différent par
+            # caméra, cohérent avec le premier port essayé par notre propre sonde.
+            try:
+                onvif_ip, onvif_user, onvif_pass = _onvif_credentials_from_rtsp(rtsp_url)
+            except Exception:
+                onvif_ip = ""
+            if onvif_ip:
+                lines += [
+                    "    onvif:",
+                    f'      host: "{onvif_ip}"',
+                    f'      user: "{onvif_user}"',
+                    f'      password: "{onvif_pass}"',
+                ]
     else:
         lines.append("cameras: {}")
 
