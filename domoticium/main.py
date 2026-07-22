@@ -1172,12 +1172,26 @@ def _webrtc_config_yaml_lines() -> list[str]:
         "      networks: [udp4, tcp4]",
         "    ice_servers:",
     ]
+    # urls en style bloc (une entrée par ligne), PAS en style flow ("[url1, url2]")
+    # — cause réelle de la corruption YAML observée au boot de go2rtc (cf. HANDOFF
+    # §66) : create_config.py (script Frigate qui régénère /dev/shm/go2rtc.yaml)
+    # charge notre frigate.yml puis le réécrit via ruamel.yaml, qui replie
+    # automatiquement (largeur par défaut 80 caractères) toute liste flow-style trop
+    # longue sur plusieurs lignes avec un format que le parseur YAML de Go (go2rtc)
+    # rejette ("did not find expected ',' or ']'") — reproduit et confirmé en local.
+    # N'apparaissait qu'avec un vrai serveur TURN (4 URLs, ligne > 80 caractères),
+    # jamais avec le simple repli STUN (1 URL courte) : d'où le caractère
+    # intermittent du bug qui a fait échouer toutes les tentatives précédentes basées
+    # sur l'hypothèse d'un problème d'écriture/timing plutôt que de formatage.
+    # Le style bloc place naturellement chaque URL sur sa propre ligne, quelle que
+    # soit sa longueur — ruamel n'a alors jamais besoin de replier quoi que ce soit.
     for server in (_turn_ice_servers or [{"urls": ["stun:stun.cloudflare.com:3478"]}]):
         urls = server.get("urls", [])
         if isinstance(urls, str):
             urls = [urls]
-        urls_str = ", ".join(f'"{u}"' for u in urls)
-        lines.append(f"      - urls: [{urls_str}]")
+        lines.append("      - urls:")
+        for u in urls:
+            lines.append(f'          - "{u}"')
         if server.get("username"):
             lines.append(f"        username: \"{server['username']}\"")
         if server.get("credential"):
