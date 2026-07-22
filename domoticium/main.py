@@ -3675,17 +3675,9 @@ def _ensure_matter_ble_proxy():
 
 def _go2rtc_stream_already_persisted(name: str, rtsp_url: str) -> bool:
     """Vérifie si le flux '{name}' est déjà enregistré côté go2rtc avec cette source,
-    via l'API JSON structurée (GET /api/streams) plutôt qu'un regex sur le YAML brut
-    du fichier de config — cf. _resync_go2rtc_streams pour le contexte (éviter de
-    déclencher PUT /api/streams, donc son écriture disque fragile, quand ce n'est pas
-    nécessaire). Une 1ère version (v2.9.15) comparait le texte YAML renvoyé par
-    GET /api/config, mais la corruption a persisté en conditions réelles le 2026-07-22
-    — signe que ce regex ne matchait pas le format réel écrit par go2rtc (jamais
-    vérifié en direct, hypothèse sur l'indentation). L'API /api/streams est structurée
-    (JSON, `{name: {producers: [{"url": ...}], ...}}`, cf. code source
-    internal/streams/stream.go MarshalJSON/producer.go) — comparaison fiable, aucune
-    hypothèse de formatage. Best-effort : toute erreur renvoie False (on retente le
-    PUT, comportement d'avant ce fix, jamais pire)."""
+    via l'API JSON structurée (GET /api/streams, `{name: {producers: [{"url": ...}]}}`,
+    cf. code source internal/streams/stream.go MarshalJSON/producer.go). Best-effort :
+    toute erreur renvoie False (traité comme "pas encore synchronisé" par l'appelant)."""
     try:
         r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
         if not r.ok:
@@ -3700,38 +3692,40 @@ def _go2rtc_stream_already_persisted(name: str, rtsp_url: str) -> bool:
 
 
 def _resync_go2rtc_streams():
-    """Repousse chaque caméra suivie (_cameras) vers go2rtc via l'API à chaud (PUT
-    /api/streams). Nécessaire après TOUT (re)démarrage de Frigate : le prepare script
-    de Frigate ne recopie /homeassistant/frigate.yml vers sa config privée QUE si
-    celle-ci est absente (1er démarrage seulement) — jamais ensuite, y compris sur un
-    simple restart de l'add-on. go2rtc (embarqué dans Frigate) repart donc avec le
-    registre de flux de cette config privée, potentiellement périmée (vide, ou
-    obsolète) — alors que notre suivi interne (_cameras/cameras.json) dit toujours "la
-    caméra existe". La réconciliation périodique (_reconcile_cameras) ne détecte
-    jamais cet écart puisqu'elle ne compare qu'à notre propre bookkeeping, pas à
-    l'état réel de go2rtc — d'où une caméra qui reste invisible/hors-service après un
-    redémarrage, sans que rien ne se corrige tout seul, jusqu'à ce fix.
+    """Vérifie que chaque caméra suivie (_cameras) est bien enregistrée côté go2rtc ;
+    sinon redémarre Frigate pour forcer une régénération propre depuis notre vraie
+    config, plutôt que d'écrire à chaud dans /config/go2rtc_homekit.yml.
 
-    ⚠️ PUT /api/streams applique en interne le MÊME mécanisme de patch texte fragile
-    que celui retiré en §58/v2.9.12 pour webrtc (`app.PatchConfig` côté go2rtc, cf.
-    internal/streams/api.go — vérifié dans le code source) : un découpage par ligne
-    recalculé à chaque appel sur le même fichier "primaire". Appelée sans condition à
-    CHAQUE démarrage de l'addon pour CHAQUE caméra, cette fonction était en réalité la
-    vraie source de la corruption YAML récurrente observée (§58/§59), pas le
-    mécanisme webrtc déjà retiré — confirmé le 2026-07-22 : la corruption persistait
-    (ligne 13 au lieu de ligne 11) et a même fini par recasser le bind webrtc lui-même
-    un cycle plus tard. D'où la vérification via _go2rtc_stream_already_persisted()
-    ci-dessous : ne PATCHer que si la valeur n'est pas déjà la bonne, au lieu de
-    marteler l'API à chaque boot même quand rien n'a changé."""
+    Nécessaire après un redémarrage go2rtc : le prepare script de Frigate ne recopie
+    /homeassistant/frigate.yml vers sa config privée QUE si celle-ci est absente (1er
+    démarrage seulement) — jamais ensuite. go2rtc peut donc repartir avec un registre
+    de flux périmé par rapport à notre suivi interne (_cameras/cameras.json).
+
+    ⚠️ NE PLUS UTILISER PUT /api/streams ici (cf. HANDOFF §63) — cause réelle,
+    confirmée en lisant le VRAI fichier /config/go2rtc_homekit.yml puis le script
+    officiel de Frigate (docker/main/rootfs/etc/s6-overlay/s6-rc.d/go2rtc/run,
+    fonction setup_homekit_config()) : ce fichier est réservé par Frigate à SA PROPRE
+    fonctionnalité HomeKit — à CHAQUE démarrage de go2rtc, AVANT même que go2rtc ne
+    lise le fichier, ce script convertit son contenu en JSON et, s'il ne trouve pas de
+    clé "homekit", VIDE ENTIÈREMENT LE FICHIER (`: > "${config_path}"`). Tout ce que
+    PUT /api/streams y avait persisté (via app.PatchConfig côté go2rtc) est donc
+    systématiquement détruit au redémarrage suivant — expliquant pourquoi 3 tentatives
+    successives (§58/§59/§60/§62, dont une vérifiée contre l'API JSON structurée de
+    go2rtc) n'ont jamais tenu au-delà du tout premier boot après un reset : le
+    problème n'a jamais été LA FRÉQUENCE de nos écritures, mais leur EXISTENCE MÊME
+    dans ce fichier précis, qui n'est simplement pas fait pour ça. Le seul mécanisme
+    fiable reste celui déjà vérifié à plusieurs reprises cette session : notre vrai
+    frigate.yml → config privée Frigate (une fois, cf. §57) → /dev/shm/go2rtc.yaml
+    régénéré PROPREMENT à CHAQUE démarrage du conteneur — jamais touché par le script
+    HomeKit (fichier différent). D'où : un redémarrage complet plutôt qu'un patch à
+    chaud dès qu'un écart est détecté."""
     if not _cameras:
         return
-    for name, rtsp_url in _cameras.items():
-        if _go2rtc_stream_already_persisted(name, rtsp_url):
-            continue
-        if _go2rtc_upsert_stream(name, rtsp_url):
-            log(f"[frigate] ✓ Flux go2rtc resynchronisé : '{name}'")
-        else:
-            warn(f"[frigate] Échec resynchronisation go2rtc : '{name}'")
+    missing = [name for name, url in _cameras.items() if not _go2rtc_stream_already_persisted(name, url)]
+    if not missing:
+        return
+    log(f"[frigate] Caméra(s) absente(s) de go2rtc ({', '.join(missing)}) — redémarrage pour resynchroniser…")
+    restart_frigate()
 
 
 _GO2RTC_API_ORIGIN_FIX_V3_MARKER = "/data/.go2rtc_api_origin_fixed_v3"
