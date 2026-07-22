@@ -1896,9 +1896,20 @@ def _reconcile_cameras(app_cameras: list):
 def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None, has_talk: bool = False) -> bool:
     """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
     Entièrement bloquant, de bout en bout — la réponse HTTP appelante ne doit dire 'ok'
-    que si le travail a réellement été fait (go2rtc à chaud OU restart complet, +
-    nettoyage HA à la suppression), jamais avant qu'une tâche de fond ait fini. Retourne
-    True si l'opération a effectivement abouti."""
+    que si le travail a réellement été fait (restart complet, + nettoyage HA à la
+    suppression), jamais avant qu'une tâche de fond ait fini. Retourne True si
+    l'opération a effectivement abouti.
+
+    Toujours un restart complet, plus de PUT/DELETE /api/streams (upsert/remove à chaud)
+    — cf. HANDOFF §63/§64 : ces deux endpoints écrivent, via app.PatchConfig côté
+    go2rtc, dans /config/go2rtc_homekit.yml, un fichier réservé par Frigate à sa propre
+    fonctionnalité HomeKit. Pire que juste inutile : la corruption qui en résulte s'est
+    révélée AUTO-PERPÉTUANTE — une fois le fichier malformé, le script de nettoyage
+    HomeKit de Frigate lui-même échoue à le reparser (même erreur YAML) et abandonne
+    sans y toucher, donc rien ne le corrige jamais tout seul, jusqu'à une réinstallation
+    complète. Un restart (quelques secondes, plutôt qu'un ajout instantané) est le
+    prix à payer pour ne plus jamais risquer de recasser toutes les caméras du site
+    pour l'ajout ou la suppression d'une seule."""
     if action == "add":
         if not rtsp_url:
             raise ValueError("rtspUrl manquant")
@@ -1910,14 +1921,6 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
             _camera_talk_enabled.discard(stream_name)
         _save_camera_talk()
         write_frigate_config()
-        # backchannel audio (cf. _generate_frigate_yaml) change le nombre de sources
-        # go2rtc du stream — l'upsert à chaud ne gère qu'une source, donc on force un
-        # restart complet dans ce cas plutôt qu'un upsert partiel potentiellement bancal.
-        if not has_talk and _go2rtc_upsert_stream(stream_name, rtsp_url):
-            log(f"✓ Caméra add (à chaud, go2rtc) : '{stream_name}'")
-            return True
-        if not has_talk:
-            warn(f"[go2rtc] upsert à chaud échoué pour '{stream_name}' — restart Frigate en secours")
     elif action == "remove":
         _cameras.pop(stream_name, None)
         _camera_talk_enabled.discard(stream_name)
@@ -1925,10 +1928,6 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
         _save_camera_talk()
         write_frigate_config()
         _ha_remove_camera_entities(stream_name)  # bloquant — cf. docstring
-        if _go2rtc_remove_stream(stream_name):
-            log(f"✓ Caméra remove (à chaud, go2rtc) : '{stream_name}'")
-            return True
-        warn(f"[go2rtc] remove à chaud échoué pour '{stream_name}' — restart Frigate en secours")
     else:
         raise ValueError(f"action inconnue: {action!r}")
 
@@ -3728,26 +3727,26 @@ def _resync_go2rtc_streams():
     restart_frigate()
 
 
-_GO2RTC_API_ORIGIN_FIX_V3_MARKER = "/data/.go2rtc_api_origin_fixed_v3"
+_GO2RTC_API_ORIGIN_FIX_V4_MARKER = "/data/.go2rtc_api_origin_fixed_v4"
 
 
 def _fix_go2rtc_api_origin_once():
     """Réinstalle Frigate proprement pour repartir d'un fichier de config "primaire"
-    go2rtc vierge, ET applique go2rtc.api.origin: "*" (ajouté à _generate_frigate_yaml
-    le 2026-07-22, cf. HANDOFF §59).
+    go2rtc (/config/go2rtc_homekit.yml) vierge.
 
-    v3 de ce correctif. v1 (marker _fixed) : simple restart, insuffisant (fichier déjà
-    corrompu, un restart ne le vide pas). v2 (marker _fixed_v2) : reinstall complet +
-    _resync_go2rtc_streams() rendue idempotente via un regex sur le YAML brut
-    (GET /api/config) — corruption ET rejet WebSocket TOUS DEUX revenus en conditions
-    réelles le 2026-07-22 après une mise à jour ultérieure, preuve que ce regex ne
-    matchait pas le format réellement écrit par go2rtc (jamais vérifié en direct,
-    juste une hypothèse sur l'indentation). _go2rtc_stream_already_persisted()
-    réécrite pour utiliser l'API JSON structurée (GET /api/streams) à la place —
-    comparaison fiable, plus d'hypothèse de formatage. Nouveau marker (suffixe _v3)
-    pour retrigger un dernier reset propre sur les sites déjà pollués. One-shot —
-    nouvelles installations : rien à corriger, jamais soumises à l'ancien comportement
-    non-idempotent.
+    v4 de ce correctif. v1-v3 (markers _fixed/_v2/_v3) : chaque version rendait nos
+    écritures dans ce fichier plus "sûres" (idempotence, API JSON plutôt que regex) —
+    mais confirmé en conditions réelles le 2026-07-22 (§63/§64) : la vraie cause
+    n'était pas la fiabilité de NOS écritures, c'est que ce fichier appartient à la
+    fonctionnalité HomeKit de Frigate, jamais censé recevoir nos streams — et qu'une
+    fois corrompu, le script de nettoyage HomeKit de Frigate lui-même échoue à le
+    reparser et abandonne SANS le corriger, rendant la corruption auto-perpétuante
+    boot après boot tant que rien ne réinitialise le fichier. §64 retire pour de bon
+    tout appel à PUT/DELETE /api/streams (ajout/suppression de caméra basculés sur un
+    restart complet, cf. handle_camera_configure) — plus aucun code ne devrait plus
+    jamais écrire dans ce fichier. Ce reset (nouveau marker _v4) nettoie la corruption
+    déjà accumulée par les versions précédentes ; ensuite, plus rien ne devrait la
+    recréer. One-shot — nouvelles installations : rien à corriger.
 
     Appelée depuis _ensure_frigate() APRÈS la branche d'état (donc potentiellement sur
     un Frigate jugé "opérationnel" à cet instant précis) — sans réinstallation
@@ -3756,15 +3755,15 @@ def _fix_go2rtc_api_origin_once():
     branches "absent"/"error", jamais dans la branche "tout va bien"). D'où l'appel
     direct à install_frigate() ci-dessous plutôt que de compter sur le tour de
     boucle suivant."""
-    if os.path.exists(_GO2RTC_API_ORIGIN_FIX_V3_MARKER):
+    if os.path.exists(_GO2RTC_API_ORIGIN_FIX_V4_MARKER):
         return
     if _is_addon_installed(FRIGATE_SLUG):
-        log("[frigate] Reset du fichier de config primaire go2rtc (corruption résiduelle, cf. HANDOFF §62) — réinstallation propre…")
+        log("[frigate] Reset du fichier de config primaire go2rtc (corruption résiduelle auto-perpétuante, cf. HANDOFF §64) — réinstallation propre…")
         r = sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", {"remove_config": True}, timeout=120)
-        log(f"[frigate] Désinstallation (reset config primaire go2rtc v3) → {r.status_code} {r.text[:150]}")
+        log(f"[frigate] Désinstallation (reset config primaire go2rtc v4) → {r.status_code} {r.text[:150]}")
         time.sleep(10)
         install_frigate()
-    open(_GO2RTC_API_ORIGIN_FIX_V3_MARKER, "w").close()
+    open(_GO2RTC_API_ORIGIN_FIX_V4_MARKER, "w").close()
 
 
 def _ensure_frigate():
