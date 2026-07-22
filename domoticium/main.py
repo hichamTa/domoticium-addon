@@ -3539,6 +3539,58 @@ def _resync_go2rtc_streams():
             warn(f"[frigate] Échec resynchronisation go2rtc : '{name}'")
 
 
+_WEBRTC_PERSISTED_MARKER = "/data/.webrtc_persisted"
+
+
+def _ensure_go2rtc_webrtc_persisted():
+    """Même mécanisme que _resync_go2rtc_streams() ci-dessus, appliqué à la section
+    webrtc plutôt qu'aux flux : go2rtc redémarre avec la config "primaire" persistée
+    (/config/go2rtc_homekit.yml côté Frigate), pas avec celle régénérée depuis notre
+    frigate.yml — confirmé en conditions réelles le 2026-07-22 (l'éditeur de config
+    Frigate ne montre ni auth, ni go2rtc, ni caméras alors que tout fonctionne par
+    ailleurs ; le bind WebRTC échoue de façon identique malgré 3 valeurs de `listen`
+    différentes testées, preuve que le fichier régénéré n'est jamais réellement pris en
+    compte). _resync_go2rtc_streams() contourne déjà ce problème pour les flux via
+    l'API à chaud (PUT /api/streams, confirmé fiable) — même remède ici via
+    PATCH /api/config (même mécanisme interne côté go2rtc, app.PatchConfig, qui écrit
+    dans le fichier "primaire" chargé en premier). webrtc.listen n'est pas rechargeable
+    à chaud (cf. _webrtc_config_yaml_lines) : un restart Frigate est nécessaire après
+    la 1ère persistance, mais une seule fois — vérifié via GET avant tout PATCH pour ne
+    pas redémarrer Frigate à chaque démarrage de l'addon une fois la config en place."""
+    if os.path.exists(_WEBRTC_PERSISTED_MARKER):
+        return
+    try:
+        r = requests.get("http://127.0.0.1:1984/api/config", timeout=5)
+        if not r.ok:
+            return
+        if re.search(r'^\s*webrtc\s*:', r.text, re.MULTILINE):
+            open(_WEBRTC_PERSISTED_MARKER, "w").close()
+            return
+
+        local_ip = _local_ipv4()
+        listen_addr = f"{local_ip}:8555" if local_ip else "0.0.0.0:8555"
+        patch_yaml = (
+            "webrtc:\n"
+            f'  listen: "{listen_addr}"\n'
+            "  filters:\n"
+            "    networks: [udp4, tcp4]\n"
+        )
+        r = requests.patch(
+            "http://127.0.0.1:1984/api/config",
+            data=patch_yaml.encode(),
+            headers={"Content-Type": "application/yaml"},
+            timeout=5,
+        )
+        if r.ok:
+            log("[webrtc] Config webrtc persistée côté go2rtc (fichier primaire) — restart Frigate pour l'appliquer")
+            open(_WEBRTC_PERSISTED_MARKER, "w").close()
+            restart_frigate()
+        else:
+            warn(f"[webrtc] Échec persistance config webrtc : HTTP {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        warn(f"[webrtc] Persistance config webrtc : {e}")
+
+
 def _ensure_frigate():
     """Installe et démarre Frigate + go2rtc s'ils sont absents ou arrêtés.
     Appelé en thread de fond au démarrage du bridge — permet de lancer Frigate
@@ -3565,6 +3617,7 @@ def _ensure_frigate():
                 log("[frigate] ✓ Frigate et go2rtc opérationnels")
                 threading.Thread(target=_setup_frigate_auth_once, daemon=True).start()
             _resync_go2rtc_streams()
+            _ensure_go2rtc_webrtc_persisted()
             return  # succès
         except Exception as e:
             warn(f"[frigate] _ensure_frigate tentative {attempt}/5 : {e}")
