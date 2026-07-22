@@ -3674,16 +3674,27 @@ def _ensure_matter_ble_proxy():
 
 
 def _go2rtc_stream_already_persisted(name: str, rtsp_url: str) -> bool:
-    """Vérifie si '{name}: [rtsp_url]' est déjà présent dans le fichier de config
-    "primaire" de go2rtc (GET /api/config, cf. _resync_go2rtc_streams). Best-effort :
-    une erreur réseau renvoie False (on retente le PUT, comportement d'avant ce fix,
-    jamais pire)."""
+    """Vérifie si le flux '{name}' est déjà enregistré côté go2rtc avec cette source,
+    via l'API JSON structurée (GET /api/streams) plutôt qu'un regex sur le YAML brut
+    du fichier de config — cf. _resync_go2rtc_streams pour le contexte (éviter de
+    déclencher PUT /api/streams, donc son écriture disque fragile, quand ce n'est pas
+    nécessaire). Une 1ère version (v2.9.15) comparait le texte YAML renvoyé par
+    GET /api/config, mais la corruption a persisté en conditions réelles le 2026-07-22
+    — signe que ce regex ne matchait pas le format réel écrit par go2rtc (jamais
+    vérifié en direct, hypothèse sur l'indentation). L'API /api/streams est structurée
+    (JSON, `{name: {producers: [{"url": ...}], ...}}`, cf. code source
+    internal/streams/stream.go MarshalJSON/producer.go) — comparaison fiable, aucune
+    hypothèse de formatage. Best-effort : toute erreur renvoie False (on retente le
+    PUT, comportement d'avant ce fix, jamais pire)."""
     try:
-        r = requests.get("http://127.0.0.1:1984/api/config", timeout=5)
+        r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
         if not r.ok:
             return False
-        pattern = re.compile(rf'^\s*{re.escape(name)}:\s*\n\s*-\s*{re.escape(rtsp_url)}\s*$', re.MULTILINE)
-        return bool(pattern.search(r.text))
+        stream = r.json().get(name)
+        if not stream:
+            return False
+        urls = {p.get("url") for p in (stream.get("producers") or []) if isinstance(p, dict)}
+        return rtsp_url in urls
     except Exception:
         return False
 
@@ -3723,7 +3734,7 @@ def _resync_go2rtc_streams():
             warn(f"[frigate] Échec resynchronisation go2rtc : '{name}'")
 
 
-_GO2RTC_API_ORIGIN_FIX_V2_MARKER = "/data/.go2rtc_api_origin_fixed_v2"
+_GO2RTC_API_ORIGIN_FIX_V3_MARKER = "/data/.go2rtc_api_origin_fixed_v3"
 
 
 def _fix_go2rtc_api_origin_once():
@@ -3731,20 +3742,18 @@ def _fix_go2rtc_api_origin_once():
     go2rtc vierge, ET applique go2rtc.api.origin: "*" (ajouté à _generate_frigate_yaml
     le 2026-07-22, cf. HANDOFF §59).
 
-    v2 de ce correctif : la 1ère version (marker _fixed, sans suffixe) se contentait
-    d'un restart Frigate — insuffisant, découvert en conditions réelles le 2026-07-22 :
-    le fichier primaire était DÉJÀ corrompu (YAML invalide au boot suivant, ligne 13),
-    et un simple restart ne le vide pas. Cause de cette corruption identifiée dans le
-    code source de go2rtc (`internal/streams/api.go`) : PUT /api/streams — appelé SANS
-    CONDITION à chaque boot pour chaque caméra par _resync_go2rtc_streams() — utilise
-    en interne le même mécanisme de patch texte fragile que celui déjà retiré pour
-    webrtc en §58 ; c'est lui, pas le mécanisme webrtc, la vraie source de corruption
-    récurrente. _resync_go2rtc_streams() ne patche désormais plus que si la valeur
-    n'est pas déjà correcte (cf. _go2rtc_stream_already_persisted) — mais le fichier
-    déjà corrompu par les nombreux cycles de cette session a besoin d'un reset propre
-    une dernière fois. Nouveau marker (suffixe _v2) pour retrigger sur les sites déjà
-    passés par la v1 de ce correctif. One-shot — nouvelles installations : rien à
-    corriger, jamais soumises à l'ancien comportement non-idempotent.
+    v3 de ce correctif. v1 (marker _fixed) : simple restart, insuffisant (fichier déjà
+    corrompu, un restart ne le vide pas). v2 (marker _fixed_v2) : reinstall complet +
+    _resync_go2rtc_streams() rendue idempotente via un regex sur le YAML brut
+    (GET /api/config) — corruption ET rejet WebSocket TOUS DEUX revenus en conditions
+    réelles le 2026-07-22 après une mise à jour ultérieure, preuve que ce regex ne
+    matchait pas le format réellement écrit par go2rtc (jamais vérifié en direct,
+    juste une hypothèse sur l'indentation). _go2rtc_stream_already_persisted()
+    réécrite pour utiliser l'API JSON structurée (GET /api/streams) à la place —
+    comparaison fiable, plus d'hypothèse de formatage. Nouveau marker (suffixe _v3)
+    pour retrigger un dernier reset propre sur les sites déjà pollués. One-shot —
+    nouvelles installations : rien à corriger, jamais soumises à l'ancien comportement
+    non-idempotent.
 
     Appelée depuis _ensure_frigate() APRÈS la branche d'état (donc potentiellement sur
     un Frigate jugé "opérationnel" à cet instant précis) — sans réinstallation
@@ -3753,15 +3762,15 @@ def _fix_go2rtc_api_origin_once():
     branches "absent"/"error", jamais dans la branche "tout va bien"). D'où l'appel
     direct à install_frigate() ci-dessous plutôt que de compter sur le tour de
     boucle suivant."""
-    if os.path.exists(_GO2RTC_API_ORIGIN_FIX_V2_MARKER):
+    if os.path.exists(_GO2RTC_API_ORIGIN_FIX_V3_MARKER):
         return
     if _is_addon_installed(FRIGATE_SLUG):
-        log("[frigate] Reset du fichier de config primaire go2rtc (corruption résiduelle, cf. HANDOFF §60) — réinstallation propre…")
+        log("[frigate] Reset du fichier de config primaire go2rtc (corruption résiduelle, cf. HANDOFF §62) — réinstallation propre…")
         r = sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", {"remove_config": True}, timeout=120)
-        log(f"[frigate] Désinstallation (reset config primaire go2rtc v2) → {r.status_code} {r.text[:150]}")
+        log(f"[frigate] Désinstallation (reset config primaire go2rtc v3) → {r.status_code} {r.text[:150]}")
         time.sleep(10)
         install_frigate()
-    open(_GO2RTC_API_ORIGIN_FIX_V2_MARKER, "w").close()
+    open(_GO2RTC_API_ORIGIN_FIX_V3_MARKER, "w").close()
 
 
 def _ensure_frigate():
