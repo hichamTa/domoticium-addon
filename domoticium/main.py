@@ -967,14 +967,17 @@ def _webrtc_config_yaml_lines() -> list[str]:
     """Section go2rtc.webrtc — go2rtc ne charge ice_servers qu'au démarrage (pas de
     rechargement à chaud), d'où le restart Frigate après chaque rafraîchissement
     périodique des identifiants TURN (cf. _turn_refresh_loop).
-    filters.networks: [udp4, tcp4] — contourne un bug connu de go2rtc 1.9.10 (notre
-    version, corrigé en 1.9.14) où le listener WebRTC tente de se lier à une adresse
-    IPv6 locale (fe80::...%eth0) instable côté hôte et échoue avec "cannot assign
-    requested address", empêchant le module WebRTC de s'initialiser DU TOUT (silence
-    total sur toute offre — observé en réel le 2026-07-20, cf. HANDOFF)."""
+    listen: "0.0.0.0:8555" (IPv4 explicite, pas ":8555") — bug connu de go2rtc 1.9.10
+    (notre version, corrigé en 1.9.14) où un bind sur host vide énumère aussi les
+    adresses IPv6 locales de l'hôte (fe80::...%eth0), instables au démarrage, et
+    échoue avec "cannot assign requested address", empêchant le module WebRTC de
+    s'initialiser DU TOUT (silence total sur toute offre). filters.networks:
+    [udp4, tcp4] seul ne suffit PAS à éviter ce bind raté (il filtre les candidats ICE
+    annoncés, pas l'adresse d'écoute elle-même) — récidive observée en réel le
+    2026-07-22 malgré ce filtre déjà en place depuis le 2026-07-20, cf. HANDOFF."""
     lines = [
         "  webrtc:",
-        '    listen: ":8555"',
+        '    listen: "0.0.0.0:8555"',
         "    filters:",
         "      networks: [udp4, tcp4]",
         "    ice_servers:",
@@ -4364,6 +4367,16 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._reject(500, str(e))
 
 
+class _ReusableTCPServer(socketserver.ThreadingTCPServer):
+    # socketserver.ThreadingTCPServer laisse allow_reuse_address=False par défaut
+    # (contrairement à http.server.HTTPServer) — un redémarrage rapide de l'addon
+    # (supervisor arrête l'ancien process, démarre le nouveau) peut laisser le socket
+    # 127.0.0.1:8098 précédent en TIME_WAIT côté noyau, faisant échouer le bind()
+    # suivant avec "Address already in use" — observé en réel le 2026-07-22, tout le
+    # serveur de commandes restait indisponible (PTZ, scènes, devices, tout).
+    allow_reuse_address = True
+
+
 def run_command_server():
     """Serveur HTTP local (127.0.0.1 uniquement) — exposé au monde via le tunnel
     Cloudflare existant (ingress ha-{slug}.domoticium.fr → 127.0.0.1:COMMAND_PORT)."""
@@ -4371,7 +4384,7 @@ def run_command_server():
         warn("[cmd-server] ingest_secret non configuré — serveur de commandes désactivé")
         return
     try:
-        httpd = socketserver.ThreadingTCPServer(("127.0.0.1", COMMAND_PORT), _CommandHandler)
+        httpd = _ReusableTCPServer(("127.0.0.1", COMMAND_PORT), _CommandHandler)
         httpd.daemon_threads = True
         log(f"[cmd-server] ✓ Serveur de commandes actif sur 127.0.0.1:{COMMAND_PORT}")
         httpd.serve_forever()
