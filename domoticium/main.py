@@ -1211,6 +1211,15 @@ def _generate_frigate_yaml() -> str:
 
     if _cameras:
         lines.append("go2rtc:")
+        # api.origin: "*" explicite — create_config.py (script Frigate qui régénère
+        # /dev/shm/go2rtc.yaml) est censé l'injecter automatiquement quand go2rtc.api
+        # est absent de la config, mais confirmé en conditions réelles le 2026-07-22 :
+        # ça ne suffit pas (rejet WebSocket persistant, cf. HANDOFF §58/§59 —
+        # internal/api/ws/ws.go côté go2rtc n'accepte que "" ou "*", sans repli par
+        # défaut). Le définir nous-mêmes retire la dépendance à ce comportement
+        # implicite plutôt que de continuer à en deviner la raison exacte.
+        lines.append("  api:")
+        lines.append('    origin: "*"')
         lines.append("  streams:")
         for name, rtsp_url in _cameras.items():
             lines += [f"    {name}:", f"      - {rtsp_url}"]
@@ -3685,6 +3694,27 @@ def _resync_go2rtc_streams():
             warn(f"[frigate] Échec resynchronisation go2rtc : '{name}'")
 
 
+_GO2RTC_API_ORIGIN_FIX_MARKER = "/data/.go2rtc_api_origin_fixed"
+
+
+def _fix_go2rtc_api_origin_once():
+    """Force UN redémarrage Frigate pour appliquer go2rtc.api.origin: "*" (ajouté à
+    _generate_frigate_yaml() le 2026-07-22, cf. HANDOFF §59) sur un site où Frigate
+    tourne déjà — sans ça, /dev/shm/go2rtc.yaml (régénéré par le script "prepare" de
+    Frigate SEULEMENT au démarrage du conteneur) resterait périmé indéfiniment sur une
+    installation qui n'a pas de raison de redémarrer d'elle-même. write_frigate_config()
+    (appelé juste avant, à chaque boot de l'addon) a déjà réécrit le fichier avec la
+    nouvelle valeur — un simple restart suffit ici, pas besoin de réinstaller. One-shot
+    via marker — sur une toute nouvelle installation le redémarrage déclenché ici est
+    redondant (Frigate vient déjà de démarrer avec la bonne valeur) mais inoffensif."""
+    if os.path.exists(_GO2RTC_API_ORIGIN_FIX_MARKER):
+        return
+    if _is_addon_installed(FRIGATE_SLUG) and _is_addon_running(FRIGATE_SLUG):
+        log("[frigate] Application de go2rtc.api.origin (fix WebSocket, cf. HANDOFF §59) — redémarrage Frigate…")
+        restart_frigate()
+    open(_GO2RTC_API_ORIGIN_FIX_MARKER, "w").close()
+
+
 def _ensure_frigate():
     """Installe et démarre Frigate + go2rtc s'ils sont absents ou arrêtés.
     Appelé en thread de fond au démarrage du bridge — permet de lancer Frigate
@@ -3710,6 +3740,7 @@ def _ensure_frigate():
             else:
                 log("[frigate] ✓ Frigate et go2rtc opérationnels")
                 threading.Thread(target=_setup_frigate_auth_once, daemon=True).start()
+            _fix_go2rtc_api_origin_once()
             _resync_go2rtc_streams()
             return  # succès
         except Exception as e:
