@@ -4286,10 +4286,10 @@ def _onvif_has_relay_output(device_xaddr: str, timeout: float = 3.0) -> bool:
 
 
 def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> list:
-    """Détecte PTZ/zoom (service PTZ présent dans GetCapabilities), talk/speaker
-    (AudioOutputConfiguration dans un profil média) et siren (sortie relais DeviceIO)
-    à partir d'un device_service ONVIF déjà connu. Best-effort : liste vide si la
-    caméra ne répond pas ou n'expose rien."""
+    """Détecte PTZ/zoom (axes réellement supportés par le nœud PTZ, cf. ci-dessous),
+    talk/speaker (AudioOutputConfiguration dans un profil média) et siren (sortie
+    relais DeviceIO) à partir d'un device_service ONVIF déjà connu. Best-effort :
+    liste vide si la caméra ne répond pas ou n'expose rien."""
     caps = set()
     try:
         xml = _onvif_soap(
@@ -4301,8 +4301,38 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
         return []
 
     if _xml_has_tag(xml, 'PTZ'):
-        caps.add('ptz')
-        caps.add('zoom')
+        # La présence du service PTZ dans GetCapabilities ne dit rien sur les axes
+        # réellement motorisés — des caméras pan/tilt sans zoom optique/numérique
+        # exposent quand même ce service, et notre ancien code ajoutait "zoom"
+        # aveuglément dans tous les cas, faisant apparaître un bouton zoom inopérant
+        # dans l'app (signalé par Hicham le 2026-07-22). GetNodes (lecture seule, pas
+        # de token requis contrairement à GetConfigurationOptions) liste les espaces
+        # de mouvement réellement supportés par le nœud PTZ — ContinuousPanTiltVelocitySpace
+        # et ContinuousZoomVelocitySpace n'apparaissent que si l'axe correspondant existe.
+        ptz_xaddr = ''
+        for xa in _xml_all(xml, 'XAddr'):
+            if 'ptz' in xa.lower():
+                ptz_xaddr = xa
+                break
+        if ptz_xaddr:
+            try:
+                nxml = _onvif_soap(
+                    ptz_xaddr,
+                    '<tptz:GetNodes xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"/>',
+                    timeout=timeout,
+                )
+                if _xml_has_tag(nxml, 'ContinuousPanTiltVelocitySpace'):
+                    caps.add('ptz')
+                if _xml_has_tag(nxml, 'ContinuousZoomVelocitySpace'):
+                    caps.add('zoom')
+            except Exception:
+                # GetNodes non supporté/exige une authentification sur cette caméra —
+                # repli conservateur : le service PTZ existe donc on suppose au moins
+                # pan/tilt, mais on n'ajoute plus zoom sans confirmation (c'était
+                # justement le bug : zoom ajouté sans jamais être vérifié).
+                caps.add('ptz')
+        else:
+            caps.add('ptz')
 
     media_url = ''
     for xa in _xml_all(xml, 'XAddr'):
