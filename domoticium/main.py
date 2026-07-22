@@ -3727,26 +3727,29 @@ def _resync_go2rtc_streams():
     restart_frigate()
 
 
-_GO2RTC_API_ORIGIN_FIX_V4_MARKER = "/data/.go2rtc_api_origin_fixed_v4"
+_GO2RTC_API_ORIGIN_FIX_V5_MARKER = "/data/.go2rtc_api_origin_fixed_v5"
 
 
 def _fix_go2rtc_api_origin_once():
     """Réinstalle Frigate proprement pour repartir d'un fichier de config "primaire"
     go2rtc (/config/go2rtc_homekit.yml) vierge.
 
-    v4 de ce correctif. v1-v3 (markers _fixed/_v2/_v3) : chaque version rendait nos
-    écritures dans ce fichier plus "sûres" (idempotence, API JSON plutôt que regex) —
-    mais confirmé en conditions réelles le 2026-07-22 (§63/§64) : la vraie cause
-    n'était pas la fiabilité de NOS écritures, c'est que ce fichier appartient à la
-    fonctionnalité HomeKit de Frigate, jamais censé recevoir nos streams — et qu'une
-    fois corrompu, le script de nettoyage HomeKit de Frigate lui-même échoue à le
-    reparser et abandonne SANS le corriger, rendant la corruption auto-perpétuante
-    boot après boot tant que rien ne réinitialise le fichier. §64 retire pour de bon
-    tout appel à PUT/DELETE /api/streams (ajout/suppression de caméra basculés sur un
-    restart complet, cf. handle_camera_configure) — plus aucun code ne devrait plus
-    jamais écrire dans ce fichier. Ce reset (nouveau marker _v4) nettoie la corruption
-    déjà accumulée par les versions précédentes ; ensuite, plus rien ne devrait la
-    recréer. One-shot — nouvelles installations : rien à corriger.
+    v5 de ce correctif. v1-v4 (markers _fixed/_v2/_v3/_v4) traitaient chacune une
+    cause réelle mais partielle : fiabilité des écritures (v1-v3), puis suppression
+    complète des écritures elles-mêmes (v4, §63/§64) — corruption toujours revenue en
+    conditions réelles le 2026-07-22, cette fois sans AUCUNE écriture en cause :
+    _ensure_frigate() enchaînait un redémarrage Frigate "de routine" (quirk de timing
+    du slug, cf. son propre code) puis, immédiatement après, un second redémarrage
+    déclenché par _resync_go2rtc_streams() (caméras jugées "absentes" juste après le
+    1er redémarrage, probablement une lecture trop précoce de l'état go2rtc) — deux
+    redémarrages Frigate quasi simultanés, correspondant exactement au moment où la
+    corruption réapparaissait dans les logs. Hypothèse retenue (§65) : une course
+    d'accès fichier entre l'ancien processus go2rtc qui termine et le nouveau qui
+    démarre, tous deux sur /config/go2rtc_homekit.yml. Fix : _ensure_frigate() ne
+    déclenche plus JAMAIS _resync_go2rtc_streams() dans la même itération qu'un
+    (re)démarrage déjà effectué — cf. son code, variable `just_restarted`. Ce reset
+    (nouveau marker _v5) nettoie une dernière fois la corruption accumulée par ce
+    nouveau mécanisme. One-shot — nouvelles installations : rien à corriger.
 
     Appelée depuis _ensure_frigate() APRÈS la branche d'état (donc potentiellement sur
     un Frigate jugé "opérationnel" à cet instant précis) — sans réinstallation
@@ -3755,15 +3758,15 @@ def _fix_go2rtc_api_origin_once():
     branches "absent"/"error", jamais dans la branche "tout va bien"). D'où l'appel
     direct à install_frigate() ci-dessous plutôt que de compter sur le tour de
     boucle suivant."""
-    if os.path.exists(_GO2RTC_API_ORIGIN_FIX_V4_MARKER):
+    if os.path.exists(_GO2RTC_API_ORIGIN_FIX_V5_MARKER):
         return
     if _is_addon_installed(FRIGATE_SLUG):
-        log("[frigate] Reset du fichier de config primaire go2rtc (corruption résiduelle auto-perpétuante, cf. HANDOFF §64) — réinstallation propre…")
+        log("[frigate] Reset du fichier de config primaire go2rtc (course entre deux redémarrages successifs, cf. HANDOFF §65) — réinstallation propre…")
         r = sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", {"remove_config": True}, timeout=120)
-        log(f"[frigate] Désinstallation (reset config primaire go2rtc v4) → {r.status_code} {r.text[:150]}")
+        log(f"[frigate] Désinstallation (reset config primaire go2rtc v5) → {r.status_code} {r.text[:150]}")
         time.sleep(10)
         install_frigate()
-    open(_GO2RTC_API_ORIGIN_FIX_V4_MARKER, "w").close()
+    open(_GO2RTC_API_ORIGIN_FIX_V5_MARKER, "w").close()
 
 
 def _ensure_frigate():
@@ -3774,25 +3777,38 @@ def _ensure_frigate():
     for attempt in range(1, 6):
         try:
             state = _frigate_state()
+            just_restarted = False
             if not _is_addon_installed(FRIGATE_SLUG):
                 log(f"[frigate] Frigate absent — installation automatique… (tentative {attempt}/5)")
                 install_frigate()
+                just_restarted = True
             elif state == "error":
                 warn(f"[frigate] Frigate en état error — réinstallation propre… (tentative {attempt}/5)")
                 sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", timeout=120)
                 time.sleep(15)
                 install_frigate()
+                just_restarted = True
             elif not _is_addon_running(FRIGATE_SLUG):
                 log("[frigate] Frigate installé mais arrêté — configuration port + démarrage…")
                 _configure_frigate_and_start()
+                just_restarted = True
             elif not _frigate_go2rtc_ready():
                 log("[frigate] Frigate en cours mais go2rtc indisponible — reconfiguration…")
                 _configure_frigate_and_start()
+                just_restarted = True
             else:
                 log("[frigate] ✓ Frigate et go2rtc opérationnels")
                 threading.Thread(target=_setup_frigate_auth_once, daemon=True).start()
             _fix_go2rtc_api_origin_once()
-            _resync_go2rtc_streams()
+            # Ne pas ré-évaluer/redémarrer juste après un (re)démarrage déjà effectué
+            # dans cette même itération — cf. HANDOFF §65 : deux redémarrages Frigate
+            # coup sur coup (celui-ci juste après un autre) ont provoqué une corruption
+            # du fichier de config primaire go2rtc, probablement une course d'accès
+            # fichier entre l'ancien processus qui termine et le nouveau qui démarre.
+            # Un (re)démarrage tout juste effectué a déjà rechargé les caméras depuis
+            # notre config réelle — inutile de re-vérifier immédiatement après.
+            if not just_restarted:
+                _resync_go2rtc_streams()
             return  # succès
         except Exception as e:
             warn(f"[frigate] _ensure_frigate tentative {attempt}/5 : {e}")
