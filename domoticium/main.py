@@ -941,18 +941,38 @@ def _migrate_frigate_repo_once():
     time.sleep(10)
 
 
+_FRIGATE_CONFIG_RACE_FIX_MARKER = "/data/.frigate_config_race_fixed"
+
+
+def _fix_frigate_config_race_once():
+    """Corrige une installation déjà faite AVANT le correctif d'ordre d'écriture
+    (write_frigate_config() appelé avant install, pas seulement avant start —
+    cf. install_frigate() étape 1bis) : sur ces sites, le tout premier démarrage de
+    Frigate a pu rater la fenêtre de migration one-shot de son script "prepare" (config
+    privée créée avec les valeurs par défaut de Frigate avant que notre fichier ne soit
+    garanti présent), cf. HANDOFF §57. Un seul réinstall propre (remove_config=True)
+    redonne une chance à cette migration, cette fois avec notre fichier garanti à jour
+    puisqu'écrit avant l'installation. One-shot via marker — les nouvelles
+    installations (jamais affectées, le correctif d'ordre s'applique dès le départ)
+    n'ont rien à corriger et posent juste le marker sans action."""
+    if os.path.exists(_FRIGATE_CONFIG_RACE_FIX_MARKER):
+        return
+    if not _is_addon_installed(FRIGATE_SLUG):
+        open(_FRIGATE_CONFIG_RACE_FIX_MARKER, "w").close()
+        return
+    log("[frigate] Nouvelle tentative de migration de la config (installation potentiellement affectée par une course au tout 1er démarrage, cf. HANDOFF §57) — réinstallation propre…")
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", {"remove_config": True}, timeout=120)
+    log(f"[frigate] Désinstallation (nouvelle tentative migration) → {r.status_code} {r.text[:150]}")
+    time.sleep(10)
+    open(_FRIGATE_CONFIG_RACE_FIX_MARKER, "w").close()
+
+
 def install_frigate():
     log("── Frigate NVR ──────────────────────────────")
 
-    _migrate_frigate_repo_once()
-
-    # 1. Nettoyer un go2rtc.yml résiduel de l'ancienne architecture standalone
-    old_go2rtc = "/homeassistant/go2rtc.yml"
-    if os.path.exists(old_go2rtc):
-        os.rename(old_go2rtc, f"{old_go2rtc}.bak")
-        log("⚠ Ancien go2rtc.yml archivé → go2rtc.yml.bak (utilise le go2rtc embarqué dans Frigate)")
-
-    # 2. Ajouter le dépôt
+    # 0. S'assurer que le dépôt est présent et à jour AVANT toute résolution de slug —
+    # nécessaire pour que _resolve_frigate_slug()/_fix_frigate_config_race_once()
+    # ci-dessous travaillent avec le bon FRIGATE_SLUG plutôt que le repli codé en dur.
     existing_urls = _sup_repos()
     if FRIGATE_REPO not in existing_urls:
         r = sup_post("/store/repositories", {"repository": FRIGATE_REPO})
@@ -963,12 +983,34 @@ def install_frigate():
             warn(f"Dépôt Frigate : {r.status_code} — on continue")
     else:
         log("Dépôt Frigate déjà présent")
+        # Forcer un rafraîchissement du store — évite de travailler depuis un
+        # manifeste potentiellement mis en cache par le Supervisor avant notre
+        # dernière modification (config.yaml du fork), cf. HANDOFF §57.
+        r = sup_post("/store/reload", timeout=60)
+        log(f"[frigate] Rafraîchissement du store → {r.status_code}")
 
-    # 2bis. Résoudre le vrai slug installable (ne pas se fier au slug deviné/codé en
-    # dur — cf. _resolve_frigate_slug, échec réel observé le 2026-07-22).
     _resolve_frigate_slug()
 
-    # 3. Installer si nécessaire
+    _migrate_frigate_repo_once()
+    _fix_frigate_config_race_once()
+
+    # 1. Nettoyer un go2rtc.yml résiduel de l'ancienne architecture standalone
+    old_go2rtc = "/homeassistant/go2rtc.yml"
+    if os.path.exists(old_go2rtc):
+        os.rename(old_go2rtc, f"{old_go2rtc}.bak")
+        log("⚠ Ancien go2rtc.yml archivé → go2rtc.yml.bak (utilise le go2rtc embarqué dans Frigate)")
+
+    # 1bis. Écrire /homeassistant/frigate.yml AVANT toute installation (pas seulement
+    # avant le démarrage, cf. plus bas) — sur une toute première installation, le script
+    # de préparation de Frigate ("prepare", côté conteneur) migre ce fichier vers son
+    # propre stockage privé UNE SEULE FOIS, dès son tout premier démarrage : s'il ne
+    # trouve rien à cet instant précis, cette fenêtre est perdue pour de bon (le fichier
+    # une fois "migré" ne l'est plus jamais une 2e fois). S'assurer qu'il existe déjà,
+    # correctement rempli, avant même de déclencher l'installation.
+    _load_cameras()
+    write_frigate_config()
+
+    # 2. Installer si nécessaire
     if not _is_addon_installed(FRIGATE_SLUG):
         log("Installation de Frigate (peut prendre 2-3 min)…")
         r = sup_post(f"/store/addons/{FRIGATE_SLUG}/install", timeout=300)
