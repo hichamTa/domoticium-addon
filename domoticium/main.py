@@ -993,14 +993,23 @@ def _webrtc_config_yaml_lines() -> list[str]:
 
 
 def _generate_frigate_yaml() -> str:
-    """Génère le YAML complet de config Frigate depuis le registre des caméras."""
+    """Génère le YAML complet de config Frigate depuis le registre des caméras.
+    MQTT activé (broker Mosquitto local, même identifiants que le reste de l'addon) —
+    nécessaire pour piloter le contrôleur ONVIF PTZ natif de Frigate (topic
+    frigate/<camera>/ptz, cf. _handle_camera_ptz_route) plutôt qu'une implémentation
+    ONVIF maison. N'affecte pas le pipeline vidéo RTSP/go2rtc — contrairement au
+    backchannel audio (cf. incident HANDOFF §47), c'est un canal de contrôle séparé."""
     lines = [
         "# Généré par Domoticium — ne pas modifier manuellement",
         'version: "0.18-0"',
         "auth:",
         "  enabled: false",
         "mqtt:",
-        "  enabled: false",
+        "  enabled: true",
+        "  host: core-mosquitto",
+        "  port: 1883",
+        f'  user: "{MOSQUITTO_USER}"',
+        f'  password: "{MOSQUITTO_PASS}"',
         "",
     ]
 
@@ -1032,6 +1041,22 @@ def _generate_frigate_yaml() -> str:
                 "    record:",
                 "      enabled: false",
             ]
+            # Identifiants ONVIF réutilisés depuis l'URL RTSP déjà stockée (même
+            # hypothèse qu'ailleurs dans le fichier : matériel grand public utilise
+            # en général les mêmes identifiants pour RTSP et ONVIF). Port par défaut
+            # Frigate (8000) — pas de champ dédié pour un port ONVIF différent par
+            # caméra, cohérent avec le premier port essayé par notre propre sonde.
+            try:
+                onvif_ip, onvif_user, onvif_pass = _onvif_credentials_from_rtsp(rtsp_url)
+            except Exception:
+                onvif_ip = ""
+            if onvif_ip:
+                lines += [
+                    "    onvif:",
+                    f'      host: "{onvif_ip}"',
+                    f'      user: "{onvif_user}"',
+                    f'      password: "{onvif_pass}"',
+                ]
     else:
         lines.append("cameras: {}")
 
@@ -4039,43 +4064,13 @@ def _onvif_locate_services(ip: str, timeout: float = 3.0) -> dict:
     return services
 
 
-def _onvif_ptz_move(ip: str, username: str, password: str, direction: str) -> tuple:
-    """direction: up/down/left/right/zoom_in/zoom_out/stop. True/detail."""
-    services = _onvif_locate_services(ip)
-    if not services['ptz_xaddr']:
-        return False, 'Cette caméra ne propose pas de service PTZ en ONVIF'
-    token = services['profile_token']
-    header = _onvif_ws_security_header(username, password)
-
-    if direction == 'stop':
-        body = (
-            '<tptz:Stop xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">'
-            f'<tptz:ProfileToken>{token}</tptz:ProfileToken>'
-            '<tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom>'
-            '</tptz:Stop>'
-        )
-    else:
-        speed = {
-            'up': (0, 0.5, 0), 'down': (0, -0.5, 0),
-            'left': (-0.5, 0, 0), 'right': (0.5, 0, 0),
-            'zoom_in': (0, 0, 0.5), 'zoom_out': (0, 0, -0.5),
-        }.get(direction)
-        if not speed:
-            return False, f'Direction inconnue : {direction}'
-        x, y, z = speed
-        body = (
-            '<tptz:ContinuousMove xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">'
-            f'<tptz:ProfileToken>{token}</tptz:ProfileToken>'
-            '<tptz:Velocity>'
-            f'<tt:PanTilt xmlns:tt="http://www.onvif.org/ver10/schema" x="{x}" y="{y}"/>'
-            f'<tt:Zoom xmlns:tt="http://www.onvif.org/ver10/schema" x="{z}"/>'
-            '</tptz:Velocity>'
-            '</tptz:ContinuousMove>'
-        )
-    xml = _onvif_soap(services['ptz_xaddr'], body, header=header)
-    if 'Fault' in xml:
-        return False, _xml_text(xml, 'Text') or 'La caméra a refusé la commande PTZ'
-    return True, 'ok'
+# Mapping direction (API web, cf. lib/ha/command.ts PtzDirection) → commande du
+# contrôleur ONVIF PTZ natif de Frigate (frigate.ptz.onvif.OnvifCommandEnum), publiée
+# sur le topic MQTT frigate/<camera>/ptz — cf. _handle_camera_ptz_route.
+_FRIGATE_PTZ_COMMANDS = {
+    'up': 'move_up', 'down': 'move_down', 'left': 'move_left', 'right': 'move_right',
+    'zoom_in': 'zoom_in', 'zoom_out': 'zoom_out', 'stop': 'stop',
+}
 
 
 def _onvif_set_night_vision(ip: str, username: str, password: str, mode: str) -> tuple:
@@ -4290,20 +4285,24 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             return None
 
     def _handle_camera_ptz_route(self, data):
+        """Relaie la commande au contrôleur ONVIF PTZ natif de Frigate (topic MQTT
+        frigate/<camera>/ptz, cf. _generate_frigate_yaml) plutôt qu'un appel ONVIF
+        direct — Frigate maintient déjà cette implémentation, pas de raison de la
+        dupliquer. Publication MQTT fire-and-forget : Frigate ne renvoie pas d'accusé
+        de réception sur ce topic, donc "ok" ici confirme l'envoi, pas l'exécution."""
         stream_name = data.get("streamName")
         direction = data.get("direction")
         if not stream_name or not direction:
             return self._reject(400, "streamName et direction requis")
-        creds = self._camera_onvif_credentials(stream_name)
-        if not creds:
+        if stream_name not in _cameras:
             return self._reject(404, "Caméra inconnue")
-        ip, username, password = creds
-        try:
-            ok, detail = _onvif_ptz_move(ip, username, password, direction)
-        except Exception as e:
-            warn(f"[camera-ptz] {stream_name} ({direction}): {e}")
-            return self._ok({"ok": False, "detail": str(e)})
-        self._ok({"ok": ok, "detail": detail})
+        command = _FRIGATE_PTZ_COMMANDS.get(direction)
+        if not command:
+            return self._ok({"ok": False, "detail": f"Direction inconnue : {direction}"})
+        if not _local_client:
+            return self._ok({"ok": False, "detail": "Mosquitto local non connecté"})
+        _local_client.publish(f"frigate/{stream_name}/ptz", command, qos=1)
+        self._ok({"ok": True, "detail": "ok"})
 
     def _handle_camera_night_vision_route(self, data):
         stream_name = data.get("streamName")
