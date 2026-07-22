@@ -1076,6 +1076,16 @@ def _setup_frigate_auth_once():
     log("[frigate] ✓ Auth gérée via YAML (auth.enabled: false dans frigate.yml)")
 
 
+def _redact_secrets(text: str) -> str:
+    """Masque mots de passe et identifiants avant un log — sinon en clair dans les
+    journaux de l'addon (visibles depuis Paramètres → Modules complémentaires → Journal,
+    copiables/partageables sans y penser). Le fichier écrit sur disque, lui, garde les
+    vraies valeurs (Frigate en a besoin pour fonctionner)."""
+    text = re.sub(r'(rtsp://[^:/@\s]*:)([^@\s]*)(@)', r'\1***\3', text)
+    text = re.sub(r'((?:password|credential)\s*:\s*")[^"]*(")', r'\1***\2', text)
+    return text
+
+
 def write_frigate_config():
     """Écrit /homeassistant/frigate.yml. Le prepare script Frigate le copie dans son
     stockage privé à chaque démarrage — c'est la seule voie de config utilisée."""
@@ -1083,7 +1093,7 @@ def write_frigate_config():
     with open("/homeassistant/frigate.yml", "w") as fh:
         fh.write(content)
     log(f"✓ config Frigate mise à jour ({len(_cameras)} caméra(s))")
-    log(f"[frigate.yml]\n{content}")
+    log(f"[frigate.yml]\n{_redact_secrets(content)}")
 
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
