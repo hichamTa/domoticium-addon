@@ -127,6 +127,34 @@ _local_client: mqtt.Client | None = None
 def log(msg):  print(f"[domoticium] {msg}", flush=True)
 def warn(msg): print(f"[domoticium] ⚠ {msg}", file=sys.stderr, flush=True)
 
+
+def _local_ipv4() -> str:
+    """IPv4 LAN de l'hôte (host_network: true, donc l'IP de l'hôte lui-même). Utilisée
+    pour forcer go2rtc à écouter sur une adresse précise plutôt que ":8555"/"0.0.0.0:8555"
+    (cf. _webrtc_config_yaml_lines) — les deux sont traitées comme "unspecified" par
+    go2rtc (pkg/xnet.ParseUnspecifiedPort accepte explicitement "0.0.0.0"), donc les deux
+    déclenchent le même chemin de code qui énumère TOUTES les interfaces réseau de l'hôte
+    pour créer un socket par interface (ice.NewMultiUDPMuxFromPort côté pion/ice) — y
+    compris les adresses IPv6 locales instables (fe80::...%eth0) qui font échouer tout le
+    bind et donc TOUT le module WebRTC de go2rtc (retour anticipé dans son Init(), jamais
+    de fallback partiel — vérifié dans le code source go2rtc/pion, cf. HANDOFF). Une
+    adresse IPv4 concrète et non générique bascule sur un simple net.ListenPacket, sans
+    énumération d'interfaces, qui évite complètement ce bug."""
+    try:
+        out = subprocess.check_output(['ip', 'route', 'get', '1.1.1.1'], text=True, timeout=2)
+        m = re.search(r'src\s+(\d+\.\d+\.\d+\.\d+)', out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    try:
+        ip = socket.gethostbyname(socket.getfqdn())
+        if ip and not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    return ''
+
 def sup_get(path):
     return requests.get(f"{SUP}{path}", headers=HDRS, timeout=15)
 
@@ -967,17 +995,25 @@ def _webrtc_config_yaml_lines() -> list[str]:
     """Section go2rtc.webrtc — go2rtc ne charge ice_servers qu'au démarrage (pas de
     rechargement à chaud), d'où le restart Frigate après chaque rafraîchissement
     périodique des identifiants TURN (cf. _turn_refresh_loop).
-    listen: "0.0.0.0:8555" (IPv4 explicite, pas ":8555") — bug connu de go2rtc 1.9.10
-    (notre version, corrigé en 1.9.14) où un bind sur host vide énumère aussi les
-    adresses IPv6 locales de l'hôte (fe80::...%eth0), instables au démarrage, et
-    échoue avec "cannot assign requested address", empêchant le module WebRTC de
-    s'initialiser DU TOUT (silence total sur toute offre). filters.networks:
-    [udp4, tcp4] seul ne suffit PAS à éviter ce bind raté (il filtre les candidats ICE
-    annoncés, pas l'adresse d'écoute elle-même) — récidive observée en réel le
-    2026-07-22 malgré ce filtre déjà en place depuis le 2026-07-20, cf. HANDOFF."""
+    listen: IP LAN concrète de l'hôte (cf. _local_ipv4), PAS ":8555" ni "0.0.0.0:8555" —
+    les deux sont traités comme "unspecified" par go2rtc (pkg/xnet.ParseUnspecifiedPort
+    accepte explicitement "0.0.0.0", vérifié dans son code source), ce qui déclenche
+    l'énumération de TOUTES les interfaces réseau de l'hôte pour créer un socket par
+    interface — y compris les adresses IPv6 locales instables (fe80::...%eth0), qui
+    font échouer le bind et donc TOUT le module WebRTC de go2rtc dès l'échec de la
+    première interface (retour anticipé dans son Init(), aucun repli partiel). Le
+    filtre filters.networks: [udp4, tcp4] déjà en place ne suffit pas à éviter ce bind
+    raté (il filtre les candidats ICE annoncés, pas les interfaces sondées pendant le
+    bind) — deux récidives réelles malgré ce filtre (2026-07-20 puis "0.0.0.0" testé et
+    toujours en échec le 2026-07-22, cf. HANDOFF). Une adresse concrète et non générique
+    bascule sur un simple `net.ListenPacket` (une seule socket, aucune énumération),
+    qui évite complètement ce chemin de code bugué. Repli sur "0.0.0.0:8555" (comportement
+    précédent, toujours risqué) si l'IP locale n'a pas pu être déterminée."""
+    local_ip = _local_ipv4()
+    listen_addr = f"{local_ip}:8555" if local_ip else "0.0.0.0:8555"
     lines = [
         "  webrtc:",
-        '    listen: "0.0.0.0:8555"',
+        f'    listen: "{listen_addr}"',
         "    filters:",
         "      networks: [udp4, tcp4]",
         "    ice_servers:",
@@ -3785,21 +3821,8 @@ def _subnet_onvif_scan(onvif_ports: tuple = (8000, 80), connect_timeout: float =
     réchauffe le cache ARP pour toutes les IP actives du réseau, donc un second passage
     immédiat est quasi instantané et beaucoup plus fiable, sans que l'utilisateur ait à
     recliquer manuellement."""
-    my_ip = ''
-    try:
-        out = subprocess.check_output(
-            ['ip', 'route', 'get', '1.1.1.1'], text=True, timeout=2
-        )
-        m = re.search(r'src\s+(\d+\.\d+\.\d+\.\d+)', out)
-        my_ip = m.group(1) if m else ''
-    except Exception:
-        pass
+    my_ip = _local_ipv4()
     if not my_ip:
-        try:
-            my_ip = socket.gethostbyname(socket.getfqdn())
-        except Exception:
-            pass
-    if not my_ip or my_ip.startswith('127.'):
         warn('[onvif-scan] subnet-scan: impossible de déterminer l\'IP locale')
         return []
 
