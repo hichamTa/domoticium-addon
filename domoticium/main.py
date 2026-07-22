@@ -967,6 +967,36 @@ def _fix_frigate_config_race_once():
     open(_FRIGATE_CONFIG_RACE_FIX_MARKER, "w").close()
 
 
+_GO2RTC_PRIMARY_CONFIG_FIX_MARKER = "/data/.go2rtc_primary_config_fixed"
+
+
+def _fix_go2rtc_primary_config_once():
+    """Corrige un site où /config/go2rtc_homekit.yml (fichier "primaire" go2rtc,
+    persistant, chargé en premier par Frigate) a pu être altéré par les PATCH
+    /api/config répétés de l'ancien mécanisme _ensure_go2rtc_webrtc_persisted() —
+    retiré le 2026-07-22 car devenu inutile ET risqué : ce mécanisme compensait
+    l'absence de lecture de /homeassistant/frigate.yml par Frigate (corrigée depuis,
+    cf. HANDOFF §55/§57), pas un besoin réel. Ses patchs texte répétés (splice par
+    ligne, cf. pkg/yaml.patch côté go2rtc) sur ce même fichier au fil des versions de
+    cette session ont vraisemblablement produit le YAML invalide observé au boot
+    ("yaml: line 11: did not find expected ',' or ']'") et empêché la propagation de
+    api.origin: "*" (auto-injecté par create_config.py UNIQUEMENT si go2rtc.api est
+    absent de la config effective — un fichier primaire corrompu peut interférer).
+    Un seul réinstall propre (remove_config=True) repart d'un fichier primaire vide ;
+    le fichier régénéré à chaque boot depuis notre frigate.yml (désormais réellement
+    lu) suffit seul. One-shot via marker — nouvelles installations : rien à corriger."""
+    if os.path.exists(_GO2RTC_PRIMARY_CONFIG_FIX_MARKER):
+        return
+    if not _is_addon_installed(FRIGATE_SLUG):
+        open(_GO2RTC_PRIMARY_CONFIG_FIX_MARKER, "w").close()
+        return
+    log("[frigate] Nettoyage du fichier de config primaire go2rtc (patches API obsolètes, cf. HANDOFF) — réinstallation propre…")
+    r = sup_post(f"/addons/{FRIGATE_SLUG}/uninstall", {"remove_config": True}, timeout=120)
+    log(f"[frigate] Désinstallation (nettoyage config primaire go2rtc) → {r.status_code} {r.text[:150]}")
+    time.sleep(10)
+    open(_GO2RTC_PRIMARY_CONFIG_FIX_MARKER, "w").close()
+
+
 def install_frigate():
     log("── Frigate NVR ──────────────────────────────")
 
@@ -993,6 +1023,7 @@ def install_frigate():
 
     _migrate_frigate_repo_once()
     _fix_frigate_config_race_once()
+    _fix_go2rtc_primary_config_once()
 
     # 1. Nettoyer un go2rtc.yml résiduel de l'ancienne architecture standalone
     old_go2rtc = "/homeassistant/go2rtc.yml"
@@ -1109,15 +1140,16 @@ def _webrtc_config_yaml_lines() -> list[str]:
     rechargement à chaud), d'où le restart Frigate après chaque rafraîchissement
     périodique des identifiants TURN (cf. _turn_refresh_loop).
 
-    ⚠️ Ce fichier (frigate.yml → /dev/shm/go2rtc.yaml régénéré par Frigate à chaque
-    démarrage) N'EST PAS la source de vérité pour la section webrtc en pratique — le
-    go2rtc qui redémarre semble ignorer ce fichier régénéré pour cette section (même
-    phénomène déjà connu pour les flux caméra, cf. _resync_go2rtc_streams — et confirmé
-    en conditions réelles le 2026-07-22 : 3 valeurs de `listen` différentes testées ici
-    sans le moindre effet observable). La config webrtc réellement active est celle
-    persistée via API par _ensure_go2rtc_webrtc_persisted() — cette section-ci est
-    gardée cohérente avec elle par prudence/lisibilité, mais si les deux devaient un
-    jour diverger, c'est CETTE fonction-là qui fait foi, pas celle-ci.
+    Cette section EST la source de vérité : /homeassistant/frigate.yml est réellement
+    lu par Frigate (CONFIG_FILE, cf. HANDOFF §55/§57) et régénère /dev/shm/go2rtc.yaml
+    à chaque démarrage. Jusqu'au 2026-07-22 un mécanisme de contournement persistait
+    cette section via PATCH /api/config directement dans le fichier "primaire" de
+    go2rtc — nécessaire tant que Frigate ne lisait pas notre fichier, mais devenu à la
+    fois inutile ET risqué une fois ce problème corrigé (patches texte répétés sur le
+    même fichier → YAML invalide observé au boot). Retiré (cf. _ensure_frigate) au
+    profit de cette seule section, désormais suffisante seule (confirmé en conditions
+    réelles : webrtc s'initialise correctement dès le premier boot suivant un reset
+    complet de la config, avant même que l'ancien mécanisme n'ait pu agir).
 
     listen: "0.0.0.0:8555", PAS l'IP LAN de l'hôte — l'add-on Frigate tourne en réseau
     Docker isolé (host_network: false dans son propre config.yaml), donc l'IP LAN de
@@ -1125,8 +1157,14 @@ def _webrtc_config_yaml_lines() -> list[str]:
     assign requested address" sur une IP pourtant correcte côté hôte). "0.0.0.0" est
     traité comme "unspecified" par go2rtc et énumère donc les interfaces DU CONTENEUR,
     filtrées par filters.networks: [udp4, tcp4] pour exclure l'IPv6 locale instable de
-    son interface pont Docker — cf. _ensure_go2rtc_webrtc_persisted() pour le détail
-    complet de cette investigation."""
+    son interface pont Docker.
+
+    Pas de clé api/origin ici : create_config.py (script Frigate qui régénère
+    /dev/shm/go2rtc.yaml) injecte automatiquement api.origin: "*" dès que go2rtc.api
+    est absent de la config — ce qui est notre cas. Sans ce "*", go2rtc applique un
+    contrôle same-origin strict sur son WebSocket de signalisation (cf. internal/api/
+    ws/ws.go côté go2rtc) qui rejette app.domoticium.fr (origine différente du nom
+    d'hôte du tunnel Cloudflare)."""
     lines = [
         "  webrtc:",
         '    listen: "0.0.0.0:8555"',
@@ -3658,62 +3696,6 @@ def _resync_go2rtc_streams():
             warn(f"[frigate] Échec resynchronisation go2rtc : '{name}'")
 
 
-def _ensure_go2rtc_webrtc_persisted():
-    """Même mécanisme que _resync_go2rtc_streams() ci-dessus, appliqué à la section
-    webrtc plutôt qu'aux flux : go2rtc redémarre avec la config "primaire" persistée
-    (/config/go2rtc_homekit.yml côté Frigate), pas avec celle régénérée depuis notre
-    frigate.yml — confirmé en conditions réelles le 2026-07-22 (_resync_go2rtc_streams()
-    contourne déjà ce problème pour les flux via l'API à chaud, PUT /api/streams ;
-    même remède ici via PATCH /api/config, même mécanisme interne côté go2rtc).
-
-    listen: "0.0.0.0:8555" et PAS l'IP LAN de l'hôte — contrairement à l'add-on
-    Domoticium (host_network: true), l'add-on Frigate tourne en réseau Docker isolé
-    (host_network: false dans son propre config.yaml, vérifié sur GitHub) : l'IP LAN de
-    l'hôte (ex: 192.168.1.144) n'existe pas à l'intérieur de son conteneur — confirmé en
-    conditions réelles le 2026-07-22, "cannot assign requested address" alors même que
-    la persistance fonctionnait enfin (preuve : l'erreur montrait cette fois l'IP qu'on
-    avait configurée, plus une IPv6 mystère). "0.0.0.0" est traité comme "unspecified"
-    par go2rtc et énumère donc les interfaces DU CONTENEUR (pas de l'hôte) — sa propre
-    interface pont Docker a probablement la même instabilité IPv6 locale que celle
-    observée au tout départ (cf. HANDOFF §35/§49), d'où filters.networks: [udp4, tcp4]
-    ci-dessous : sans lui, on retomberait dans le bug d'origine. Ce filtre n'ayant
-    jamais été réellement chargé par go2rtc jusqu'à cette persistance via API
-    (cf. §52/§53), c'est la première fois qu'il a une chance d'être réellement actif.
-
-    webrtc.listen n'est pas rechargeable à chaud (cf. _webrtc_config_yaml_lines) : un
-    restart Frigate est nécessaire après toute nouvelle persistance. Vérifie la valeur
-    EXACTE de listen (pas juste la présence de la clé webrtc) avant de patcher, pour
-    rester idempotent une fois la bonne valeur en place, tout en corrigeant
-    automatiquement une valeur précédente incorrecte (ex: IP hôte laissée par une
-    version antérieure de l'addon)."""
-    try:
-        r = requests.get("http://127.0.0.1:1984/api/config", timeout=5)
-        if not r.ok:
-            return
-        if re.search(r'listen:\s*"?0\.0\.0\.0:8555"?', r.text):
-            return
-
-        patch_yaml = (
-            "webrtc:\n"
-            '  listen: "0.0.0.0:8555"\n'
-            "  filters:\n"
-            "    networks: [udp4, tcp4]\n"
-        )
-        r = requests.patch(
-            "http://127.0.0.1:1984/api/config",
-            data=patch_yaml.encode(),
-            headers={"Content-Type": "application/yaml"},
-            timeout=5,
-        )
-        if r.ok:
-            log("[webrtc] Config webrtc (ré)persistée côté go2rtc (fichier primaire) — restart Frigate pour l'appliquer")
-            restart_frigate()
-        else:
-            warn(f"[webrtc] Échec persistance config webrtc : HTTP {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        warn(f"[webrtc] Persistance config webrtc : {e}")
-
-
 def _ensure_frigate():
     """Installe et démarre Frigate + go2rtc s'ils sont absents ou arrêtés.
     Appelé en thread de fond au démarrage du bridge — permet de lancer Frigate
@@ -3740,7 +3722,6 @@ def _ensure_frigate():
                 log("[frigate] ✓ Frigate et go2rtc opérationnels")
                 threading.Thread(target=_setup_frigate_auth_once, daemon=True).start()
             _resync_go2rtc_streams()
-            _ensure_go2rtc_webrtc_persisted()
             return  # succès
         except Exception as e:
             warn(f"[frigate] _ensure_frigate tentative {attempt}/5 : {e}")
