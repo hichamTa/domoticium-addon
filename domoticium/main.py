@@ -1266,6 +1266,53 @@ def _remove_legacy_heartbeat_automation_once():
     open(_LEGACY_HEARTBEAT_AUTO_MARKER, "w").close()
 
 
+_WATCHDOG_ENABLED_MARKER = "/data/.watchdog_enabled"
+
+
+def _enable_watchdogs_once():
+    """Active le redémarrage automatique du Supervisor ("Watchdog", visible dans
+    Paramètres → Modules complémentaires → [add-on] → interrupteur Watchdog) pour
+    Domoticium et les add-ons dont il dépend, si installés. Ne protège que contre un
+    add-on qui CRASHE (process qui meurt) — pas contre un service interne qui reste
+    bloqué sans faire planter le container (ex: incident cmd-server du 2026-07-22,
+    déjà corrigé par ailleurs) : le Watchdog Supervisor n'a pas de sonde applicative,
+    juste "le process tourne-t-il encore ?". Complémentaire, pas un remplacement, des
+    correctifs ciblés. `/addons/self/options` = API Supervisor dédiée pour qu'un
+    add-on se configure lui-même sans connaître son propre slug installé (qui varie
+    selon le dépôt d'installation). Idempotent via marker, retente à chaque démarrage
+    tant qu'un appel a échoué."""
+    if os.path.exists(_WATCHDOG_ENABLED_MARKER):
+        return
+    ok = True
+    try:
+        r = sup_post("/addons/self/options", {"watchdog": True})
+        if r.ok:
+            log("[watchdog] ✓ activé pour Domoticium")
+        else:
+            warn(f"[watchdog] échec activation pour Domoticium : HTTP {r.status_code}")
+            ok = False
+    except Exception as e:
+        warn(f"[watchdog] Domoticium : {e}")
+        ok = False
+
+    for slug in (MOSQUITTO_SLUG, FRIGATE_SLUG, MATTER_SLUG, Z2M_SLUG, THREAD_SLUG):
+        if not _is_addon_installed(slug):
+            continue
+        try:
+            r = sup_post(f"/addons/{slug}/options", {"watchdog": True})
+            if r.ok:
+                log(f"[watchdog] ✓ activé pour {slug}")
+            else:
+                warn(f"[watchdog] échec activation pour {slug} : HTTP {r.status_code}")
+                ok = False
+        except Exception as e:
+            warn(f"[watchdog] {slug} : {e}")
+            ok = False
+
+    if ok:
+        open(_WATCHDOG_ENABLED_MARKER, "w").close()
+
+
 _LEGACY_REST_COMMANDS_MARKER = "/data/.legacy_rest_commands_removed"
 
 
@@ -4426,6 +4473,7 @@ def run_bridge():
     start_cloudflared()
     threading.Thread(target=_remove_legacy_heartbeat_automation_once, daemon=True).start()
     threading.Thread(target=_remove_legacy_rest_commands_once, daemon=True).start()
+    threading.Thread(target=_enable_watchdogs_once, daemon=True).start()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
