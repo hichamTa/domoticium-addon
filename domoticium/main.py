@@ -310,6 +310,51 @@ def _sup_repos():
         repos = []
     return [r.get("source", "") for r in repos if isinstance(r, dict)]
 
+
+def _resolve_frigate_slug(attempts: int = 4, delay: float = 5.0) -> bool:
+    """Détermine le VRAI slug de l'add-on Frigate installable depuis FRIGATE_REPO, en
+    interrogeant le Supervisor plutôt qu'en devinant sha1(url)[:8] — cette formule
+    correspond bien au slug de dépôt observé pour l'upstream officiel (vérifié par
+    calcul), mais rien ne garantit qu'elle soit fiable pour n'importe quelle URL (ex:
+    normalisation différente selon casse/slash final) : une 1ère tentative en
+    conditions réelles avec un slug deviné a échoué (404 "does not exist in the
+    store"), cf. HANDOFF §57. Réessaie plusieurs fois avec un délai : le Supervisor met
+    un peu de temps à indexer les add-ons d'un dépôt tout juste ajouté. Met à jour la
+    variable globale FRIGATE_SLUG si trouvé."""
+    global FRIGATE_SLUG
+    for attempt in range(1, attempts + 1):
+        try:
+            r = sup_get("/store/repositories")
+            body = r.json()
+            repos = body.get("data", body) if isinstance(body, dict) else body
+            repos = repos.get("repositories", repos) if isinstance(repos, dict) else repos
+            repo_slug = next(
+                (repo.get("slug") for repo in repos
+                 if isinstance(repo, dict) and repo.get("source") == FRIGATE_REPO),
+                None,
+            )
+            if repo_slug:
+                r2 = sup_get("/store/addons")
+                body2 = r2.json()
+                addons = body2.get("data", body2) if isinstance(body2, dict) else body2
+                addons = addons.get("addons", addons) if isinstance(addons, dict) else addons
+                for addon in addons:
+                    if (
+                        isinstance(addon, dict)
+                        and addon.get("repository") == repo_slug
+                        and str(addon.get("slug", "")).endswith("_frigate")
+                    ):
+                        FRIGATE_SLUG = addon["slug"]
+                        log(f"[frigate] Slug résolu dynamiquement : {FRIGATE_SLUG}")
+                        return True
+        except Exception as e:
+            warn(f"[frigate] Résolution du slug Frigate (tentative {attempt}/{attempts}) : {e}")
+        if attempt < attempts:
+            time.sleep(delay)
+    warn("[frigate] Impossible de résoudre le slug Frigate depuis le store — utilisation du fallback codé en dur")
+    return False
+
+
 def _is_addon_installed(slug: str) -> bool:
     """Vérifie si un add-on est réellement installé (pas seulement disponible en store).
     Le Supervisor retourne 200 même pour les add-ons du store non installés.
@@ -918,6 +963,10 @@ def install_frigate():
             warn(f"Dépôt Frigate : {r.status_code} — on continue")
     else:
         log("Dépôt Frigate déjà présent")
+
+    # 2bis. Résoudre le vrai slug installable (ne pas se fier au slug deviné/codé en
+    # dur — cf. _resolve_frigate_slug, échec réel observé le 2026-07-22).
+    _resolve_frigate_slug()
 
     # 3. Installer si nécessaire
     if not _is_addon_installed(FRIGATE_SLUG):
