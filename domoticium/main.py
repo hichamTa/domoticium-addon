@@ -129,17 +129,11 @@ def warn(msg): print(f"[domoticium] ⚠ {msg}", file=sys.stderr, flush=True)
 
 
 def _local_ipv4() -> str:
-    """IPv4 LAN de l'hôte (host_network: true, donc l'IP de l'hôte lui-même). Utilisée
-    pour forcer go2rtc à écouter sur une adresse précise plutôt que ":8555"/"0.0.0.0:8555"
-    (cf. _webrtc_config_yaml_lines) — les deux sont traitées comme "unspecified" par
-    go2rtc (pkg/xnet.ParseUnspecifiedPort accepte explicitement "0.0.0.0"), donc les deux
-    déclenchent le même chemin de code qui énumère TOUTES les interfaces réseau de l'hôte
-    pour créer un socket par interface (ice.NewMultiUDPMuxFromPort côté pion/ice) — y
-    compris les adresses IPv6 locales instables (fe80::...%eth0) qui font échouer tout le
-    bind et donc TOUT le module WebRTC de go2rtc (retour anticipé dans son Init(), jamais
-    de fallback partiel — vérifié dans le code source go2rtc/pion, cf. HANDOFF). Une
-    adresse IPv4 concrète et non générique bascule sur un simple net.ListenPacket, sans
-    énumération d'interfaces, qui évite complètement ce bug."""
+    """IPv4 LAN de l'hôte (l'addon Domoticium tourne en host_network: true, donc c'est
+    bien l'IP de l'hôte lui-même). Utilisée pour le scan réseau ONVIF (cf.
+    _subnet_onvif_scan) — PAS pour la config webrtc de go2rtc/Frigate : ce dernier
+    tourne dans son propre réseau Docker isolé (host_network: false côté add-on
+    Frigate), donc cette IP n'y existe pas et n'y serait d'aucune utilité."""
     try:
         out = subprocess.check_output(['ip', 'route', 'get', '1.1.1.1'], text=True, timeout=2)
         m = re.search(r'src\s+(\d+\.\d+\.\d+\.\d+)', out)
@@ -995,25 +989,28 @@ def _webrtc_config_yaml_lines() -> list[str]:
     """Section go2rtc.webrtc — go2rtc ne charge ice_servers qu'au démarrage (pas de
     rechargement à chaud), d'où le restart Frigate après chaque rafraîchissement
     périodique des identifiants TURN (cf. _turn_refresh_loop).
-    listen: IP LAN concrète de l'hôte (cf. _local_ipv4), PAS ":8555" ni "0.0.0.0:8555" —
-    les deux sont traités comme "unspecified" par go2rtc (pkg/xnet.ParseUnspecifiedPort
-    accepte explicitement "0.0.0.0", vérifié dans son code source), ce qui déclenche
-    l'énumération de TOUTES les interfaces réseau de l'hôte pour créer un socket par
-    interface — y compris les adresses IPv6 locales instables (fe80::...%eth0), qui
-    font échouer le bind et donc TOUT le module WebRTC de go2rtc dès l'échec de la
-    première interface (retour anticipé dans son Init(), aucun repli partiel). Le
-    filtre filters.networks: [udp4, tcp4] déjà en place ne suffit pas à éviter ce bind
-    raté (il filtre les candidats ICE annoncés, pas les interfaces sondées pendant le
-    bind) — deux récidives réelles malgré ce filtre (2026-07-20 puis "0.0.0.0" testé et
-    toujours en échec le 2026-07-22, cf. HANDOFF). Une adresse concrète et non générique
-    bascule sur un simple `net.ListenPacket` (une seule socket, aucune énumération),
-    qui évite complètement ce chemin de code bugué. Repli sur "0.0.0.0:8555" (comportement
-    précédent, toujours risqué) si l'IP locale n'a pas pu être déterminée."""
-    local_ip = _local_ipv4()
-    listen_addr = f"{local_ip}:8555" if local_ip else "0.0.0.0:8555"
+
+    ⚠️ Ce fichier (frigate.yml → /dev/shm/go2rtc.yaml régénéré par Frigate à chaque
+    démarrage) N'EST PAS la source de vérité pour la section webrtc en pratique — le
+    go2rtc qui redémarre semble ignorer ce fichier régénéré pour cette section (même
+    phénomène déjà connu pour les flux caméra, cf. _resync_go2rtc_streams — et confirmé
+    en conditions réelles le 2026-07-22 : 3 valeurs de `listen` différentes testées ici
+    sans le moindre effet observable). La config webrtc réellement active est celle
+    persistée via API par _ensure_go2rtc_webrtc_persisted() — cette section-ci est
+    gardée cohérente avec elle par prudence/lisibilité, mais si les deux devaient un
+    jour diverger, c'est CETTE fonction-là qui fait foi, pas celle-ci.
+
+    listen: "0.0.0.0:8555", PAS l'IP LAN de l'hôte — l'add-on Frigate tourne en réseau
+    Docker isolé (host_network: false dans son propre config.yaml), donc l'IP LAN de
+    l'hôte n'existe pas à l'intérieur de son conteneur (confirmé en réel : "cannot
+    assign requested address" sur une IP pourtant correcte côté hôte). "0.0.0.0" est
+    traité comme "unspecified" par go2rtc et énumère donc les interfaces DU CONTENEUR,
+    filtrées par filters.networks: [udp4, tcp4] pour exclure l'IPv6 locale instable de
+    son interface pont Docker — cf. _ensure_go2rtc_webrtc_persisted() pour le détail
+    complet de cette investigation."""
     lines = [
         "  webrtc:",
-        f'    listen: "{listen_addr}"',
+        '    listen: "0.0.0.0:8555"',
         "    filters:",
         "      networks: [udp4, tcp4]",
         "    ice_servers:",
@@ -3539,39 +3536,44 @@ def _resync_go2rtc_streams():
             warn(f"[frigate] Échec resynchronisation go2rtc : '{name}'")
 
 
-_WEBRTC_PERSISTED_MARKER = "/data/.webrtc_persisted"
-
-
 def _ensure_go2rtc_webrtc_persisted():
     """Même mécanisme que _resync_go2rtc_streams() ci-dessus, appliqué à la section
     webrtc plutôt qu'aux flux : go2rtc redémarre avec la config "primaire" persistée
     (/config/go2rtc_homekit.yml côté Frigate), pas avec celle régénérée depuis notre
-    frigate.yml — confirmé en conditions réelles le 2026-07-22 (l'éditeur de config
-    Frigate ne montre ni auth, ni go2rtc, ni caméras alors que tout fonctionne par
-    ailleurs ; le bind WebRTC échoue de façon identique malgré 3 valeurs de `listen`
-    différentes testées, preuve que le fichier régénéré n'est jamais réellement pris en
-    compte). _resync_go2rtc_streams() contourne déjà ce problème pour les flux via
-    l'API à chaud (PUT /api/streams, confirmé fiable) — même remède ici via
-    PATCH /api/config (même mécanisme interne côté go2rtc, app.PatchConfig, qui écrit
-    dans le fichier "primaire" chargé en premier). webrtc.listen n'est pas rechargeable
-    à chaud (cf. _webrtc_config_yaml_lines) : un restart Frigate est nécessaire après
-    la 1ère persistance, mais une seule fois — vérifié via GET avant tout PATCH pour ne
-    pas redémarrer Frigate à chaque démarrage de l'addon une fois la config en place."""
-    if os.path.exists(_WEBRTC_PERSISTED_MARKER):
-        return
+    frigate.yml — confirmé en conditions réelles le 2026-07-22 (_resync_go2rtc_streams()
+    contourne déjà ce problème pour les flux via l'API à chaud, PUT /api/streams ;
+    même remède ici via PATCH /api/config, même mécanisme interne côté go2rtc).
+
+    listen: "0.0.0.0:8555" et PAS l'IP LAN de l'hôte — contrairement à l'add-on
+    Domoticium (host_network: true), l'add-on Frigate tourne en réseau Docker isolé
+    (host_network: false dans son propre config.yaml, vérifié sur GitHub) : l'IP LAN de
+    l'hôte (ex: 192.168.1.144) n'existe pas à l'intérieur de son conteneur — confirmé en
+    conditions réelles le 2026-07-22, "cannot assign requested address" alors même que
+    la persistance fonctionnait enfin (preuve : l'erreur montrait cette fois l'IP qu'on
+    avait configurée, plus une IPv6 mystère). "0.0.0.0" est traité comme "unspecified"
+    par go2rtc et énumère donc les interfaces DU CONTENEUR (pas de l'hôte) — sa propre
+    interface pont Docker a probablement la même instabilité IPv6 locale que celle
+    observée au tout départ (cf. HANDOFF §35/§49), d'où filters.networks: [udp4, tcp4]
+    ci-dessous : sans lui, on retomberait dans le bug d'origine. Ce filtre n'ayant
+    jamais été réellement chargé par go2rtc jusqu'à cette persistance via API
+    (cf. §52/§53), c'est la première fois qu'il a une chance d'être réellement actif.
+
+    webrtc.listen n'est pas rechargeable à chaud (cf. _webrtc_config_yaml_lines) : un
+    restart Frigate est nécessaire après toute nouvelle persistance. Vérifie la valeur
+    EXACTE de listen (pas juste la présence de la clé webrtc) avant de patcher, pour
+    rester idempotent une fois la bonne valeur en place, tout en corrigeant
+    automatiquement une valeur précédente incorrecte (ex: IP hôte laissée par une
+    version antérieure de l'addon)."""
     try:
         r = requests.get("http://127.0.0.1:1984/api/config", timeout=5)
         if not r.ok:
             return
-        if re.search(r'^\s*webrtc\s*:', r.text, re.MULTILINE):
-            open(_WEBRTC_PERSISTED_MARKER, "w").close()
+        if re.search(r'listen:\s*"?0\.0\.0\.0:8555"?', r.text):
             return
 
-        local_ip = _local_ipv4()
-        listen_addr = f"{local_ip}:8555" if local_ip else "0.0.0.0:8555"
         patch_yaml = (
             "webrtc:\n"
-            f'  listen: "{listen_addr}"\n'
+            '  listen: "0.0.0.0:8555"\n'
             "  filters:\n"
             "    networks: [udp4, tcp4]\n"
         )
@@ -3582,8 +3584,7 @@ def _ensure_go2rtc_webrtc_persisted():
             timeout=5,
         )
         if r.ok:
-            log("[webrtc] Config webrtc persistée côté go2rtc (fichier primaire) — restart Frigate pour l'appliquer")
-            open(_WEBRTC_PERSISTED_MARKER, "w").close()
+            log("[webrtc] Config webrtc (ré)persistée côté go2rtc (fichier primaire) — restart Frigate pour l'appliquer")
             restart_frigate()
         else:
             warn(f"[webrtc] Échec persistance config webrtc : HTTP {r.status_code} {r.text[:200]}")
