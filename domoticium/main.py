@@ -132,6 +132,15 @@ _turn_ice_servers: list[dict] = []
 # Client MQTT local (Mosquitto, Z2M ↔ HA) — plus de client cloud, EMQX est retiré.
 _local_client: mqtt.Client | None = None
 
+# Cache court des capacités ONVIF détectées par le dernier scan réseau, par IP —
+# cf. _safe_probe_capabilities. Évite une 2e salve de connexions ONVIF vers la même
+# caméra quelques secondes après le scan (au moment du "Tester la connexion" lors de
+# l'ajout), qui entre en collision avec la caméra encore occupée par le scan et fait
+# échouer la détection silencieusement (confirmé en conditions réelles le 2026-07-23,
+# persistait même avec un retry — cf. HANDOFF §68/§69).
+_SCAN_CAPABILITIES_CACHE_TTL = 120.0  # secondes
+_scan_capabilities_cache: dict[str, tuple[float, list]] = {}
+
 
 def log(msg):  print(f"[domoticium] {msg}", flush=True)
 def warn(msg): print(f"[domoticium] ⚠ {msg}", file=sys.stderr, flush=True)
@@ -4227,13 +4236,15 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
         if not rtsp_url:
             rtsp_url = _rtsp_fallback(manufacturer, ip)
 
+        caps = _onvif_capabilities_from_xaddr(xaddr)
+        _scan_capabilities_cache[ip] = (time.time(), caps)
         results.append({
             'ip':           ip,
             'manufacturer': manufacturer,
             'model':        model,
             'name':         (f'{manufacturer} {model}'.strip()) or f'Caméra {ip}',
             'rtspUrl':      rtsp_url,
-            'capabilities': _onvif_capabilities_from_xaddr(xaddr),
+            'capabilities': caps,
         })
     log(f'[onvif-scan] {len(results)} caméra(s) ONVIF confirmée(s) sur {len(xaddrs)} IP(s) scannée(s)')
     return results
@@ -4387,7 +4398,19 @@ def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0, attempts: int
 
 def _safe_probe_capabilities(ip: str) -> list:
     """Ne doit jamais faire échouer le test de connexion caméra (résultat principal)
-    si la sonde ONVIF de capacités plante ou traîne — pure best-effort."""
+    si la sonde ONVIF de capacités plante ou traîne — pure best-effort.
+
+    Réutilise le résultat d'un scan réseau récent pour cette IP plutôt que de
+    relancer une sonde ONVIF complète — le scan (_scan_onvif_cameras) vient déjà de
+    faire 5-6 appels ONVIF vers cette même caméra quelques secondes plus tôt (pour la
+    lister) ; la reprobe depuis zéro juste après crée une collision avec la caméra
+    encore occupée par le scan (certaines n'acceptent qu'une connexion ONVIF à la
+    fois) et fait échouer la détection en silence — confirmé en conditions réelles le
+    2026-07-23, persistait même avec 2 tentatives (retry seul ne suffisait pas :
+    le problème n'était pas un aléa réseau ponctuel mais une vraie ressource occupée)."""
+    cached = _scan_capabilities_cache.get(ip)
+    if cached and (time.time() - cached[0]) < _SCAN_CAPABILITIES_CACHE_TTL:
+        return cached[1]
     try:
         return _probe_onvif_capabilities_by_ip(ip)
     except Exception as e:
