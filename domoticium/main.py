@@ -4358,13 +4358,30 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
     return sorted(caps)
 
 
-def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0) -> list:
+def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0, attempts: int = 2, retry_delay: float = 1.5) -> list:
     """Variante pour l'ajout manuel (IP connue, device_service ONVIF pas encore
-    localisé) — essaie les ports ONVIF courants avant d'abandonner silencieusement."""
-    for port in (8000, 80):
-        caps = _onvif_capabilities_from_xaddr(f'http://{ip}:{port}/onvif/device_service', timeout=timeout)
-        if caps:
-            return caps
+    localisé) — essaie les ports ONVIF courants, sur 2 tentatives avant d'abandonner.
+    Une caméra qui vient de répondre à un scan réseau ou un test précédent peut être
+    momentanément occupée (connexion ONVIF concurrente, redémarrage Frigate qui vient
+    de se produire) et ne pas répondre du premier coup — confirmé en conditions
+    réelles le 2026-07-23 : caméra détectée avec succès par le scan quelques secondes
+    plus tôt, puis capabilities=[] au test manuel suivant, sans aucune erreur visible
+    côté utilisateur (best-effort, échec avalé en silence).
+
+    Limité à 2 tentatives (pas plus) : l'appelant HTTP (route Next.js
+    /api/cameras/test) a un maxDuration de 40s côté Vercel — dans le pire cas
+    (caméra jamais jointe, 2 ports × ~4 appels ONVIF × timeout à chaque tentative),
+    le budget total doit rester compatible avec cette limite, en plus du temps déjà
+    consommé par le test RTSP principal qui s'exécute avant. Ne bloque jamais ce
+    test principal, qui a son propre chemin — juste la détection de capacités, en
+    complément, best-effort."""
+    for attempt in range(1, attempts + 1):
+        for port in (8000, 80):
+            caps = _onvif_capabilities_from_xaddr(f'http://{ip}:{port}/onvif/device_service', timeout=timeout)
+            if caps:
+                return caps
+        if attempt < attempts:
+            time.sleep(retry_delay)
     return []
 
 
