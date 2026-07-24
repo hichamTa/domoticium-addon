@@ -4236,6 +4236,14 @@ def _scan_onvif_cameras(timeout: float = 12.0) -> list:
         if not rtsp_url:
             rtsp_url = _rtsp_fallback(manufacturer, ip)
 
+        # Courte pause avant la sonde de capacités : cette même caméra vient déjà de
+        # recevoir 3-4 appels ONVIF dos-à-dos ci-dessus (GetDeviceInformation,
+        # GetCapabilities, GetProfiles, GetStreamUri) — confirmé en conditions réelles
+        # le 2026-07-24 (§70) : capabilities=[] alors même que le cache scan a bien été
+        # réutilisé au test suivant (donc le problème n'est pas scan-vs-test, déjà
+        # corrigé en v2.9.24, mais une collision À L'INTÉRIEUR du scan lui-même, sur
+        # une caméra qui n'accepte qu'une session ONVIF à la fois).
+        time.sleep(0.5)
         caps = _onvif_capabilities_from_xaddr(xaddr)
         _scan_capabilities_cache[ip] = (time.time(), caps)
         results.append({
@@ -4315,6 +4323,14 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
         # Nécessaire pour diagnostiquer objectivement plutôt que par supposition.
         warn(f'[onvif-capabilities] GetCapabilities {device_xaddr}: {e}')
         return []
+
+    # Journalisé même en cas de succès apparent (pas d'exception) : une caméra
+    # sous forte charge (juste après une rafale d'appels ONVIF/TCP précédente,
+    # cf. _scan_onvif_cameras) peut répondre 200 avec un corps SOAP vide ou
+    # tronqué plutôt que lever une erreur réseau — un cas jamais distingué
+    # jusqu'ici d'une caméra qui n'a réellement aucun de ces services.
+    if len(xml) < 200:
+        warn(f'[onvif-capabilities] GetCapabilities {device_xaddr}: réponse suspicieusement courte ({len(xml)} caractères) — {xml!r}')
 
     if _xml_has_tag(xml, 'PTZ'):
         # La présence du service PTZ dans GetCapabilities ne dit rien sur les axes
