@@ -1246,13 +1246,16 @@ def _generate_frigate_yaml() -> str:
         lines.append("  streams:")
         for name, rtsp_url in _cameras.items():
             lines += [f"    {name}:", f"      - {rtsp_url}"]
-            if name in _camera_talk_enabled:
-                # Deuxième source = même caméra, marquée #backchannel=0 → go2rtc y
-                # envoie l'audio reçu du navigateur (bouton "parler") au lieu de le
-                # lire. Combinaison confirmée par la doc communautaire go2rtc pour les
-                # caméras Reolink — PAS testée en conditions réelles ici (cf. HANDOFF),
-                # certains modèles n'acceptent qu'un seul client RTSP à la fois.
-                lines.append(f"      - {rtsp_url}#backchannel=0")
+            # PAS de 2e source '#backchannel=0' ici (retiré §76/§77) : contresens sur la
+            # doc go2rtc (internal/rtsp/README.md) — ce flag DÉSACTIVE le two-way audio
+            # sur la source qui le porte, il ne le redirige pas dessus. go2rtc négocie
+            # le two-way audio automatiquement en ONVIF Profile T, dans LA MÊME session
+            # RTSP que la vidéo, dès qu'un client WebRTC envoie une piste audio sendonly
+            # — dans l'unique source ci-dessus, pas besoin d'une deuxième. Cette 2e
+            # source dupliquée (même URL) ouvrait une vraie 2e connexion RTSP
+            # concurrente vers la caméra — confirmé en conditions réelles le 2026-07-24
+            # (§76) : erreurs RTP "bad cseq" + timeout + crash ffmpeg dès l'activation
+            # du micro, sur une caméra qui n'accepte qu'un client RTSP à la fois.
         lines += _webrtc_config_yaml_lines()
         lines.append("")
         lines.append("cameras:")
