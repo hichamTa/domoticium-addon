@@ -4311,9 +4311,20 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
     liste vide si la caméra ne répond pas ou n'expose rien."""
     caps = set()
     try:
+        # Category explicite plutôt qu'omise : le scan (_scan_onvif_cameras) demande
+        # déjà explicitement <tds:Category>Media</tds:Category> et obtient une réponse
+        # complète pour cette même caméra quelques appels plus tôt — alors que cet
+        # appel-ci, sans aucune Category, revenait systématiquement vide (§70/§71 :
+        # confirmé en conditions réelles, aucune exception, aucune réponse anormalement
+        # courte non plus, donc pas un problème de collision/timeout). La norme ONVIF
+        # dit que Category omise doit valoir "All" par défaut, mais du firmware ONVIF
+        # bon marché (très répandu, cf. Reolink) l'interprète parfois comme "Device
+        # seulement" — explicite = plus fiable que de compter sur un défaut ambigu.
         xml = _onvif_soap(
             device_xaddr,
-            '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
+            '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+            '<tds:Category>All</tds:Category>'
+            '</tds:GetCapabilities>',
             timeout=timeout,
         )
     except Exception as e:
@@ -4331,6 +4342,12 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
     # jusqu'ici d'une caméra qui n'a réellement aucun de ces services.
     if len(xml) < 200:
         warn(f'[onvif-capabilities] GetCapabilities {device_xaddr}: réponse suspicieusement courte ({len(xml)} caractères) — {xml!r}')
+    elif not _xml_has_tag(xml, 'PTZ'):
+        # Réponse "normale" en apparence mais sans section PTZ — utile à voir en clair
+        # si le fix Category=All ne suffisait pas : contenu réel plutôt qu'une simple
+        # taille, pour juger si la caméra n'a vraiment pas de PTZ ou si la réponse est
+        # tronquée/incomplète d'une autre façon.
+        log(f'[onvif-capabilities] {device_xaddr}: pas de tag PTZ — extrait réponse : {xml[:400]!r}')
 
     if _xml_has_tag(xml, 'PTZ'):
         # La présence du service PTZ dans GetCapabilities ne dit rien sur les axes
