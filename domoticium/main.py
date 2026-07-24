@@ -1257,19 +1257,20 @@ def _generate_frigate_yaml() -> str:
             # (§76) : erreurs RTP "bad cseq" + timeout + crash ffmpeg dès l'activation
             # du micro, sur une caméra qui n'accepte qu'un client RTSP à la fois.
             #
-            # 2e source ffmpeg (§78/§79) : PAS une 2e connexion RTSP vers la caméra
-            # (même risque que ci-dessus) — 'ffmpeg:{name}#...' réutilise en entrée le
-            # flux déjà reçu par go2rtc lui-même (nom de stream go2rtc comme source
-            # ffmpeg, cf. internal/ffmpeg/README.md), vidéo copiée telle quelle (aucun
-            # réencodage, coût CPU négligeable), audio transcodé en Opus. Nécessaire
-            # car cette caméra envoie son audio en AAC (confirmé via
-            # /api/streams?src=... le 2026-07-25) — codec qu'aucun navigateur
-            # n'accepte en WebRTC (Opus/G722/PCMU/PCMA/L16 seulement) ; sans
-            # transcodage, go2rtc reçoit l'audio mais ne peut jamais l'exposer au
-            # consumer WebRTC (aucun "sender" audio, confirmé dans la même réponse
-            # API). Problème générique de compatibilité de codec, pas propre à
-            # Reolink — appliqué à toutes les caméras, pas seulement celle-ci.
-            lines.append(f"      - ffmpeg:{name}#video=copy#audio=opus")
+            # 2e source ffmpeg audio=opus (§79) RETIRÉE en §80 — le transcodage
+            # fonctionnait bien côté serveur (audio Opus effectivement transmis, vérifié
+            # via /api/streams) et un bug d'app séparé empêchait de l'entendre (corrigé,
+            # cf. HANDOFF §80). Une fois ce bug corrigé, Hicham a confirmé en conditions
+            # réelles un sifflement aigu qui monte jusqu'à l'ultrason dans les
+            # haut-parleurs de son ordinateur — douloureux, pas un effet Larsen physique
+            # près de la caméra (confirmé : le son se développe dans SES enceintes, pas
+            # celles de la caméra). Cause probable : dérive d'horloge/PTS dans le
+            # transcodage live via la source ffmpeg auto-référencée (ffmpeg lit le
+            # restream RTSP de go2rtc lui-même plutôt que la caméra directement — plus
+            # sûr pour éviter une 2e connexion RTSP concurrente vers la caméra, cf.
+            # §76/§77, mais visiblement pas neutre sur la synchronisation audio). Retiré
+            # par précaution le temps de trouver un réglage sûr — ne pas remettre sans
+            # d'abord tester longuement, faible volume, prêt à couper immédiatement.
         lines += _webrtc_config_yaml_lines()
         lines.append("")
         lines.append("cameras:")
