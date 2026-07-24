@@ -4285,31 +4285,53 @@ def _onvif_deviceio_xaddr(device_xaddr: str, timeout: float = 3.0) -> str:
     return ''
 
 
-def _onvif_has_relay_output(device_xaddr: str, timeout: float = 3.0) -> bool:
+def _onvif_has_relay_output(device_xaddr: str, timeout: float = 3.0, username: str = '', password: str = '') -> bool:
     """True si la caméra expose au moins une sortie relais ONVIF pilotable. Pas de
     service ONVIF standard "Sirène" — DeviceIO/RelayOutput est le seul mécanisme
     générique, et rien ne dit qu'il est câblé sur une sirène plutôt qu'un projecteur
-    ou une gâche électrique : signal best-effort, pas une garantie de sémantique."""
+    ou une gâche électrique : signal best-effort, pas une garantie de sémantique.
+
+    GetRelayOutputs est Access Class READ_MEDIA dans la spec ONVIF Device-IO (§70-§72,
+    vérifié directement dans le PDF officiel) — sans WS-Security, une caméra qui
+    applique cette règle renvoie un Fault ou un corps vide, jamais une erreur réseau,
+    donc jamais détecté avant (cf. _onvif_capabilities_from_xaddr)."""
     deviceio_xaddr = _onvif_deviceio_xaddr(device_xaddr, timeout=timeout)
     if not deviceio_xaddr:
         return False
+    header = _onvif_ws_security_header(username, password) if username and password else ''
     try:
         xml = _onvif_soap(
             deviceio_xaddr,
             '<tmd:GetRelayOutputs xmlns:tmd="http://www.onvif.org/ver10/deviceIO/wsdl"/>',
             timeout=timeout,
+            header=header,
         )
     except Exception:
         return False
     return bool(_xml_attr(xml, 'RelayOutputs', 'token'))
 
 
-def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> list:
+def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0, username: str = '', password: str = '') -> list:
     """Détecte PTZ/zoom (axes réellement supportés par le nœud PTZ, cf. ci-dessous),
     talk/speaker (AudioOutputConfiguration dans un profil média) et siren (sortie
     relais DeviceIO) à partir d'un device_service ONVIF déjà connu. Best-effort :
-    liste vide si la caméra ne répond pas ou n'expose rien."""
+    liste vide si la caméra ne répond pas ou n'expose rien.
+
+    username/password optionnels : GetNodes (PTZ), GetProfiles (Media) et
+    GetRelayOutputs (DeviceIO) sont TOUS Access Class READ_MEDIA dans les
+    spécifications ONVIF officielles (vérifié directement dans les PDF PTZ/Media/
+    Device-IO le 2026-07-24, à la demande d'Hicham, après que §70/§71/§72 aient
+    épuisé les hypothèses de collision/timing sans jamais trouver la vraie cause).
+    Seul GetCapabilities est PRE_AUTH. Sans WS-Security, une caméra qui applique
+    correctement ces règles d'accès renvoie un Fault ou un corps vide plutôt qu'une
+    erreur réseau franche — indiscernable en pratique d'une caméra qui n'a
+    réellement aucun de ces services, d'où les échecs 100% silencieux observés
+    jusqu'ici. Le scan réseau (_scan_onvif_cameras), lui, ne peut structurellement
+    jamais fournir ces identifiants (aucun mot de passe saisi à ce stade) — la
+    sonde à l'ajout/test, quand le mot de passe est connu, est donc la seule à
+    pouvoir s'authentifier."""
     caps = set()
+    header = _onvif_ws_security_header(username, password) if username and password else ''
     try:
         # Category explicite plutôt qu'omise : le scan (_scan_onvif_cameras) demande
         # déjà explicitement <tds:Category>Media</tds:Category> et obtient une réponse
@@ -4369,6 +4391,7 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
                     ptz_xaddr,
                     '<tptz:GetNodes xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"/>',
                     timeout=timeout,
+                    header=header,
                 )
                 if _xml_has_tag(nxml, 'ContinuousPanTiltVelocitySpace'):
                     caps.add('ptz')
@@ -4395,6 +4418,7 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
                 media_url,
                 '<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>',
                 timeout=timeout,
+                header=header,
             )
             if _xml_has_tag(pxml, 'AudioOutputConfiguration'):
                 caps.add('talk')
@@ -4402,13 +4426,16 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
         except Exception:
             pass
 
-    if _onvif_has_relay_output(device_xaddr, timeout=timeout):
+    if _onvif_has_relay_output(device_xaddr, timeout=timeout, username=username, password=password):
         caps.add('siren')
 
     return sorted(caps)
 
 
-def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0, attempts: int = 2, retry_delay: float = 1.5) -> list:
+def _probe_onvif_capabilities_by_ip(
+    ip: str, timeout: float = 3.0, attempts: int = 2, retry_delay: float = 1.5,
+    username: str = '', password: str = '',
+) -> list:
     """Variante pour l'ajout manuel (IP connue, device_service ONVIF pas encore
     localisé) — essaie les ports ONVIF courants, sur 2 tentatives avant d'abandonner.
     Une caméra qui vient de répondre à un scan réseau ou un test précédent peut être
@@ -4427,7 +4454,10 @@ def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0, attempts: int
     complément, best-effort."""
     for attempt in range(1, attempts + 1):
         for port in (8000, 80):
-            caps = _onvif_capabilities_from_xaddr(f'http://{ip}:{port}/onvif/device_service', timeout=timeout)
+            caps = _onvif_capabilities_from_xaddr(
+                f'http://{ip}:{port}/onvif/device_service', timeout=timeout,
+                username=username, password=password,
+            )
             if caps:
                 return caps
         if attempt < attempts:
@@ -4436,23 +4466,38 @@ def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0, attempts: int
     return []
 
 
-def _safe_probe_capabilities(ip: str) -> list:
+def _safe_probe_capabilities(ip: str, username: str = '', password: str = '') -> list:
     """Ne doit jamais faire échouer le test de connexion caméra (résultat principal)
     si la sonde ONVIF de capacités plante ou traîne — pure best-effort.
 
-    Réutilise le résultat d'un scan réseau récent pour cette IP plutôt que de
-    relancer une sonde ONVIF complète — le scan (_scan_onvif_cameras) vient déjà de
-    faire 5-6 appels ONVIF vers cette même caméra quelques secondes plus tôt (pour la
-    lister) ; la reprobe depuis zéro juste après crée une collision avec la caméra
-    encore occupée par le scan (certaines n'acceptent qu'une connexion ONVIF à la
-    fois) et fait échouer la détection en silence — confirmé en conditions réelles le
-    2026-07-23, persistait même avec 2 tentatives (retry seul ne suffisait pas :
-    le problème n'était pas un aléa réseau ponctuel mais une vraie ressource occupée)."""
+    Si un mot de passe est fourni (ajout/test réel, cf. _handle_camera_test_route),
+    une sonde FRAÎCHE ET AUTHENTIFIÉE est toujours relancée plutôt que de réutiliser
+    le cache du scan réseau — vérifié dans les spécifications ONVIF officielles
+    (2026-07-24) que GetNodes/GetProfiles/GetRelayOutputs sont Access Class
+    READ_MEDIA, donc le scan (qui n'a structurellement JAMAIS de mot de passe à ce
+    stade) ne peut par nature détecter qu'un sous-ensemble des capacités — le cache
+    ne peut pas remplacer une sonde qui, elle, peut s'authentifier (§72).
+
+    Sans mot de passe (aucun moyen de s'authentifier de toute façon), réutilise le
+    résultat d'un scan réseau récent pour cette IP plutôt que de relancer une sonde
+    ONVIF complète — le scan (_scan_onvif_cameras) vient déjà de faire 5-6 appels
+    ONVIF vers cette même caméra quelques secondes plus tôt (pour la lister) ; la
+    reprobe depuis zéro juste après crée une collision avec la caméra encore occupée
+    par le scan (certaines n'acceptent qu'une connexion ONVIF à la fois) — confirmé
+    en conditions réelles le 2026-07-23."""
+    if username and password:
+        log(f'[onvif-capabilities] {ip}: mot de passe disponible — sonde authentifiée fraîche (pas de réutilisation du cache scan)')
+        try:
+            return _probe_onvif_capabilities_by_ip(ip, username=username, password=password)
+        except Exception as e:
+            warn(f'[onvif-capabilities] {ip}: {e}')
+            return []
+
     cached = _scan_capabilities_cache.get(ip)
     if cached and (time.time() - cached[0]) < _SCAN_CAPABILITIES_CACHE_TTL:
         log(f'[onvif-capabilities] {ip}: cache scan réutilisé ({cached[1]})')
         return cached[1]
-    log(f'[onvif-capabilities] {ip}: pas de scan récent en cache — sonde ONVIF directe')
+    log(f'[onvif-capabilities] {ip}: pas de scan récent en cache — sonde ONVIF directe (non authentifiée, pas de mot de passe connu)')
     try:
         return _probe_onvif_capabilities_by_ip(ip)
     except Exception as e:
@@ -4722,8 +4767,14 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         if rtsp_url:
             # Mode "URL manuelle" — l'utilisateur a fourni l'URL exacte, aucune devinette.
             ok, detail = _go2rtc_test_stream(rtsp_url)
-            ip_m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', rtsp_url)
-            caps = _safe_probe_capabilities(ip_m.group(1)) if ip_m else []
+            try:
+                onvif_ip, onvif_user, onvif_pass = _onvif_credentials_from_rtsp(rtsp_url)
+            except ValueError:
+                onvif_ip, onvif_user, onvif_pass = '', '', ''
+            if not onvif_ip:
+                ip_m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', rtsp_url)
+                onvif_ip = ip_m.group(1) if ip_m else ''
+            caps = _safe_probe_capabilities(onvif_ip, username=onvif_user, password=onvif_pass) if onvif_ip else []
             return self._ok({"ok": ok, "detail": detail, "correctedUrl": None, "detectedCapabilities": caps})
 
         ip = data.get("ip")
@@ -4732,7 +4783,11 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             return self._reject(400, "ip et password requis (ou rtspUrl)")
         manufacturer = data.get("manufacturer") or ""
         ok, detail, url = _test_camera_by_brand(ip, password, manufacturer)
-        self._ok({"ok": ok, "detail": detail, "correctedUrl": url, "detectedCapabilities": _safe_probe_capabilities(ip)})
+        # username "admin" : convention constante des templates RTSP de toutes les
+        # marques du projet (_RTSP_TEMPLATES) — même hypothèse déjà utilisée ailleurs
+        # pour les commandes ONVIF authentifiées (PTZ, vision nocturne).
+        caps = _safe_probe_capabilities(ip, username="admin", password=password)
+        self._ok({"ok": ok, "detail": detail, "correctedUrl": url, "detectedCapabilities": caps})
 
     def _camera_onvif_credentials(self, stream_name):
         """Retrouve (ip, username, password) à partir du streamName — réutilise les
