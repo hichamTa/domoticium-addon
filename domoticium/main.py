@@ -1256,6 +1256,20 @@ def _generate_frigate_yaml() -> str:
             # concurrente vers la caméra — confirmé en conditions réelles le 2026-07-24
             # (§76) : erreurs RTP "bad cseq" + timeout + crash ffmpeg dès l'activation
             # du micro, sur une caméra qui n'accepte qu'un client RTSP à la fois.
+            #
+            # 2e source ffmpeg (§78/§79) : PAS une 2e connexion RTSP vers la caméra
+            # (même risque que ci-dessus) — 'ffmpeg:{name}#...' réutilise en entrée le
+            # flux déjà reçu par go2rtc lui-même (nom de stream go2rtc comme source
+            # ffmpeg, cf. internal/ffmpeg/README.md), vidéo copiée telle quelle (aucun
+            # réencodage, coût CPU négligeable), audio transcodé en Opus. Nécessaire
+            # car cette caméra envoie son audio en AAC (confirmé via
+            # /api/streams?src=... le 2026-07-25) — codec qu'aucun navigateur
+            # n'accepte en WebRTC (Opus/G722/PCMU/PCMA/L16 seulement) ; sans
+            # transcodage, go2rtc reçoit l'audio mais ne peut jamais l'exposer au
+            # consumer WebRTC (aucun "sender" audio, confirmé dans la même réponse
+            # API). Problème générique de compatibilité de codec, pas propre à
+            # Reolink — appliqué à toutes les caméras, pas seulement celle-ci.
+            lines.append(f"      - ffmpeg:{name}#video=copy#audio=opus")
         lines += _webrtc_config_yaml_lines()
         lines.append("")
         lines.append("cameras:")
