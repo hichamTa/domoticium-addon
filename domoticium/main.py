@@ -4308,7 +4308,12 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
             '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
             timeout=timeout,
         )
-    except Exception:
+    except Exception as e:
+        # Volontairement journalisé (pas juste avalé) : ce best-effort a échoué en
+        # silence à plusieurs reprises (§67-§69) sans jamais laisser de trace de LA
+        # raison réelle — timeout ? connexion refusée ? réponse SOAP invalide ?
+        # Nécessaire pour diagnostiquer objectivement plutôt que par supposition.
+        warn(f'[onvif-capabilities] GetCapabilities {device_xaddr}: {e}')
         return []
 
     if _xml_has_tag(xml, 'PTZ'):
@@ -4336,11 +4341,12 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0) -> l
                     caps.add('ptz')
                 if _xml_has_tag(nxml, 'ContinuousZoomVelocitySpace'):
                     caps.add('zoom')
-            except Exception:
+            except Exception as e:
                 # GetNodes non supporté/exige une authentification sur cette caméra —
                 # repli conservateur : le service PTZ existe donc on suppose au moins
                 # pan/tilt, mais on n'ajoute plus zoom sans confirmation (c'était
                 # justement le bug : zoom ajouté sans jamais être vérifié).
+                warn(f'[onvif-capabilities] GetNodes {ptz_xaddr}: {e} — repli ptz seul')
                 caps.add('ptz')
         else:
             caps.add('ptz')
@@ -4393,6 +4399,7 @@ def _probe_onvif_capabilities_by_ip(ip: str, timeout: float = 3.0, attempts: int
                 return caps
         if attempt < attempts:
             time.sleep(retry_delay)
+    warn(f'[onvif-capabilities] {ip}: aucune capacité détectée après {attempts} tentative(s) — voir les échecs GetCapabilities ci-dessus')
     return []
 
 
@@ -4410,7 +4417,9 @@ def _safe_probe_capabilities(ip: str) -> list:
     le problème n'était pas un aléa réseau ponctuel mais une vraie ressource occupée)."""
     cached = _scan_capabilities_cache.get(ip)
     if cached and (time.time() - cached[0]) < _SCAN_CAPABILITIES_CACHE_TTL:
+        log(f'[onvif-capabilities] {ip}: cache scan réutilisé ({cached[1]})')
         return cached[1]
+    log(f'[onvif-capabilities] {ip}: pas de scan récent en cache — sonde ONVIF directe')
     try:
         return _probe_onvif_capabilities_by_ip(ip)
     except Exception as e:
