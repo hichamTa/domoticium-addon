@@ -1243,6 +1243,21 @@ def _generate_frigate_yaml() -> str:
         # implicite plutôt que de continuer à en deviner la raison exacte.
         lines.append("  api:")
         lines.append('    origin: "*"')
+        # Format ffmpeg personnalisé pour la conversion audio d'écoute (§79-§82) —
+        # défini UNE FOIS ici, appliqué à toutes les caméras indifféremment de leur
+        # matériel. Ne PAS coller ce réglage aux caractéristiques d'une caméra
+        # particulière (ex. sa fréquence audio native) : le parc de caméras des
+        # clients est hétérogène par nature (marques/modèles différents à chaque
+        # installation), un réglage figé sur une seule caméra testée casserait pour
+        # les autres. Sortie fixée à 48000Hz stéréo (le format natif attendu par
+        # WebRTC/Opus côté navigateur, confirmé par l'offre SDP du navigateur :
+        # "audio, sendonly, OPUS/48000/2") quelle que soit l'entrée — ffmpeg
+        # rééchantillonne depuis n'importe quelle fréquence/nombre de canaux source.
+        # -min_comp 0 : incrément d'horodatage audio constant, requis pour une bonne
+        # qualité WebRTC (cf. internal/ffmpeg/ffmpeg.go, code source go2rtc, et
+        # https://github.com/pion/webrtc/issues/1514).
+        lines.append("  ffmpeg:")
+        lines.append('    opus_listen: "-c:a libopus -application:a lowdelay -min_comp 0 -ar:a 48000 -ac:a 2"')
         lines.append("  streams:")
         for name, rtsp_url in _cameras.items():
             lines += [f"    {name}:", f"      - {rtsp_url}"]
@@ -1257,20 +1272,13 @@ def _generate_frigate_yaml() -> str:
             # (§76) : erreurs RTP "bad cseq" + timeout + crash ffmpeg dès l'activation
             # du micro, sur une caméra qui n'accepte qu'un client RTSP à la fois.
             #
-            # 2e source ffmpeg (§79) : transcodage audio en Opus pour l'écoute (cette
-            # caméra envoie son audio natif en AAC/16000Hz, incompatible WebRTC). Un
-            # premier essai avec le modèle générique 'audio=opus' (§80) a provoqué un
-            # sifflement aigu montant jusqu'à l'ultrason dans les enceintes d'Hicham
-            # (§81, retiré par précaution). Cause probable trouvée en relisant
-            # internal/ffmpeg/ffmpeg.go (code source go2rtc) : le modèle 'opus'
-            # générique ne force aucune fréquence d'échantillonnage de sortie, laissant
-            # ffmpeg/libopus rééchantillonner par défaut — go2rtc fournit justement un
-            # modèle dédié 'opus/16000' (force -ar:a 16000 -ac:a 1) pour ce cas précis,
-            # avec un commentaire explicite dans son propre code sur des soucis de
-            # qualité audio WebRTC liés à un mauvais réglage de rééchantillonnage. Notre
-            # source est exactement en 16000Hz (confirmé via /api/streams) — utiliser le
-            # modèle qui correspond plutôt que le générique.
-            lines.append(f"      - ffmpeg:{name}#video=copy#audio=opus/16000")
+            # 2e source ffmpeg (§79-§82) : transcodage audio pour l'écoute — beaucoup
+            # de caméras envoient leur audio natif en AAC, incompatible WebRTC.
+            # 'opus_listen' est le format personnalisé défini plus haut, générique,
+            # jamais spécifique à cette caméra précise. Toujours la source
+            # auto-référencée (nom de stream go2rtc, pas l'URL RTSP physique) — pas de
+            # 2e connexion RTSP vers la caméra, même raisonnement que ci-dessus §76/§77.
+            lines.append(f"      - ffmpeg:{name}#video=copy#audio=opus_listen")
         lines += _webrtc_config_yaml_lines()
         lines.append("")
         lines.append("cameras:")
