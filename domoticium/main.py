@@ -1798,7 +1798,7 @@ _BRAND_GUESS_ORDER = [
 
 def _test_camera_by_brand(
     ip: str, password: str, manufacturer: str, timeout: float = 8.0
-) -> tuple[bool, str, str | None]:
+) -> tuple[bool, str, str | None, str | None]:
     """Teste une caméra IP+mot de passe selon la marque choisie par l'utilisateur
     (menu déroulant du formulaire d'ajout) — une seule tentative directe, la bonne URL
     étant connue d'avance. Si aucune marque n'est choisie ("Inconnue"), teste tous les
@@ -1807,31 +1807,38 @@ def _test_camera_by_brand(
     concurrentes se percutent, observé en test réel : erreur go2rtc trompeuse "wrong
     response on DESCRIBE"), bornées à ~25s au total quel que soit le nombre de marques
     dans la table, pour rester dans le budget de la requête HTTP appelante.
-    Retourne (ok, message, url_qui_fonctionne)."""
+    Retourne (ok, message, url_qui_fonctionne, url_sous_flux_ou_None).
+
+    Le sous-flux (§87) n'est JAMAIS testé en direct ici, volontairement — seulement
+    deviné depuis _RTSP_SUB_TEMPLATES pour la marque identifiée. Le tester ouvrirait
+    une 2e connexion RTSP juste après celle qui vient de réussir, vers une caméra qui
+    n'en accepte peut-être qu'une à la fois (même risque que §76/§77)."""
     norm = _normalize_brand(manufacturer)
     if norm and norm in _RTSP_TEMPLATES:
         url = _RTSP_TEMPLATES[norm].format(ip=ip).replace("MOTDEPASSE", password)
         if _probe_rtsp_url(url, timeout=timeout):
-            return True, "ok", url
+            sub_url = _RTSP_SUB_TEMPLATES.get(norm, '').format(ip=ip).replace("MOTDEPASSE", password) or None
+            return True, "ok", url, sub_url
         reason = _recent_go2rtc_error_hint()
-        return False, reason or f"Impossible de se connecter avec le chemin {manufacturer}", None
+        return False, reason or f"Impossible de se connecter avec le chemin {manufacturer}", None, None
 
-    candidates = [f"rtsp://admin:{password}@{ip}:554/stream"] + [
-        _RTSP_TEMPLATES[k].format(ip=ip).replace("MOTDEPASSE", password)
+    candidates = [("", f"rtsp://admin:{password}@{ip}:554/stream")] + [
+        (k, _RTSP_TEMPLATES[k].format(ip=ip).replace("MOTDEPASSE", password))
         for k in _BRAND_GUESS_ORDER
     ]
     deadline = time.time() + 25.0
-    for url in candidates:
+    for brand_key, url in candidates:
         if time.time() > deadline:
             break
         if _probe_rtsp_url(url, timeout=3.0):
-            return True, "ok", url
+            sub_url = _RTSP_SUB_TEMPLATES.get(brand_key, '').format(ip=ip).replace("MOTDEPASSE", password) or None
+            return True, "ok", url, sub_url
 
     reason = _recent_go2rtc_error_hint()
     return False, reason or (
         "Aucun chemin RTSP connu n'a fonctionné — vérifiez l'adresse IP et le mot de "
         "passe, ou saisissez l'URL manuellement"
-    ), None
+    ), None, None
 
 
 def _ha_remove_camera_entities(stream_name: str):
@@ -4011,6 +4018,32 @@ _RTSP_TEMPLATES = {
     "annke":     "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/101",  # OEM Hikvision
 }
 
+# Flux secondaire ("sous-flux") — même caméra, résolution/débit plus faible, pensé pour
+# les connexions faibles (§87, sélection de qualité en direct). Généré depuis le MÊME
+# modèle que _RTSP_TEMPLATES ci-dessus, jamais testé en direct au moment de l'ajout —
+# contrairement au flux principal (réellement connecté via _probe_rtsp_url), tester
+# aussi celui-ci ouvrirait une 2e connexion RTSP juste après la première vers une
+# caméra qui n'en accepte peut-être qu'une à la fois (cf. §76/§77) ; la bascule de
+# qualité elle-même (côté web, /api/cameras/[id]/quality) ne maintient jamais deux
+# connexions en parallèle non plus — un seul flux actif à la fois, reconfiguré et
+# reconnecté au changement. Volontairement absent pour les marques dont la convention
+# de sous-flux n'est pas suffisamment établie (axis, vivotek, pelco, flir, tplink,
+# foscam, ezviz, dlink) plutôt que de deviner au hasard — bascule de qualité
+# simplement indisponible pour ces caméras, pas d'URL fausse silencieuse.
+_RTSP_SUB_TEMPLATES = {
+    "hikvision": "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/102",
+    "dahua":     "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=1",
+    "amcrest":   "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=1",
+    "imou":      "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=1",
+    "lorex":     "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=1",
+    "reolink":   "rtsp://admin:MOTDEPASSE@{ip}:554/h264Preview_01_sub",
+    "uniview":   "rtsp://admin:MOTDEPASSE@{ip}:554/media/video2",
+    "hanwha":    "rtsp://admin:MOTDEPASSE@{ip}:554/profile2/media.smp",
+    "bosch":     "rtsp://admin:MOTDEPASSE@{ip}:554/video?inst=2",
+    "swann":     "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/102",
+    "annke":     "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/102",
+}
+
 
 def _rtsp_fallback(manufacturer: str, ip: str) -> str:
     """Cherche le chemin RTSP connu pour un fabricant ONVIF (ex: 'TP-Link Systems Inc.',
@@ -4664,12 +4697,15 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         if not ip or password is None:
             return self._reject(400, "ip et password requis (ou rtspUrl)")
         manufacturer = data.get("manufacturer") or ""
-        ok, detail, url = _test_camera_by_brand(ip, password, manufacturer)
+        ok, detail, url, sub_url = _test_camera_by_brand(ip, password, manufacturer)
         # username "admin" : convention constante des templates RTSP de toutes les
         # marques du projet (_RTSP_TEMPLATES) — même hypothèse déjà utilisée ailleurs
         # pour les commandes ONVIF authentifiées (PTZ, vision nocturne).
         caps = _safe_probe_capabilities(ip, username="admin", password=password)
-        self._ok({"ok": ok, "detail": detail, "correctedUrl": url, "detectedCapabilities": caps})
+        self._ok({
+            "ok": ok, "detail": detail, "correctedUrl": url, "correctedUrlSub": sub_url,
+            "detectedCapabilities": caps,
+        })
 
     def _handle_camera_ptz_route(self, data):
         """Relaie la commande au contrôleur ONVIF PTZ natif de Frigate (topic MQTT
