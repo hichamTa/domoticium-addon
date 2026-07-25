@@ -4026,10 +4026,13 @@ _RTSP_TEMPLATES = {
 # caméra qui n'en accepte peut-être qu'une à la fois (cf. §76/§77) ; la bascule de
 # qualité elle-même (côté web, /api/cameras/[id]/quality) ne maintient jamais deux
 # connexions en parallèle non plus — un seul flux actif à la fois, reconfiguré et
-# reconnecté au changement. Volontairement absent pour les marques dont la convention
-# de sous-flux n'est pas suffisamment établie (axis, vivotek, pelco, flir, tplink,
-# foscam, ezviz, dlink) plutôt que de deviner au hasard — bascule de qualité
-# simplement indisponible pour ces caméras, pas d'URL fausse silencieuse.
+# reconnecté au changement. axis/vivotek/pelco/tplink/foscam/ezviz ajoutés en §89
+# (bis) après vérification de la convention officielle de chaque marque (doc
+# fabricant/support officiel — pas une supposition). Toujours absents : flir (le
+# support officiel dit explicitement que le chemin varie par modèle, pas de
+# convention générique) et dlink (play1.sdp/play2.sdp semblent liés au codec
+# MJPEG/H.264, pas clairement à un palier de qualité) — plutôt que de deviner au
+# hasard, bascule de qualité simplement indisponible pour ces deux marques.
 _RTSP_SUB_TEMPLATES = {
     "hikvision": "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/102",
     "dahua":     "rtsp://admin:MOTDEPASSE@{ip}:554/cam/realmonitor?channel=1&subtype=1",
@@ -4042,6 +4045,15 @@ _RTSP_SUB_TEMPLATES = {
     "bosch":     "rtsp://admin:MOTDEPASSE@{ip}:554/video?inst=2",
     "swann":     "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/102",
     "annke":     "rtsp://admin:MOTDEPASSE@{ip}:554/Streaming/Channels/102",
+    "pelco":     "rtsp://admin:MOTDEPASSE@{ip}:554/stream2",
+    "tplink":    "rtsp://admin:MOTDEPASSE@{ip}:554/stream2",                      # Tapo / VIGI
+    "foscam":    "rtsp://admin:MOTDEPASSE@{ip}:554/videoSub",
+    "ezviz":     "rtsp://admin:MOTDEPASSE@{ip}:554/h264/ch1/sub/av_stream",
+    "vivotek":   "rtsp://root:MOTDEPASSE@{ip}:554/live2.sdp",
+    # Axis n'a pas de 2e chemin dédié — même endpoint que le flux principal, avec un
+    # paramètre de résolution (mécanisme officiel VAPIX). 640x480 est un choix prudent
+    # (supporté par la quasi-totalité des modèles Axis), pas garanti optimal partout.
+    "axis":      "rtsp://root:MOTDEPASSE@{ip}/axis-media/media.amp?resolution=640x480",
 }
 
 
