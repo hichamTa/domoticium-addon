@@ -4467,10 +4467,17 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0, user
                 timeout=timeout,
                 header=header,
             )
-            if _xml_has_tag(asxml, 'AudioSource'):
+            # 'AudioSources' (nom du champ réponse, répété une fois par élément selon
+            # la convention ONVIF déjà observée sur GetRelayOutputs/RelayOutputs dans
+            # ce fichier) plutôt que 'AudioSource' (nom du type) — les deux vérifiés
+            # par sécurité, avec log si ni l'un ni l'autre ne matche pour diagnostiquer
+            # au lieu de deviner une 3e fois (cf. §70-§73, même discipline).
+            if _xml_has_tag(asxml, 'AudioSources') or _xml_has_tag(asxml, 'AudioSource'):
                 caps.add('microphone')
-        except Exception:
-            pass
+            else:
+                log(f'[onvif-capabilities] {media_url}: GetAudioSources sans tag AudioSource(s) — extrait réponse : {asxml[:400]!r}')
+        except Exception as e:
+            warn(f'[onvif-capabilities] GetAudioSources {media_url}: {e}')
 
     if _onvif_has_relay_output(device_xaddr, timeout=timeout, username=username, password=password):
         caps.add('siren')
