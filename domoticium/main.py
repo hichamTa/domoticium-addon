@@ -2957,17 +2957,48 @@ _cam_watch_dirty: set[str] = set()        # streamNames dont le statut a changé
 _cam_watch_lock = threading.Lock()
 
 
-def _go2rtc_active_consumers() -> dict[str, bool]:
-    """Liste (via /api/streams, une seule requête légère, aucune nouvelle connexion
-    ouverte) les flux ayant au moins un consommateur actif (quelqu'un regarde le direct
-    en ce moment — HLS/WebRTC). Retourne {stream_name: bool}."""
+def _go2rtc_stream_snapshot() -> dict:
+    """Lit /api/streams une seule fois (une requête légère, aucune nouvelle connexion
+    ouverte) — retourne le JSON brut {stream_name: {producers, consumers}}, utilisé à
+    la fois pour la présence de consommateurs et l'activité réelle des producteurs."""
     try:
         r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
         if not r.ok:
             return {}
-        return {name: bool((info or {}).get("consumers")) for name, info in r.json().items()}
+        return r.json()
     except Exception:
         return {}
+
+
+# (connection_id, bytes_recv) du producteur au cycle watchdog précédent, par flux —
+# cf. _producer_seems_stalled().
+_producer_baseline: dict[str, tuple[object, int]] = {}
+
+
+def _producer_seems_stalled(name: str, info: dict | None) -> bool:
+    """True si le(s) producteur(s) de ce flux n'ont reçu aucun octet nouveau depuis le
+    cycle watchdog précédent (~60s) — signe qu'une reconnexion go2rtc est en échec
+    silencieux malgré un consommateur toujours listé comme actif. Nécessaire car,
+    d'après la source go2rtc (Producer.MarshalJSON/reconnect) : le producteur GARDE
+    l'ancien objet Connection inchangé pendant toute tentative de reconnexion ratée —
+    'un consommateur existe' reste donc vrai indéfiniment même si la caméra physique
+    est injoignable depuis des heures (observé en conditions réelles le 2026-07-25 :
+    caméra débranchée ~18h, alerte reçue seulement ~23h15, car l'app garde chaque
+    caméra connectée en continu dès que la page Caméras est ouverte, cf. §80)."""
+    producers = (info or {}).get("producers") or []
+    if not producers:
+        return True  # aucun producteur du tout : certainement pas joignable
+    conn_id = producers[0].get("id")
+    bytes_recv = sum((p or {}).get("bytes_recv", 0) for p in producers)
+    prev = _producer_baseline.get(name)
+    _producer_baseline[name] = (conn_id, bytes_recv)
+    if prev is None or prev[0] != conn_id:
+        # Pas de référence exploitable (1er cycle depuis le démarrage de l'addon, ou
+        # reconnexion réussie entre-temps — nouvel id de connexion) : pas assez
+        # d'info pour conclure à un blocage, on laisse une chance au prochain cycle
+        # plutôt que de sonder inutilement juste après une reconnexion réussie.
+        return False
+    return bytes_recv <= prev[1]
 
 
 def _probe_cameras_go2rtc() -> dict[str, bool]:
@@ -2976,16 +3007,20 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
     pas en général : go2rtc ne garde une connexion ouverte que s'il y a un consommateur
     actif (WebRTC/HLS en cours de visionnage), donc son champ producer 'state' est
     absent la quasi-totalité du temps même quand la caméra est parfaitement joignable.
-    EXCEPTION : si un consommateur est déjà actif (quelqu'un regarde le direct), on
-    saute la sonde active pour cette caméra — elle est forcément déjà joignable
-    (un flux en cours de lecture le prouve), et une sonde en parallèle risquerait
-    d'ouvrir une 2e connexion RTSP concurrente vers la caméra. Certaines caméras
-    d'entrée de gamme n'acceptent qu'UNE connexion à la fois : la sonde entrait alors
-    en collision avec la session de visionnage en cours et la coupait (observé en
-    réel : erreur go2rtc "wrong response on DESCRIBE" pile au moment du visionnage,
-    répétée à chaque cycle watchdog de 60s)."""
+    EXCEPTION : si un consommateur est déjà actif (quelqu'un regarde le direct) ET que
+    le producteur reçoit encore des données (cf. _producer_seems_stalled), on saute la
+    sonde active pour cette caméra — elle est forcément déjà joignable (un flux en
+    cours de lecture le prouve), et une sonde en parallèle risquerait d'ouvrir une 2e
+    connexion RTSP concurrente vers la caméra. Certaines caméras d'entrée de gamme
+    n'acceptent qu'UNE connexion à la fois : la sonde entrait alors en collision avec
+    la session de visionnage en cours et la coupait (observé en réel : erreur go2rtc
+    "wrong response on DESCRIBE" pile au moment du visionnage, répétée à chaque cycle
+    watchdog de 60s). Si le producteur semble figé malgré un consommateur actif, on ne
+    fait PLUS aveuglément confiance à ce signal — une vraie sonde est relancée ce
+    cycle-ci, le risque de collision devenant acceptable puisqu'il ne survient plus
+    que dans ce cas suspect précis, pas en permanence."""
     names = list(_cameras)
-    active_consumers = _go2rtc_active_consumers()
+    snapshot = _go2rtc_stream_snapshot()
     result: dict[str, bool] = {}
     lock = threading.Lock()
 
@@ -2996,7 +3031,9 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
 
     to_probe = []
     for name in names:
-        if active_consumers.get(name):
+        info = snapshot.get(name)
+        has_consumer = bool((info or {}).get("consumers"))
+        if has_consumer and not _producer_seems_stalled(name, info):
             result[name] = True
         else:
             to_probe.append(name)
