@@ -117,6 +117,19 @@ else:
 
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
 
+# Sérialise handle_camera_configure() — chaque requête /addon/camera/configure arrive
+# dans son propre thread (cmd-server), donc supprimer/ajouter plusieurs caméras d'un
+# coup (ex: suppression groupée depuis l'app) déclenche plusieurs appels quasi
+# simultanés. Sans verrou, chacun mute _cameras et appelle restart_frigate() en
+# parallèle — confirmé en conditions réelles le 2026-07-25 : le 2e restart_frigate()
+# reçoit un 400 du Supervisor HA (redémarrage déjà en cours pour le 1er), l'appelant
+# HTTP correspondant reçoit un 502 alors que l'état final était pourtant correct.
+# Sans conséquence dans ce cas précis (le dernier write_frigate_config() gagnait de
+# toute façon), mais fragile en général — ce verrou fait passer les appels un par un :
+# état et redémarrage toujours cohérents, plus de résultat "ok=False" trompeur pour
+# une opération qui a en réalité réussi.
+_camera_configure_lock = threading.Lock()
+
 # Caméras avec audio bidirectionnel ("parler") activé — dict séparé plutôt que
 # d'étendre _cameras (type dict[str,str] déjà lu/écrit à de nombreux endroits, risque
 # de casser le flux vidéo principal déjà validé en conditions réelles). Persisté à
@@ -1958,31 +1971,41 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
     sans y toucher, donc rien ne le corrige jamais tout seul, jusqu'à une réinstallation
     complète. Un restart (quelques secondes, plutôt qu'un ajout instantané) est le
     prix à payer pour ne plus jamais risquer de recasser toutes les caméras du site
-    pour l'ajout ou la suppression d'une seule."""
-    if action == "add":
-        if not rtsp_url:
-            raise ValueError("rtspUrl manquant")
-        _cameras[stream_name] = rtsp_url
-        _save_cameras()
-        if has_talk:
-            _camera_talk_enabled.add(stream_name)
-        else:
-            _camera_talk_enabled.discard(stream_name)
-        _save_camera_talk()
-        write_frigate_config()
-    elif action == "remove":
-        _cameras.pop(stream_name, None)
-        _camera_talk_enabled.discard(stream_name)
-        _save_cameras()
-        _save_camera_talk()
-        write_frigate_config()
-        _ha_remove_camera_entities(stream_name)  # bloquant — cf. docstring
-    else:
-        raise ValueError(f"action inconnue: {action!r}")
+    pour l'ajout ou la suppression d'une seule.
 
-    ok = restart_frigate()
-    log(f"{'✓' if ok else '⚠'} Caméra {action} (via restart complet) : '{stream_name}'")
-    return ok
+    Verrouillé de bout en bout (_camera_configure_lock) : plusieurs suppressions/ajouts
+    quasi simultanés (ex: suppression groupée de plusieurs caméras depuis l'app) sont
+    courants et arrivent chacun dans son propre thread — sans ce verrou, l'état partagé
+    (_cameras) et surtout restart_frigate() se chevauchent, le Supervisor HA rejetant
+    un redémarrage demandé pendant qu'un autre est déjà en cours (confirmé en
+    conditions réelles le 2026-07-25 : 400 puis 502 pour l'appelant, alors que l'état
+    final était pourtant correct). Ici, chaque appel passe entièrement l'un après
+    l'autre — résultat toujours cohérent avec l'état réel, jamais de faux échec."""
+    with _camera_configure_lock:
+        if action == "add":
+            if not rtsp_url:
+                raise ValueError("rtspUrl manquant")
+            _cameras[stream_name] = rtsp_url
+            _save_cameras()
+            if has_talk:
+                _camera_talk_enabled.add(stream_name)
+            else:
+                _camera_talk_enabled.discard(stream_name)
+            _save_camera_talk()
+            write_frigate_config()
+        elif action == "remove":
+            _cameras.pop(stream_name, None)
+            _camera_talk_enabled.discard(stream_name)
+            _save_cameras()
+            _save_camera_talk()
+            write_frigate_config()
+            _ha_remove_camera_entities(stream_name)  # bloquant — cf. docstring
+        else:
+            raise ValueError(f"action inconnue: {action!r}")
+
+        ok = restart_frigate()
+        log(f"{'✓' if ok else '⚠'} Caméra {action} (via restart complet) : '{stream_name}'")
+        return ok
 
 
 def _matter_ws_frames(s):
