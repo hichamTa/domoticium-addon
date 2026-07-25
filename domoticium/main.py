@@ -4452,6 +4452,26 @@ def _onvif_capabilities_from_xaddr(device_xaddr: str, timeout: float = 3.0, user
         except Exception:
             pass
 
+        # Micro (écoute du son ambiant) — un flux RTSP peut déclarer une piste audio
+        # même sans micro physique réel (constaté en conditions réelles le 2026-07-25 :
+        # "Camera exterieur" transmettait un flux audio AAC exploitable — silence ou
+        # bruit de fond du capteur — sans micro intégré). GetAudioSources (lecture
+        # seule) est le signal ONVIF dédié : liste vide si le device n'a réellement
+        # aucune source audio. Comme les autres capacités ONVIF, purement indicatif —
+        # le matériel grand public peut mentir dans un sens ou dans l'autre — d'où le
+        # pré-remplissage + confirmation manuelle à l'ajout (cf. lib/cameras/capabilities.ts).
+        try:
+            asxml = _onvif_soap(
+                media_url,
+                '<trt:GetAudioSources xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>',
+                timeout=timeout,
+                header=header,
+            )
+            if _xml_has_tag(asxml, 'AudioSource'):
+                caps.add('microphone')
+        except Exception:
+            pass
+
     if _onvif_has_relay_output(device_xaddr, timeout=timeout, username=username, password=password):
         caps.add('siren')
 
