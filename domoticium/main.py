@@ -3125,18 +3125,30 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
 def _run_camera_watchdog():
     """Thread de fond : sonde les caméras via go2rtc toutes les 60s.
     Les deltas sont injectés dans _cam_watch_dirty pour être envoyés
-    dans le prochain flush de _flush_state_batch."""
+    dans le prochain flush de _flush_state_batch.
+
+    §97 — constaté en conditions réelles le 2026-07-26 : plus un seul appel
+    pi_report_camera_status pendant plusieurs minutes après un redémarrage (confirmé
+    via les logs Supabase), alors que pi_report_device_state/pi_report_heartbeat
+    continuaient normalement — signe que ce thread meurt silencieusement sur une
+    exception non attrapée (aucun try/except autour de la boucle jusqu'ici) et ne
+    rapporte plus jamais rien ensuite. Désormais blindé : une erreur est journalisée
+    (cause réelle visible au prochain incident) et la boucle continue au cycle
+    suivant plutôt que de s'arrêter pour toujours."""
     time.sleep(30)  # laisser go2rtc démarrer
     while True:
-        if _cameras:
-            probed = _probe_cameras_go2rtc()
-            if probed:
-                with _cam_watch_lock:
-                    for name in list(_cameras):
-                        new_online = probed.get(name, False)
-                        if _cam_watch_online.get(name) != new_online:
-                            _cam_watch_online[name] = new_online
-                            _cam_watch_dirty.add(name)
+        try:
+            if _cameras:
+                probed = _probe_cameras_go2rtc()
+                if probed:
+                    with _cam_watch_lock:
+                        for name in list(_cameras):
+                            new_online = probed.get(name, False)
+                            if _cam_watch_online.get(name) != new_online:
+                                _cam_watch_online[name] = new_online
+                                _cam_watch_dirty.add(name)
+        except Exception as e:
+            warn(f"[watchdog] cycle échoué (poursuite au prochain) : {e}")
         time.sleep(60)
 
 
@@ -3181,40 +3193,47 @@ def _flush_state_batch():
     """Thread de fond : envoie états devices + statuts caméras toutes les 2.5s via
     Supabase direct (un appel HMAC par item). Un item qui échoue (réseau, Supabase
     indisponible) est réintégré au batch pour être retenté au prochain cycle — pas
-    de repli Vercel, aucune donnée perdue silencieusement."""
+    de repli Vercel, aucune donnée perdue silencieusement.
+
+    Blindé (§97) par cohérence avec _run_camera_watchdog() : une exception non
+    prévue ici tuerait ce thread silencieusement, plus jamais aucun état ni
+    heartbeat rapporté ensuite — désormais journalisée, la boucle continue."""
     while True:
         time.sleep(2.5)
-        if not INGEST_SECRET:
-            continue
+        try:
+            if not INGEST_SECRET:
+                continue
 
-        with _state_batch_lock:
-            batch = dict(_state_batch)
-            _state_batch.clear()
-
-        with _cam_watch_lock:
-            cam_batch = {
-                n: _cam_watch_online[n]
-                for n in _cam_watch_dirty
-                if n in _cam_watch_online and n in _cameras
-            }
-            _cam_watch_dirty.clear()
-
-        failed_states = {
-            eid: (st, attrs) for eid, (st, attrs) in batch.items()
-            if not _report_device_state_direct(eid, st, attrs)
-        }
-        failed_cams = {
-            name: online for name, online in cam_batch.items()
-            if not _report_camera_status_direct(name, online)
-        }
-
-        if failed_states:
             with _state_batch_lock:
-                for eid, v in failed_states.items():
-                    _state_batch.setdefault(eid, v)
-        if failed_cams:
+                batch = dict(_state_batch)
+                _state_batch.clear()
+
             with _cam_watch_lock:
-                _cam_watch_dirty.update(failed_cams.keys())
+                cam_batch = {
+                    n: _cam_watch_online[n]
+                    for n in _cam_watch_dirty
+                    if n in _cam_watch_online and n in _cameras
+                }
+                _cam_watch_dirty.clear()
+
+            failed_states = {
+                eid: (st, attrs) for eid, (st, attrs) in batch.items()
+                if not _report_device_state_direct(eid, st, attrs)
+            }
+            failed_cams = {
+                name: online for name, online in cam_batch.items()
+                if not _report_camera_status_direct(name, online)
+            }
+
+            if failed_states:
+                with _state_batch_lock:
+                    for eid, v in failed_states.items():
+                        _state_batch.setdefault(eid, v)
+            if failed_cams:
+                with _cam_watch_lock:
+                    _cam_watch_dirty.update(failed_cams.keys())
+        except Exception as e:
+            warn(f"[flush-state] cycle échoué (poursuite au prochain) : {e}")
 
 
 _IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
