@@ -157,8 +157,11 @@ _SCAN_CAPABILITIES_CACHE_TTL = 120.0  # secondes
 _scan_capabilities_cache: dict[str, tuple[float, list]] = {}
 
 
-def log(msg):  print(f"[domoticium] {msg}", flush=True)
-def warn(msg): print(f"[domoticium] ⚠ {msg}", file=sys.stderr, flush=True)
+def _log_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def log(msg):  print(f"[domoticium] {_log_ts()} {msg}", flush=True)
+def warn(msg): print(f"[domoticium] {_log_ts()} ⚠ {msg}", file=sys.stderr, flush=True)
 
 
 def _local_ipv4() -> str:
