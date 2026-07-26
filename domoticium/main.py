@@ -3144,16 +3144,28 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
         info = snapshot.get(name)
         has_consumer = bool((info or {}).get("consumers"))
         is_masked = bool(_camera_masks.get(name))
+        producers = (info or {}).get("producers") or []
+        # Journalisation temporaire (§95) — diagnostic du bug "caméra masquée hors
+        # ligne à tort", à retirer une fois confirmé résolu en conditions réelles.
+        log(
+            f"[watchdog-diag] {name}: consumer={has_consumer} masked={is_masked} "
+            f"producers={len(producers)} "
+            f"ids={[p.get('id') for p in producers]} "
+            f"bytes={[p.get('bytes_recv') for p in producers]}"
+        )
         if has_consumer and (is_masked or not _producer_seems_stalled(name, info)):
             result[name] = True
         else:
             to_probe.append(name)
+            log(f"[watchdog-diag] {name}: sonde active relancée ce cycle")
 
     threads = [threading.Thread(target=_probe, args=(n,), daemon=True) for n in to_probe]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=8.0)
+    for name in to_probe:
+        log(f"[watchdog-diag] {name}: résultat sonde active = {result.get(name)}")
     return result
 
 
