@@ -64,6 +64,7 @@ HDRS = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "applicat
 
 SETUP_DONE   = "/data/.setup_done"
 CAMERAS_FILE = "/data/cameras.json"
+CAMERA_MASKS_FILE = "/data/camera_masks.json"
 
 
 def _pi_sign(message: str) -> str:
@@ -116,6 +117,14 @@ else:
         _f.write(MOSQUITTO_PASS)
 
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
+
+# Masquage de zones "en dur" (§93) — {stream_name: [{"x":0-1,"y":0-1,"w":0-1,"h":0-1}, ...]}.
+# Rectangles en fractions normalisées de la frame (indépendant de la résolution —
+# fonctionne pareil pour le flux principal et le sous-flux qualité §87/§88). Séparé
+# de _cameras plutôt que d'étendre sa structure : _cameras est utilisé partout comme
+# dict[str, str] (name → rtsp_url), changer son type aurait forcé à retoucher tous
+# ses usages pour un gain nul. Défini UNIQUEMENT côté admin (jamais côté client final).
+_camera_masks: dict[str, list[dict]] = {}
 
 # Sérialise handle_camera_configure() — chaque requête /addon/camera/configure arrive
 # dans son propre thread (cmd-server), donc supprimer/ajouter plusieurs caméras d'un
@@ -407,6 +416,20 @@ def _load_cameras():
 def _save_cameras():
     with open(CAMERAS_FILE, "w") as f:
         json.dump(_cameras, f)
+
+
+def _load_camera_masks():
+    global _camera_masks
+    try:
+        with open(CAMERA_MASKS_FILE) as f:
+            _camera_masks = json.load(f)
+    except FileNotFoundError:
+        _camera_masks = {}
+
+
+def _save_camera_masks():
+    with open(CAMERA_MASKS_FILE, "w") as f:
+        json.dump(_camera_masks, f)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -892,6 +915,7 @@ def _configure_frigate_and_start() -> bool:
     log(f"[frigate] network/1984 → {r.status_code} {r.text[:120]}")
 
     _load_cameras()
+    _load_camera_masks()
     write_frigate_config()
 
     # start ou restart selon l'état courant
@@ -1041,6 +1065,7 @@ def install_frigate():
     # une fois "migré" ne l'est plus jamais une 2e fois). S'assurer qu'il existe déjà,
     # correctement rempli, avant même de déclencher l'installation.
     _load_cameras()
+    _load_camera_masks()
     write_frigate_config()
 
     # 2. Installer si nécessaire
@@ -1078,6 +1103,7 @@ def install_frigate():
     # Notre config contient version:"0.18-0" → migration entièrement skippée même si
     # un stale réapparaît d'une source externe.
     _load_cameras()
+    _load_camera_masks()
     write_frigate_config()
 
     # Effacer le marker d'auth désactivée : après remove_config+reinstall, Frigate
@@ -1201,6 +1227,28 @@ def _webrtc_config_yaml_lines() -> list[str]:
     return lines
 
 
+def _mask_ffmpeg_preset(rects: list[dict]) -> str:
+    """Construit la valeur du préréglage ffmpeg go2rtc pour masquer une caméra (§93) :
+    une chaîne de filtres 'drawbox' (un par rectangle, en fractions iw/ih — les
+    variables ffmpeg pour la largeur/hauteur RÉELLES du flux décodé, donc indépendant
+    de la résolution — fonctionne identiquement pour le flux principal et le sous-flux
+    qualité §87/§88, sans connaître la résolution à l'avance) suivie d'un encodage
+    vidéo réel : masquer des pixels impose de décoder puis ré-encoder (plus possible
+    de rester en 'video=copy', cf. HANDOFF §93 sur le coût CPU — accepté par Hicham,
+    limité aux caméras effectivement masquées). Réglages d'encodage repris du
+    préréglage 'h264' intégré à go2rtc (internal/ffmpeg/ffmpeg.go) pour rester cohérent
+    avec ce que go2rtc utiliserait lui-même par défaut."""
+    boxes = ",".join(
+        f"drawbox=x=iw*{r['x']}:y=ih*{r['y']}:w=iw*{r['w']}:h=ih*{r['h']}:color=black:t=fill"
+        for r in rects
+    )
+    return (
+        f"-vf {boxes} "
+        "-c:v libx264 -g 50 -profile:v high -level:v 4.1 "
+        "-preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p"
+    )
+
+
 def _generate_frigate_yaml() -> str:
     """Génère le YAML complet de config Frigate depuis le registre des caméras.
 
@@ -1251,9 +1299,15 @@ def _generate_frigate_yaml() -> str:
         # https://github.com/pion/webrtc/issues/1514).
         lines.append("  ffmpeg:")
         lines.append('    opus_listen: "-c:a libopus -application:a lowdelay -min_comp 0 -ar:a 48000 -ac:a 2"')
+        # Préréglages de masquage (§93) — un par caméra masquée, jamais partagé (chaque
+        # caméra a ses propres rectangles). Rien n'est émis pour les caméras sans masque.
+        for name in _cameras:
+            mask_rects = _camera_masks.get(name) or []
+            if mask_rects:
+                lines.append(f'    mask_{name}: "{_mask_ffmpeg_preset(mask_rects)}"')
         lines.append("  streams:")
         for name, rtsp_url in _cameras.items():
-            lines += [f"    {name}:", f"      - {rtsp_url}"]
+            mask_rects = _camera_masks.get(name) or []
             # PAS de 2e source '#backchannel=0' ici (retiré §76/§77) : contresens sur la
             # doc go2rtc (internal/rtsp/README.md) — ce flag DÉSACTIVE le two-way audio
             # sur la source qui le porte, il ne le redirige pas dessus. go2rtc négocie
@@ -1271,7 +1325,28 @@ def _generate_frigate_yaml() -> str:
             # jamais spécifique à cette caméra précise. Toujours la source
             # auto-référencée (nom de stream go2rtc, pas l'URL RTSP physique) — pas de
             # 2e connexion RTSP vers la caméra, même raisonnement que ci-dessus §76/§77.
-            lines.append(f"      - ffmpeg:{name}#video=copy#audio=opus_listen")
+            if mask_rects:
+                # Masquage "en dur" (§93) : le nom public {name} — celui que Frigate ET
+                # l'app web interrogent tous les deux (rtsp://127.0.0.1:8554/{name} côté
+                # Frigate, streamName côté web) — n'ingère JAMAIS le flux brut. L'ingest
+                # réel de la caméra physique se fait sous un nom interne {name}__raw,
+                # jamais exposé ; {name} n'est que des sources ffmpeg auto-référencées
+                # dessus (donc toujours UNE SEULE connexion RTSP réelle vers la caméra,
+                # même raisonnement §76/§77). La vidéo passe par le préréglage de
+                # masquage (décode + drawbox + ré-encode — 'video=copy' n'est plus
+                # possible dès qu'on touche aux pixels, coût CPU réel mais uniquement
+                # pour les caméras effectivement masquées). L'audio n'a pas besoin
+                # d'être masqué, simple passthrough.
+                raw_name = f"{name}__raw"
+                lines += [f"    {raw_name}:", f"      - {rtsp_url}"]
+                lines += [
+                    f"    {name}:",
+                    f"      - ffmpeg:{raw_name}#video=mask_{name}#audio=copy",
+                    f"      - ffmpeg:{raw_name}#video=copy#audio=opus_listen",
+                ]
+            else:
+                lines += [f"    {name}:", f"      - {rtsp_url}"]
+                lines.append(f"      - ffmpeg:{name}#video=copy#audio=opus_listen")
         lines += _webrtc_config_yaml_lines()
         lines.append("")
         lines.append("cameras:")
@@ -1977,6 +2052,8 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
         elif action == "remove":
             _cameras.pop(stream_name, None)
             _save_cameras()
+            if _camera_masks.pop(stream_name, None) is not None:
+                _save_camera_masks()
             write_frigate_config()
             _ha_remove_camera_entities(stream_name)  # bloquant — cf. docstring
         else:
@@ -1984,6 +2061,27 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
 
         ok = restart_frigate()
         log(f"{'✓' if ok else '⚠'} Caméra {action} (via restart complet) : '{stream_name}'")
+        return ok
+
+
+def handle_camera_mask(stream_name: str, rects: list[dict]) -> bool:
+    """Définit (ou retire, si rects vide) le masquage 'en dur' d'une caméra déjà
+    enregistrée (§93) — admin uniquement, jamais appelé côté client. Même verrou et
+    même mécanisme (réécriture frigate.yml + restart complet) que
+    handle_camera_configure(), pour ne jamais faire chevaucher les deux (ex: masquage
+    modifié pendant qu'une bascule de qualité §88 est en cours)."""
+    with _camera_configure_lock:
+        if stream_name not in _cameras:
+            raise ValueError(f"caméra inconnue: {stream_name!r}")
+        if rects:
+            _camera_masks[stream_name] = rects
+        else:
+            _camera_masks.pop(stream_name, None)
+        _save_camera_masks()
+        write_frigate_config()
+
+        ok = restart_frigate()
+        log(f"{'✓' if ok else '⚠'} Masquage mis à jour ({len(rects)} zone(s)) : '{stream_name}'")
         return ok
 
 
@@ -4634,6 +4732,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/zigbee/set-attribute": self._handle_set_attribute,
                 "/ha-command":           self._handle_ha_command_route,
                 "/camera/configure":     self._handle_camera_configure_route,
+                "/camera/mask":          self._handle_camera_mask_route,
                 "/camera/test":          self._handle_camera_test_route,
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/sync-now":             self._handle_sync_now,
@@ -4725,6 +4824,27 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok()
         else:
             self._reject(502, "Échec de configuration Frigate/go2rtc — voir les logs de l'add-on")
+
+    def _handle_camera_mask_route(self, data):
+        stream_name = data.get("streamName")
+        if not stream_name:
+            return self._reject(400, "streamName manquant")
+        rects = data.get("maskRects") or []
+        if not isinstance(rects, list):
+            return self._reject(400, "maskRects doit être une liste")
+        for r in rects:
+            if not isinstance(r, dict) or not all(
+                isinstance(r.get(k), (int, float)) and 0 <= r[k] <= 1 for k in ("x", "y", "w", "h")
+            ):
+                return self._reject(400, "chaque rectangle doit avoir x/y/w/h numériques entre 0 et 1")
+        try:
+            ok = handle_camera_mask(stream_name, rects)
+        except ValueError as e:
+            return self._reject(404, str(e))
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, "Échec de mise à jour du masquage — voir les logs de l'add-on")
 
     def _handle_camera_test_route(self, data):
         rtsp_url = data.get("rtspUrl")
@@ -4856,6 +4976,7 @@ def _turn_refresh_loop():
 
 def run_bridge():
     _load_cameras()
+    _load_camera_masks()
     global _turn_ice_servers
     # synchrone — requis avant la 1ère écriture frigate.yml ; repli STUN local si le
     # 1er fetch échoue (pas de restart en jeu ici, juste la valeur initiale)
@@ -4920,6 +5041,7 @@ if __name__ == "__main__":
     # (/config/config.yml dans le conteneur Frigate) si ce dernier n'existe pas encore.
     # La config contient version:"0.18-0" → toute migration Frigate est skippée.
     _load_cameras()
+    _load_camera_masks()
     write_frigate_config()
 
     if FORCE_SETUP:
