@@ -4087,6 +4087,12 @@ ALLOWED_SERVICES = {
     "media_player":  {"turn_on", "turn_off", "volume_set", "media_play", "media_pause"},
     "homeassistant": {"turn_on", "turn_off", "toggle"},
     "scene":         {"turn_on"},
+    # Les "scènes" de l'app sont implémentées côté HA comme des scripts
+    # (script.domoticium_scene_..., cf. api/scenes/[id]/activate côté web) — pas des
+    # scene.* natives. "script" était absent de cette liste blanche, donc chaque
+    # activation était rejetée en 403 (trouvé en conditions réelles le 2026-07-26,
+    # après un signalement d'Hicham : le bouton "Activer" ne faisait rien).
+    "script":        {"turn_on", "turn_off", "toggle"},
     "alarm_control_panel": {
         "alarm_arm_home", "alarm_arm_away", "alarm_arm_night",
         "alarm_arm_vacation", "alarm_disarm", "alarm_trigger",
