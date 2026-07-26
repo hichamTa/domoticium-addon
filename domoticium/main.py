@@ -3127,17 +3127,25 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
 
 def _run_camera_watchdog():
     """Thread de fond : sonde les caméras via go2rtc toutes les 60s.
-    Les deltas sont injectés dans _cam_watch_dirty pour être envoyés
-    dans le prochain flush de _flush_state_batch.
+    Chaque cycle est injecté dans _cam_watch_dirty pour être envoyé dans le
+    prochain flush de _flush_state_batch.
 
-    §97 — constaté en conditions réelles le 2026-07-26 : plus un seul appel
-    pi_report_camera_status pendant plusieurs minutes après un redémarrage (confirmé
-    via les logs Supabase), alors que pi_report_device_state/pi_report_heartbeat
-    continuaient normalement — signe que ce thread meurt silencieusement sur une
-    exception non attrapée (aucun try/except autour de la boucle jusqu'ici) et ne
-    rapporte plus jamais rien ensuite. Désormais blindé : une erreur est journalisée
-    (cause réelle visible au prochain incident) et la boucle continue au cycle
-    suivant plutôt que de s'arrêter pour toujours."""
+    §97 : le thread ne mourait pas silencieusement (l'hypothèse initiale) — le vrai
+    problème, trouvé en conditions réelles le 2026-07-26 grâce à l'horodatage des
+    logs (§97bis) : ce cycle ne rapportait auparavant que les CHANGEMENTS d'état
+    (`if _cam_watch_online.get(name) != new_online`). Une caméra qui reste en ligne
+    en continu n'était donc plus jamais re-rapportée après son premier passage à
+    'true' — last_seen ne se rafraîchissait plus jamais pour elle. Mais le filet
+    pg_cron (§91, check_stale_cameras) suppose que last_seen se rafraîchit
+    périodiquement pour prouver qu'une caméra est toujours vivante : au bout de 5
+    minutes sans nouveau rapport (même si rien n'avait changé), il concluait à tort
+    à une coupure et marquait la caméra hors ligne — systématiquement, ~5-10 min
+    après chaque redémarrage, indépendamment du masquage ou des tentatives
+    précédentes (§92/§95/§96), qui corrigeaient toutes un faux problème. **Fix** :
+    chaque caméra est désormais marquée 'dirty' à CHAQUE cycle, changement ou non —
+    last_seen reste frais tant que le watchdog tourne et sonde avec succès, ce qui
+    est exactement ce dont pg_cron a besoin. Le blindage try/except (toujours utile,
+    gardé) continue de protéger contre une vraie exception future."""
     time.sleep(30)  # laisser go2rtc démarrer
     while True:
         try:
@@ -3146,10 +3154,8 @@ def _run_camera_watchdog():
                 if probed:
                     with _cam_watch_lock:
                         for name in list(_cameras):
-                            new_online = probed.get(name, False)
-                            if _cam_watch_online.get(name) != new_online:
-                                _cam_watch_online[name] = new_online
-                                _cam_watch_dirty.add(name)
+                            _cam_watch_online[name] = probed.get(name, False)
+                            _cam_watch_dirty.add(name)
         except Exception as e:
             warn(f"[watchdog] cycle échoué (poursuite au prochain) : {e}")
         time.sleep(60)
