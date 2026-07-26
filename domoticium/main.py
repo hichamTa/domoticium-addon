@@ -3116,7 +3116,19 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
     watchdog de 60s). Si le producteur semble figé malgré un consommateur actif, on ne
     fait PLUS aveuglément confiance à ce signal — une vraie sonde est relancée ce
     cycle-ci, le risque de collision devenant acceptable puisqu'il ne survient plus
-    que dans ce cas suspect précis, pas en permanence."""
+    que dans ce cas suspect précis, pas en permanence.
+
+    _producer_seems_stalled() est SAUTÉE pour les caméras masquées (§93) : ses
+    producteurs ne sont plus jamais un dial RTSP direct mais deux sources ffmpeg
+    auto-référencées (raisonnement jamais validé pour ce cas, le masquage étant venu
+    après ce fix) — bytes_recv d'un producteur exec ffmpeg n'a aucune garantie de se
+    comporter comme celui d'une connexion réseau brute. Constaté en conditions
+    réelles le 2026-07-26 : caméra masquée fluide et saine dans Frigate/HA (donc le
+    pipeline go2rtc est sain) mais marquée hors ligne en continu côté app — signe
+    que cette heuristique concluait "figé" à tort en permanence pour ce cas, jamais
+    un vrai problème de flux. Ces caméras reviennent au comportement d'avant §92
+    (consommateur actif ⇒ joignable) ; le filet pg_cron (§91, toutes les 5 min,
+    basé sur last_seen) reste la protection contre une vraie coupure prolongée."""
     names = list(_cameras)
     snapshot = _go2rtc_stream_snapshot()
     result: dict[str, bool] = {}
@@ -3131,7 +3143,8 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
     for name in names:
         info = snapshot.get(name)
         has_consumer = bool((info or {}).get("consumers"))
-        if has_consumer and not _producer_seems_stalled(name, info):
+        is_masked = bool(_camera_masks.get(name))
+        if has_consumer and (is_masked or not _producer_seems_stalled(name, info)):
             result[name] = True
         else:
             to_probe.append(name)
