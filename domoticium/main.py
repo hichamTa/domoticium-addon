@@ -94,12 +94,13 @@ MATTER_SLUG    = "core_matter_server"
 THREAD_SLUG    = "core_openthread_border_router"
 FRIGATE_REPO   = "https://github.com/hichamTa/frigate-hass-addons"
 # Alarmo n'est PAS un add-on Supervisor (contrairement à Frigate ci-dessus) mais une
-# intégration HA classique (custom_component). Pas besoin de HACS pour l'installer :
-# son mainteneur publie un zip de release tout prêt (mêmes conventions que HACS lui-
-# même), qu'on télécharge et dépose directement dans custom_components/ — cf.
-# install_alarmo() plus bas. Repo public, vérifié manuellement (2026-07-27).
-ALARMO_GH_REPO = "nielsfaber/alarmo"
-ALARMO_DIR     = "/homeassistant/custom_components/alarmo"
+# intégration HA classique (custom_component), installée via HACS — cf. install_hacs()
+# / install_alarmo() plus bas. HACS lui-même est déposé de la même façon que Frigate
+# ci-dessus le serait pour un add-on : zip de release GitHub, pas de script bash
+# interactif. Repos publics, vérifiés manuellement (2026-07-27).
+HACS_GH_REPO     = "hacs/integration"
+HACS_DIR         = "/homeassistant/custom_components/hacs"
+ALARMO_FULL_NAME = "nielsfaber/alarmo"
 FRIGATE_SLUG   = "582436be_frigate"
 # Ancien dépôt Frigate (officiel, upstream) — Frigate n'y lit JAMAIS notre frigate.yml
 # (CONFIG_FILE non défini dans son config.yaml, donc find_config_file() résout vers son
@@ -1405,6 +1406,185 @@ def _setup_frigate_auth_once():
     log("[frigate] ✓ Auth gérée via YAML (auth.enabled: false dans frigate.yml)")
 
 
+def _hacs_installed_version() -> str | None:
+    try:
+        with open(os.path.join(HACS_DIR, "manifest.json")) as f:
+            return json.load(f).get("version")
+    except Exception:
+        return None
+
+
+def _hacs_config_entry_exists() -> bool:
+    try:
+        with open("/homeassistant/.storage/core.config_entries") as f:
+            storage = json.load(f)
+        entries = storage.get("data", {}).get("entries", [])
+        return any(e.get("domain") == "hacs" for e in entries)
+    except Exception as e:
+        warn(f"[hacs] Lecture core.config_entries impossible : {e}")
+        return False
+
+
+def _hacs_deploy_files() -> bool:
+    try:
+        r = requests.get(f"https://api.github.com/repos/{HACS_GH_REPO}/releases/latest", timeout=15)
+        r.raise_for_status()
+        release = r.json()
+        asset = next((a for a in release.get("assets", []) if a.get("name") == "hacs.zip"), None)
+        if not asset:
+            warn("[hacs] Aucun asset hacs.zip trouvé sur la dernière release GitHub — abandon")
+            return False
+        zip_resp = requests.get(asset["browser_download_url"], timeout=30)
+        zip_resp.raise_for_status()
+        os.makedirs(HACS_DIR, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+            zf.extractall(HACS_DIR)
+        log(f"✓ HACS {release.get('tag_name', '?')} déployé → {HACS_DIR}")
+        return True
+    except Exception as e:
+        warn(f"[hacs] Téléchargement/installation impossible : {e}")
+        return False
+
+
+def _hacs_poll_device_flow(flow_id: str):
+    """Thread de fond : re-soumet le flow HACS toutes les 5s jusqu'à ce que Hicham
+    ait validé le code sur github.com/login/device (ou abandon après 10 min — le
+    prochain démarrage de l'addon relancera alors un nouveau code). Mécanisme HA
+    standard pour les steps "show_progress" : re-soumettre le même flow_id force
+    HA à revérifier l'état de la tâche d'activation asynchrone côté intégration
+    (cf. async_step_device officiel de HACS — activation_task.done())."""
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        time.sleep(5)
+        resp = ha_post(f"/config/config_entries/flow/{flow_id}", {})
+        if not resp.ok:
+            continue
+        step = _unwrap(resp.json())
+        step_type = step.get("type")
+        if step_type == "create_entry":
+            log("✓ [hacs] Autorisation GitHub validée — HACS configuré")
+            return
+        if step_type == "abort":
+            warn(f"[hacs] Flow d'autorisation abandonné : {step.get('reason')}")
+            return
+        # sinon (progress toujours en cours) → on reboucle
+    warn("[hacs] Autorisation GitHub non complétée dans les 10 minutes — le prochain "
+         "démarrage de l'addon relancera un nouveau code.")
+
+
+def install_hacs() -> bool:
+    """Dépose et autorise HACS — nécessaire une seule fois par site, partagé avec
+    Alarmo ET la future intégration Frigate (HACS déjà décidé pour Frigate, cf.
+    HANDOFF — même bootstrap réutilisé ici plutôt que dupliqué).
+
+    Retourne True si HACS est installé ET déjà autorisé (config entry présente).
+    Retourne False si l'installation est en cours, ou si l'autorisation GitHub est
+    en attente — dans ce 2e cas un code vient d'être loggé (ACTION REQUISE), à
+    saisir une fois sur github.com/login/device ; le thread de fond ou le prochain
+    démarrage de l'addon complètera automatiquement le flow ensuite.
+
+    Séquence vérifiée directement dans le code source réel de HACS (config_flow.py,
+    websocket/*.py de hacs/integration) — pas devinée — mais jamais exécutée contre
+    une vraie instance HA depuis cette session (2026-07-27)."""
+    if _hacs_installed_version() is None:
+        log("── HACS ──────────────────────────────────────")
+        if not _hacs_deploy_files():
+            return False
+        log("[hacs] Restart HA Core pour charger HACS…")
+        try:
+            requests.post(
+                f"{SUP}/homeassistant/restart",
+                headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+                timeout=60,
+            )
+        except Exception as e:
+            warn(f"[hacs] Erreur restart HA : {e}")
+            return False
+        wait_for_ha()
+
+    if _hacs_config_entry_exists():
+        return True
+
+    # Étape 1 : formulaire "disclaimer" HACS — 4 cases à cocher obligatoires pour
+    # continuer (acc_logs/acc_addons/acc_untested/acc_disable), fixes pour tout
+    # utilisateur, cf. _show_config_form() officiel — aucun jugement à faire.
+    flow_resp = ha_post("/config/config_entries/flow", {"handler": "hacs"})
+    if not flow_resp.ok:
+        warn(f"[hacs] Flow impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
+        return False
+    flow = _unwrap(flow_resp.json())
+    flow_id = flow.get("flow_id")
+    if not flow_id:
+        warn(f"[hacs] Pas de flow_id : {flow}")
+        return False
+
+    step_resp = ha_post(
+        f"/config/config_entries/flow/{flow_id}",
+        {"acc_logs": True, "acc_addons": True, "acc_untested": True, "acc_disable": True},
+    )
+    if not step_resp.ok:
+        warn(f"[hacs] Étape disclaimer impossible ({step_resp.status_code}): {step_resp.text[:200]}")
+        return False
+    step = _unwrap(step_resp.json())
+
+    # Étape 2 : device flow GitHub — le code apparaît directement dans cette
+    # réponse (description_placeholders), cf. async_step_device officiel.
+    placeholders = step.get("description_placeholders", {}) or {}
+    code = placeholders.get("code")
+    url  = placeholders.get("url", "https://github.com/login/device")
+    if code:
+        log(f"⚠ [hacs] ACTION REQUISE (une seule fois pour ce site) — va sur {url} et entre le code : {code}")
+        log("[hacs] Sert aussi pour Alarmo et la future intégration Frigate (HACS).")
+        threading.Thread(target=_hacs_poll_device_flow, args=(flow_id,), daemon=True).start()
+    else:
+        warn(f"[hacs] Pas de code d'autorisation détecté dans la réponse : {step}")
+    return False  # pas encore autorisé sur ce cycle — le poller ou le prochain boot s'en chargeront
+
+
+def _hacs_get_repository(full_name: str, category: str = "integration") -> dict | None:
+    """Retourne le dict repo HACS (id/installed/pending_upgrade…) pour full_name,
+    en l'ajoutant comme dépôt custom si HACS ne le connaît pas encore par défaut
+    (cas d'Alarmo, absent de la liste curatée) — cf. hacs/repositories/add côté
+    websocket/repositories.py officiel."""
+    result = _ha_ws_call("hacs/repositories/list", categories=[category])
+    if result and result.get("success"):
+        for repo in result.get("result", []):
+            if repo.get("full_name", "").lower() == full_name.lower():
+                return repo
+
+    add_result = _ha_ws_call("hacs/repositories/add", repository=full_name, category=category)
+    if not add_result or not add_result.get("success"):
+        warn(f"[hacs] Impossible d'ajouter le dépôt {full_name} : {add_result}")
+        return None
+    time.sleep(3)  # laisse HACS récupérer les métadonnées du dépôt fraîchement ajouté
+    result = _ha_ws_call("hacs/repositories/list", categories=[category])
+    if result and result.get("success"):
+        for repo in result.get("result", []):
+            if repo.get("full_name", "").lower() == full_name.lower():
+                return repo
+    warn(f"[hacs] Dépôt {full_name} ajouté mais introuvable ensuite dans la liste HACS")
+    return None
+
+
+def _hacs_ensure_installed(full_name: str, category: str = "integration") -> bool:
+    """Installe/actualise full_name via HACS (hacs/repository/download — même
+    endpoint utilisé par le bouton "Download" du panneau HACS). Retourne True si
+    un redémarrage HA est nécessaire (fichiers déposés/modifiés), False si déjà à
+    jour ou en cas d'échec."""
+    repo = _hacs_get_repository(full_name, category)
+    if repo is None:
+        return False
+    if repo.get("installed") and not repo.get("pending_upgrade"):
+        return False  # déjà installé et à jour
+
+    result = _ha_ws_call("hacs/repository/download", repository=repo["id"])
+    if not result or not result.get("success"):
+        warn(f"[hacs] Échec du téléchargement de {full_name} via HACS : {result}")
+        return False
+    log(f"✓ {full_name} {'mis à jour' if repo.get('installed') else 'installé'} via HACS")
+    return True
+
+
 def _alarmo_config_entry_exists() -> bool:
     """Même technique que _mqtt_config_entry_exists() : lecture directe du storage
     HA (homeassistant_config:rw), pas d'appel API nécessaire pour un simple check."""
@@ -1418,72 +1598,24 @@ def _alarmo_config_entry_exists() -> bool:
         return False
 
 
-def _alarmo_installed_version() -> str | None:
-    try:
-        with open(os.path.join(ALARMO_DIR, "manifest.json")) as f:
-            return json.load(f).get("version")
-    except Exception:
-        return None
-
-
-def _alarmo_deploy_release(release: dict) -> bool:
-    """Télécharge alarmo.zip de la release donnée et l'extrait dans ALARMO_DIR
-    (écrase un déploiement existant — utilisé aussi bien pour l'install initiale
-    que pour une mise à jour)."""
-    asset = next((a for a in release.get("assets", []) if a.get("name") == "alarmo.zip"), None)
-    if not asset:
-        warn("[alarmo] Aucun asset alarmo.zip trouvé sur la dernière release GitHub — abandon")
-        return False
-    try:
-        zip_resp = requests.get(asset["browser_download_url"], timeout=30)
-        zip_resp.raise_for_status()
-        os.makedirs(ALARMO_DIR, exist_ok=True)
-        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
-            zf.extractall(ALARMO_DIR)
-        return True
-    except Exception as e:
-        warn(f"[alarmo] Téléchargement/installation impossible : {e}")
-        return False
-
-
 def install_alarmo():
-    """Installe ET met à jour Alarmo (alarme, cf. chantier alarme HANDOFF) —
-    idempotent, appelé à chaque démarrage de l'addon (pas seulement à la première
-    installation, contrairement à run_setup(), pour pouvoir s'activer/se mettre à
-    jour sur un site déjà provisionné sans réinitialiser toute la config).
+    """Installe ET met à jour Alarmo via HACS (cf. install_hacs() pour le bootstrap
+    partagé — HACS lui-même + autorisation GitHub, une fois par site). Idempotent,
+    appelé à chaque démarrage de l'addon (volontairement hors run_setup(), pour
+    pouvoir s'activer sur un site déjà provisionné sans réinitialiser toute la
+    config — cf. __main__).
 
-    Alarmo n'a pas d'auto-update HACS ici (cf. ALARMO_GH_REPO plus haut — pas de
-    HACS du tout) : sans cette vérification à chaque boot, une version installée
-    une fois resterait figée pour toujours.
+    NB : logique construite et vérifiée contre le code source réel de HACS et
+    d'Alarmo (websocket/*.py, config_flow.py, releases GitHub) — pas devinée —
+    mais jamais exécutée contre une vraie instance HA depuis cette session, faute
+    d'accès. À surveiller au premier déploiement réel (2026-07-27)."""
+    if not install_hacs():
+        return  # HACS pas encore prêt (installation ou autorisation GitHub en cours)
 
-    NB : jamais vérifié en conditions réelles (pas de site de test avec Alarmo
-    disponible pendant cette session) — à surveiller au premier déploiement réel."""
     log("── Alarmo (alarme) ──────────────────────────")
     wait_for_ha()
 
-    installed_version = _alarmo_installed_version()  # None si pas encore installé
-
-    latest_release = None
-    try:
-        r = requests.get(f"https://api.github.com/repos/{ALARMO_GH_REPO}/releases/latest", timeout=15)
-        r.raise_for_status()
-        latest_release = r.json()
-    except Exception as e:
-        warn(f"[alarmo] Vérification de la dernière version impossible : {e}")
-        if installed_version is None:
-            return  # ni installé, ni moyen de vérifier — on retentera au prochain boot
-
-    latest_version = str(latest_release.get("tag_name", "")).lstrip("v") if latest_release else None
-    needs_deploy = installed_version is None or (latest_version and latest_version != installed_version)
-
-    if needs_deploy and latest_release:
-        if not _alarmo_deploy_release(latest_release):
-            return
-        if installed_version:
-            log(f"✓ Alarmo mis à jour {installed_version} → {latest_version} → {ALARMO_DIR}")
-        else:
-            log(f"✓ Alarmo {latest_version or '?'} installé → {ALARMO_DIR}")
-
+    if _hacs_ensure_installed(ALARMO_FULL_NAME):
         log("[alarmo] Restart HA Core pour charger Alarmo…")
         try:
             requests.post(
@@ -1495,8 +1627,6 @@ def install_alarmo():
             warn(f"[alarmo] Erreur restart HA : {e}")
             return
         wait_for_ha()
-    elif installed_version:
-        log(f"[alarmo] Déjà à jour ({installed_version})")
 
     if _alarmo_config_entry_exists():
         return
