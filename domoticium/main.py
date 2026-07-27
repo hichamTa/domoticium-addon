@@ -1463,6 +1463,11 @@ def _hacs_poll_device_flow(flow_id: str):
         step_type = step.get("type")
         if step_type == "create_entry":
             log("✓ [hacs] Autorisation GitHub validée — HACS configuré")
+            # install_alarmo() a déjà tourné une fois au démarrage AVANT que cette
+            # autorisation soit validée (install_hacs() avait donc renvoyé False à ce
+            # moment-là) — sans cet appel, Alarmo ne serait jamais installé avant le
+            # prochain redémarrage complet de l'addon. On complète la séquence ici.
+            install_alarmo()
             return
         if step_type == "abort":
             warn(f"[hacs] Flow d'autorisation abandonné : {step.get('reason')}")
