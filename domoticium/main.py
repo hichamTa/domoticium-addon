@@ -3522,6 +3522,14 @@ def _detect_device_type(exposes: list[dict]) -> str:
     if "contact" in names: return "sensor-contact"
     if "temperature" in names or "humidity" in names: return "sensor-temp"
     if "outlet" in types: return "plug"
+    # Sirène Zigbee (Develco/Heiman/Woox/Bosch…) : expose top-level "warning"
+    # (composite) sur toutes les sirènes standard Z2M — vérifié sur la doc Z2M
+    # (SIRZB-110, HS2WD-E), pas de type "siren" natif chez Z2M. (2026-07-27)
+    if "warning" in names: return "siren"
+    # TODO clavier de verrouillage (Alarmo) : pas encore de modèle matériel choisi,
+    # donc pas de signature d'exposes fiable à détecter ici — à faire une fois le
+    # matériel confirmé (cf. HANDOFF, chantier alarme). Classification manuelle
+    # possible entre-temps via AddDeviceFlow (type "keypad").
     return "switch"
 
 
