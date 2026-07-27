@@ -1685,6 +1685,19 @@ def _alarmo_candidate_sensors(existing: dict) -> list[dict]:
     return candidates
 
 
+def handle_alarmo_set_settings(data: dict) -> tuple[bool, str]:
+    """POST /api/alarmo/config côté HA (websockets.py::AlarmoConfigView) —
+    réglages globaux (onglets "Général"/"Codes" du panneau Alarmo) : code_arm_
+    required/code_disarm_required/code_mode_change_required/code_format,
+    ignore_blocking_sensors_after_trigger, disarm_after_trigger, trigger_time,
+    mqtt, master. Distinct de handle_alarmo_set_area() (délais par mode) et de
+    notre propre GET /alarmo/config (agrégat de lecture, sans rapport)."""
+    r = ha_post("/alarmo/config", data)
+    if r.ok:
+        return True, ""
+    return False, f"HA {r.status_code}: {r.text[:200]}"
+
+
 def _alarmo_notify_targets() -> list[str]:
     """Cibles de notification disponibles — reproduit le menu déroulant "Cible"
     du formulaire "Créer une notification" d'Alarmo (capture Hicham, 2026-07-27) :
@@ -1705,12 +1718,14 @@ def handle_alarmo_get_config() -> dict:
     areas = _ha_ws_call("alarmo/areas")
     users = _ha_ws_call("alarmo/users")
     automations = _ha_ws_call("alarmo/automations")
+    settings = _ha_ws_call("alarmo/config")
     sensors_result = sensors.get("result") if sensors and sensors.get("success") else {}
     return {
         "sensors": sensors_result,
         "areas": areas.get("result") if areas and areas.get("success") else {},
         "users": users.get("result") if users and users.get("success") else {},
         "automations": automations.get("result") if automations and automations.get("success") else {},
+        "settings": settings.get("result") if settings and settings.get("success") else {},
         "candidates": _alarmo_candidate_sensors(sensors_result or {}),
         "notifyTargets": _alarmo_notify_targets(),
     }
@@ -5166,6 +5181,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/alarmo/area":          self._handle_alarmo_area_route,
                 "/alarmo/user":          self._handle_alarmo_user_route,
                 "/alarmo/automation":    self._handle_alarmo_automation_route,
+                "/alarmo/settings":      self._handle_alarmo_settings_route,
             }
             handler = handlers.get(route)
             if not handler:
@@ -5267,6 +5283,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_alarmo_automation_route(self, data):
         ok, err = handle_alarmo_set_automation(data)
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, err)
+
+    def _handle_alarmo_settings_route(self, data):
+        ok, err = handle_alarmo_set_settings(data)
         if ok:
             self._ok()
         else:
