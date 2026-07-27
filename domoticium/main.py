@@ -1598,6 +1598,41 @@ def _alarmo_config_entry_exists() -> bool:
         return False
 
 
+def handle_alarmo_set_sensor(data: dict) -> tuple[bool, str]:
+    """POST /api/alarmo/sensors côté HA — pas un service, une vue HTTP dédiée
+    d'Alarmo (websockets.py::AlarmoSensorView, vérifiée dans son code source).
+    entity_id + les champs Alarmo réels (type/modes/use_exit_delay/…) — l'app web
+    envoie déjà les bons noms de champs, l'addon ne fait que relayer."""
+    entity_id = data.get("entity_id")
+    if not entity_id:
+        return False, "entity_id manquant"
+    r = ha_post("/alarmo/sensors", data)
+    if r.ok:
+        return True, ""
+    return False, f"HA {r.status_code}: {r.text[:200]}"
+
+
+def handle_alarmo_set_area(data: dict) -> tuple[bool, str]:
+    """POST /api/alarmo/area côté HA (websockets.py::AlarmoAreaView) — modes
+    d'armement (délais) de la zone par défaut si area_id absent (site mono-zone)."""
+    r = ha_post("/alarmo/area", data)
+    if r.ok:
+        return True, ""
+    return False, f"HA {r.status_code}: {r.text[:200]}"
+
+
+def handle_alarmo_get_config() -> dict:
+    """Lecture config Alarmo réelle — WS uniquement côté Alarmo (pas de REST GET,
+    cf. websockets.py::websocket_get_sensors/websocket_get_areas), pour préremplir
+    l'app avec l'état réel plutôt que des défauts recalculés à chaque chargement."""
+    sensors = _ha_ws_call("alarmo/sensors")
+    areas = _ha_ws_call("alarmo/areas")
+    return {
+        "sensors": sensors.get("result") if sensors and sensors.get("success") else {},
+        "areas": areas.get("result") if areas and areas.get("success") else {},
+    }
+
+
 def install_alarmo():
     """Installe ET met à jour Alarmo via HACS (cf. install_hacs() pour le bootstrap
     partagé — HACS lui-même + autorisation GitHub, une fois par site). Idempotent,
@@ -5044,6 +5079,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/camera/test":          self._handle_camera_test_route,
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/sync-now":             self._handle_sync_now,
+                "/alarmo/sensor":        self._handle_alarmo_sensor_route,
+                "/alarmo/area":          self._handle_alarmo_area_route,
             }
             handler = handlers.get(route)
             if not handler:
@@ -5121,6 +5158,20 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
     def _handle_ha_command_route(self, data):
         _handle_ha_command(json.dumps(data).encode())
         self._ok()
+
+    def _handle_alarmo_sensor_route(self, data):
+        ok, err = handle_alarmo_set_sensor(data)
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, err)
+
+    def _handle_alarmo_area_route(self, data):
+        ok, err = handle_alarmo_set_area(data)
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, err)
 
     def _handle_camera_configure_route(self, data):
         action = data.get("action", "add")
@@ -5220,6 +5271,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         route = route.split("?")[0]
         if route == "/camera/scan":
             self._handle_camera_scan()
+        elif route == "/alarmo/config":
+            self._handle_alarmo_config_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -5229,6 +5282,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok({"cameras": cameras})
         except Exception as e:
             warn(f"[camera-scan] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_config_route(self):
+        try:
+            self._ok(handle_alarmo_get_config())
+        except Exception as e:
+            warn(f"[alarmo-config] {e}")
             self._reject(500, str(e))
 
 
