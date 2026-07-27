@@ -1418,41 +1418,73 @@ def _alarmo_config_entry_exists() -> bool:
         return False
 
 
+def _alarmo_installed_version() -> str | None:
+    try:
+        with open(os.path.join(ALARMO_DIR, "manifest.json")) as f:
+            return json.load(f).get("version")
+    except Exception:
+        return None
+
+
+def _alarmo_deploy_release(release: dict) -> bool:
+    """Télécharge alarmo.zip de la release donnée et l'extrait dans ALARMO_DIR
+    (écrase un déploiement existant — utilisé aussi bien pour l'install initiale
+    que pour une mise à jour)."""
+    asset = next((a for a in release.get("assets", []) if a.get("name") == "alarmo.zip"), None)
+    if not asset:
+        warn("[alarmo] Aucun asset alarmo.zip trouvé sur la dernière release GitHub — abandon")
+        return False
+    try:
+        zip_resp = requests.get(asset["browser_download_url"], timeout=30)
+        zip_resp.raise_for_status()
+        os.makedirs(ALARMO_DIR, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+            zf.extractall(ALARMO_DIR)
+        return True
+    except Exception as e:
+        warn(f"[alarmo] Téléchargement/installation impossible : {e}")
+        return False
+
+
 def install_alarmo():
-    """Installe et configure Alarmo (alarme, cf. chantier alarme HANDOFF) — idempotent,
-    appelé à chaque démarrage de l'addon (pas seulement à la première installation,
-    contrairement à run_setup(), pour pouvoir l'activer sur un site déjà provisionné
-    sans réinitialiser toute la config).
+    """Installe ET met à jour Alarmo (alarme, cf. chantier alarme HANDOFF) —
+    idempotent, appelé à chaque démarrage de l'addon (pas seulement à la première
+    installation, contrairement à run_setup(), pour pouvoir s'activer/se mettre à
+    jour sur un site déjà provisionné sans réinitialiser toute la config).
 
-    NB : jamais vérifié en conditions réelles (pas de site de test avec Alarmo pas
-    encore installé disponible pendant cette session) — à surveiller au premier
-    déploiement réel."""
-    if os.path.isdir(ALARMO_DIR) and _alarmo_config_entry_exists():
-        return  # déjà installé et configuré — cas normal après le 1er démarrage
+    Alarmo n'a pas d'auto-update HACS ici (cf. ALARMO_GH_REPO plus haut — pas de
+    HACS du tout) : sans cette vérification à chaque boot, une version installée
+    une fois resterait figée pour toujours.
 
+    NB : jamais vérifié en conditions réelles (pas de site de test avec Alarmo
+    disponible pendant cette session) — à surveiller au premier déploiement réel."""
     log("── Alarmo (alarme) ──────────────────────────")
     wait_for_ha()
 
-    if not os.path.isdir(ALARMO_DIR):
-        try:
-            r = requests.get(f"https://api.github.com/repos/{ALARMO_GH_REPO}/releases/latest", timeout=15)
-            r.raise_for_status()
-            release = r.json()
-            asset = next((a for a in release.get("assets", []) if a.get("name") == "alarmo.zip"), None)
-            if not asset:
-                warn("[alarmo] Aucun asset alarmo.zip trouvé sur la dernière release GitHub — abandon")
-                return
-            zip_resp = requests.get(asset["browser_download_url"], timeout=30)
-            zip_resp.raise_for_status()
-            os.makedirs(ALARMO_DIR, exist_ok=True)
-            with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
-                zf.extractall(ALARMO_DIR)
-            log(f"✓ Alarmo {release.get('tag_name', '?')} déployé → {ALARMO_DIR}")
-        except Exception as e:
-            warn(f"[alarmo] Téléchargement/installation impossible : {e}")
-            return
+    installed_version = _alarmo_installed_version()  # None si pas encore installé
 
-        log("[alarmo] Restart HA Core pour charger le nouveau custom_component…")
+    latest_release = None
+    try:
+        r = requests.get(f"https://api.github.com/repos/{ALARMO_GH_REPO}/releases/latest", timeout=15)
+        r.raise_for_status()
+        latest_release = r.json()
+    except Exception as e:
+        warn(f"[alarmo] Vérification de la dernière version impossible : {e}")
+        if installed_version is None:
+            return  # ni installé, ni moyen de vérifier — on retentera au prochain boot
+
+    latest_version = str(latest_release.get("tag_name", "")).lstrip("v") if latest_release else None
+    needs_deploy = installed_version is None or (latest_version and latest_version != installed_version)
+
+    if needs_deploy and latest_release:
+        if not _alarmo_deploy_release(latest_release):
+            return
+        if installed_version:
+            log(f"✓ Alarmo mis à jour {installed_version} → {latest_version} → {ALARMO_DIR}")
+        else:
+            log(f"✓ Alarmo {latest_version or '?'} installé → {ALARMO_DIR}")
+
+        log("[alarmo] Restart HA Core pour charger Alarmo…")
         try:
             requests.post(
                 f"{SUP}/homeassistant/restart",
@@ -1463,9 +1495,10 @@ def install_alarmo():
             warn(f"[alarmo] Erreur restart HA : {e}")
             return
         wait_for_ha()
+    elif installed_version:
+        log(f"[alarmo] Déjà à jour ({installed_version})")
 
     if _alarmo_config_entry_exists():
-        log("✓ Intégration Alarmo déjà configurée")
         return
 
     # Flow zéro-input : config_flow.py officiel d'Alarmo appelle
