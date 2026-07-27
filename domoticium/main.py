@@ -1685,6 +1685,18 @@ def _alarmo_candidate_sensors(existing: dict) -> list[dict]:
     return candidates
 
 
+def _alarmo_notify_targets() -> list[str]:
+    """Cibles de notification disponibles — reproduit le menu déroulant "Cible"
+    du formulaire "Créer une notification" d'Alarmo (capture Hicham, 2026-07-27) :
+    ce n'est PAS une API Alarmo, juste les services HA du domaine "notify"
+    (get_services, commande WS standard HA)."""
+    result = _ha_ws_call("get_services")
+    if not result or not result.get("success"):
+        return []
+    notify_services = (result.get("result") or {}).get("notify", {})
+    return [f"notify.{name}" for name in notify_services.keys()]
+
+
 def handle_alarmo_get_config() -> dict:
     """Lecture config Alarmo réelle — WS uniquement côté Alarmo (pas de REST GET,
     cf. websockets.py::websocket_get_*), pour préremplir l'app avec l'état réel
@@ -1700,6 +1712,7 @@ def handle_alarmo_get_config() -> dict:
         "users": users.get("result") if users and users.get("success") else {},
         "automations": automations.get("result") if automations and automations.get("success") else {},
         "candidates": _alarmo_candidate_sensors(sensors_result or {}),
+        "notifyTargets": _alarmo_notify_targets(),
     }
 
 
