@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, uuid
+import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, uuid, zipfile
 import paho.mqtt.client as mqtt
 import requests
 
@@ -93,6 +93,13 @@ Z2M_SLUG       = "45df7312_zigbee2mqtt"
 MATTER_SLUG    = "core_matter_server"
 THREAD_SLUG    = "core_openthread_border_router"
 FRIGATE_REPO   = "https://github.com/hichamTa/frigate-hass-addons"
+# Alarmo n'est PAS un add-on Supervisor (contrairement à Frigate ci-dessus) mais une
+# intégration HA classique (custom_component). Pas besoin de HACS pour l'installer :
+# son mainteneur publie un zip de release tout prêt (mêmes conventions que HACS lui-
+# même), qu'on télécharge et dépose directement dans custom_components/ — cf.
+# install_alarmo() plus bas. Repo public, vérifié manuellement (2026-07-27).
+ALARMO_GH_REPO = "nielsfaber/alarmo"
+ALARMO_DIR     = "/homeassistant/custom_components/alarmo"
 FRIGATE_SLUG   = "582436be_frigate"
 # Ancien dépôt Frigate (officiel, upstream) — Frigate n'y lit JAMAIS notre frigate.yml
 # (CONFIG_FILE non défini dans son config.yaml, donc find_config_file() résout vers son
@@ -1396,6 +1403,83 @@ def _setup_frigate_auth_once():
         return
     open(_FRIGATE_AUTH_MARKER, "w").close()
     log("[frigate] ✓ Auth gérée via YAML (auth.enabled: false dans frigate.yml)")
+
+
+def _alarmo_config_entry_exists() -> bool:
+    """Même technique que _mqtt_config_entry_exists() : lecture directe du storage
+    HA (homeassistant_config:rw), pas d'appel API nécessaire pour un simple check."""
+    try:
+        with open("/homeassistant/.storage/core.config_entries") as f:
+            storage = json.load(f)
+        entries = storage.get("data", {}).get("entries", [])
+        return any(e.get("domain") == "alarmo" for e in entries)
+    except Exception as e:
+        warn(f"[alarmo] Lecture core.config_entries impossible : {e}")
+        return False
+
+
+def install_alarmo():
+    """Installe et configure Alarmo (alarme, cf. chantier alarme HANDOFF) — idempotent,
+    appelé à chaque démarrage de l'addon (pas seulement à la première installation,
+    contrairement à run_setup(), pour pouvoir l'activer sur un site déjà provisionné
+    sans réinitialiser toute la config).
+
+    NB : jamais vérifié en conditions réelles (pas de site de test avec Alarmo pas
+    encore installé disponible pendant cette session) — à surveiller au premier
+    déploiement réel."""
+    if os.path.isdir(ALARMO_DIR) and _alarmo_config_entry_exists():
+        return  # déjà installé et configuré — cas normal après le 1er démarrage
+
+    log("── Alarmo (alarme) ──────────────────────────")
+    wait_for_ha()
+
+    if not os.path.isdir(ALARMO_DIR):
+        try:
+            r = requests.get(f"https://api.github.com/repos/{ALARMO_GH_REPO}/releases/latest", timeout=15)
+            r.raise_for_status()
+            release = r.json()
+            asset = next((a for a in release.get("assets", []) if a.get("name") == "alarmo.zip"), None)
+            if not asset:
+                warn("[alarmo] Aucun asset alarmo.zip trouvé sur la dernière release GitHub — abandon")
+                return
+            zip_resp = requests.get(asset["browser_download_url"], timeout=30)
+            zip_resp.raise_for_status()
+            os.makedirs(ALARMO_DIR, exist_ok=True)
+            with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+                zf.extractall(ALARMO_DIR)
+            log(f"✓ Alarmo {release.get('tag_name', '?')} déployé → {ALARMO_DIR}")
+        except Exception as e:
+            warn(f"[alarmo] Téléchargement/installation impossible : {e}")
+            return
+
+        log("[alarmo] Restart HA Core pour charger le nouveau custom_component…")
+        try:
+            requests.post(
+                f"{SUP}/homeassistant/restart",
+                headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+                timeout=60,
+            )
+        except Exception as e:
+            warn(f"[alarmo] Erreur restart HA : {e}")
+            return
+        wait_for_ha()
+
+    if _alarmo_config_entry_exists():
+        log("✓ Intégration Alarmo déjà configurée")
+        return
+
+    # Flow zéro-input : config_flow.py officiel d'Alarmo appelle
+    # self.async_create_entry(...) dès le premier appel, sans étape intermédiaire
+    # (vérifié directement dans le code source de la release, 2026-07-27).
+    flow_resp = ha_post("/config/config_entries/flow", {"handler": "alarmo"})
+    if not flow_resp.ok:
+        warn(f"[alarmo] Flow impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
+        return
+    flow = _unwrap(flow_resp.json())
+    if flow.get("type") == "create_entry":
+        log("✓ Intégration Alarmo configurée")
+    else:
+        warn(f"[alarmo] Flow inattendu (type={flow.get('type')}) : {flow}")
 
 
 def write_frigate_config():
@@ -5072,4 +5156,10 @@ if __name__ == "__main__":
         run_setup()
     else:
         log("Déjà configuré — démarrage du service.")
+
+    # Hors run_setup() volontairement : contrairement à Z2M/Matter/Frigate (posés une
+    # fois pour toutes à la création du site), Alarmo est un chantier en cours — doit
+    # pouvoir s'installer sur un site déjà provisionné, sans repasser par force_setup.
+    install_alarmo()
+
     run_bridge()
