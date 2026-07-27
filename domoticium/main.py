@@ -1626,15 +1626,80 @@ def handle_alarmo_set_area(data: dict) -> tuple[bool, str]:
     return False, f"HA {r.status_code}: {r.text[:200]}"
 
 
+def handle_alarmo_set_user(data: dict) -> tuple[bool, str]:
+    """POST /api/alarmo/users côté HA (websockets.py::AlarmoUserView)."""
+    r = ha_post("/alarmo/users", data)
+    if r.ok:
+        return True, ""
+    return False, f"HA {r.status_code}: {r.text[:200]}"
+
+
+def handle_alarmo_set_automation(data: dict) -> tuple[bool, str]:
+    """POST /api/alarmo/automations côté HA (websockets.py::AlarmoAutomationView) —
+    sert à la fois pour l'onglet Notifications (type="notification", service_data
+    passé dans des templates/wildcards Alarmo) et Actions (type quelconque, appel
+    de service HA direct sans traitement de wildcard, cf. async_execute_automation
+    dans automations.py — vérifié dans le code source, pas deviné)."""
+    r = ha_post("/alarmo/automations", data)
+    if r.ok:
+        return True, ""
+    return False, f"HA {r.status_code}: {r.text[:200]}"
+
+
+# device_class HA → catégorie Alarmo — reproduit la logique de suggestion du
+# frontend d'Alarmo (le backend ne fait AUCUN filtrage par device_class lui-même,
+# vérifié dans sensors.py — ce mapping n'existe que côté frontend HA/Alarmo).
+# Correspond au tableau du README officiel d'Alarmo (2026-07-27).
+_ALARMO_DEVICE_CLASS_TO_TYPE = {
+    "door": "door", "garage_door": "door", "lock": "door", "opening": "door",
+    "window": "window",
+    "motion": "motion", "moving": "motion", "occupancy": "motion", "presence": "motion",
+    "tamper": "tamper", "sound": "tamper", "vibration": "tamper",
+    "carbon_monoxide": "environmental", "gas": "environmental", "heat": "environmental",
+    "moisture": "environmental", "safety": "environmental", "smoke": "environmental",
+}
+
+
+def _alarmo_candidate_sensors(existing: dict) -> list[dict]:
+    """Capteurs HA disponibles pour Alarmo mais pas encore ajoutés — demandé par
+    Hicham (2026-07-27) : partir des vraies entités HA plutôt que de nos propres
+    devices Domoticium, comme le fait le panneau Alarmo lui-même."""
+    result = _ha_ws_call("get_states")
+    if not result or not result.get("success"):
+        return []
+    candidates = []
+    for state in result.get("result", []):
+        entity_id = state.get("entity_id", "")
+        if not entity_id.startswith("binary_sensor.") or entity_id in existing:
+            continue
+        device_class = (state.get("attributes") or {}).get("device_class")
+        alarmo_type = _ALARMO_DEVICE_CLASS_TO_TYPE.get(device_class)
+        if not alarmo_type:
+            continue
+        candidates.append({
+            "entity_id": entity_id,
+            "name": (state.get("attributes") or {}).get("friendly_name", entity_id),
+            "device_class": device_class,
+            "suggested_type": alarmo_type,
+        })
+    return candidates
+
+
 def handle_alarmo_get_config() -> dict:
     """Lecture config Alarmo réelle — WS uniquement côté Alarmo (pas de REST GET,
-    cf. websockets.py::websocket_get_sensors/websocket_get_areas), pour préremplir
-    l'app avec l'état réel plutôt que des défauts recalculés à chaque chargement."""
+    cf. websockets.py::websocket_get_*), pour préremplir l'app avec l'état réel
+    plutôt que des défauts recalculés à chaque chargement."""
     sensors = _ha_ws_call("alarmo/sensors")
     areas = _ha_ws_call("alarmo/areas")
+    users = _ha_ws_call("alarmo/users")
+    automations = _ha_ws_call("alarmo/automations")
+    sensors_result = sensors.get("result") if sensors and sensors.get("success") else {}
     return {
-        "sensors": sensors.get("result") if sensors and sensors.get("success") else {},
+        "sensors": sensors_result,
         "areas": areas.get("result") if areas and areas.get("success") else {},
+        "users": users.get("result") if users and users.get("success") else {},
+        "automations": automations.get("result") if automations and automations.get("success") else {},
+        "candidates": _alarmo_candidate_sensors(sensors_result or {}),
     }
 
 
@@ -5086,6 +5151,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/sync-now":             self._handle_sync_now,
                 "/alarmo/sensor":        self._handle_alarmo_sensor_route,
                 "/alarmo/area":          self._handle_alarmo_area_route,
+                "/alarmo/user":          self._handle_alarmo_user_route,
+                "/alarmo/automation":    self._handle_alarmo_automation_route,
             }
             handler = handlers.get(route)
             if not handler:
@@ -5173,6 +5240,20 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_alarmo_area_route(self, data):
         ok, err = handle_alarmo_set_area(data)
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, err)
+
+    def _handle_alarmo_user_route(self, data):
+        ok, err = handle_alarmo_set_user(data)
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, err)
+
+    def _handle_alarmo_automation_route(self, data):
+        ok, err = handle_alarmo_set_automation(data)
         if ok:
             self._ok()
         else:
