@@ -3193,6 +3193,19 @@ def run_ha_ws_bridge():
                     state_val = new_state.get("state", "")
                     attributes = new_state.get("attributes", {})
 
+                    if domain == "alarm_control_panel":
+                        # Pas un "device" (pas de room/ieee) — table sites.alarm_*
+                        # dédiée, jamais dans le batch générique ci-dessous. Peu
+                        # fréquent (armements/déclenchements) → appel direct plutôt
+                        # que batché, pas besoin d'attendre 2.5s pour ce cas.
+                        if INGEST_SECRET:
+                            threading.Thread(
+                                target=_report_alarm_state_direct,
+                                args=(entity_id, state_val, attributes),
+                                daemon=True,
+                            ).start()
+                        continue
+
                     # Accumule dans le batch — _flush_state_batch() envoie toutes les 2.5s.
                     # La déduplication par entity_id conserve uniquement le dernier état.
                     if INGEST_SECRET:
@@ -3424,6 +3437,34 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
         return True
     except Exception as e:
         warn(f"[supabase] pi_report_device_state({entity_id}): {e}")
+        return False
+
+
+def _report_alarm_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
+    """pi_report_alarm_state via Supabase direct — True si réussi. alarm_control_panel
+    n'est pas un "device" au sens de notre schéma (pas de room_id/ieee_address…) —
+    table dédiée sites.alarm_* plutôt que le pipeline générique pi_report_device_state
+    (qui ne trouverait aucune ligne correspondante dans `devices`).
+
+    open_sensors : dict {entity_id: sensor_state} côté Alarmo (vérifié dans
+    sensors.py::async_arm — "open_sensors[entity] = sensor_state"), pas une liste —
+    on prend la première clé comme capteur déclencheur."""
+    try:
+        mode = attributes.get("arm_mode")
+        open_sensors = attributes.get("open_sensors") or {}
+        triggered_by = next(iter(open_sensors.keys()), None) if isinstance(open_sensors, dict) else None
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:alarm_state:{state}"
+        r = _supabase_rpc("pi_report_alarm_state", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_state": state, "p_mode": mode, "p_triggered_by": triggered_by,
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_alarm_state({entity_id}) {r.status_code}: {r.text[:120]}")
+            return False
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_alarm_state({entity_id}): {e}")
         return False
 
 
