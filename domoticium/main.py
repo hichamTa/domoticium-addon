@@ -1582,6 +1582,58 @@ def _hacs_ensure_installed(full_name: str, category: str = "integration") -> boo
     return True
 
 
+# device_class HA → catégorie Alarmo — reproduit la logique de suggestion du
+# frontend d'Alarmo (le backend ne fait AUCUN filtrage par device_class lui-même,
+# vérifié dans sensors.py — ce mapping n'existe que côté frontend HA/Alarmo).
+# Correspond au tableau du README officiel d'Alarmo (vérifié 2026-07-27).
+_ALARMO_DEVICE_CLASS_TO_TYPE = {
+    "door": "door", "garage_door": "door", "lock": "door", "opening": "door",
+    "window": "window",
+    "motion": "motion", "moving": "motion", "occupancy": "motion", "presence": "motion",
+    "tamper": "tamper", "sound": "tamper", "vibration": "tamper",
+    "carbon_monoxide": "environmental", "gas": "environmental", "heat": "environmental",
+    "moisture": "environmental", "safety": "environmental", "smoke": "environmental",
+}
+
+
+def _alarmo_candidate_sensors(existing: dict) -> list[dict]:
+    """Capteurs HA disponibles pour Alarmo mais pas encore ajoutés — on part des
+    vraies entités HA (get_states + device_class) plutôt que de nos propres
+    devices Domoticium, comme le fait le panneau Alarmo lui-même."""
+    result = _ha_ws_call("get_states")
+    if not result or not result.get("success"):
+        return []
+    candidates = []
+    for state in result.get("result", []):
+        entity_id = state.get("entity_id", "")
+        if not entity_id.startswith("binary_sensor.") or entity_id in existing:
+            continue
+        device_class = (state.get("attributes") or {}).get("device_class")
+        alarmo_type = _ALARMO_DEVICE_CLASS_TO_TYPE.get(device_class)
+        if not alarmo_type:
+            continue
+        candidates.append({
+            "entity_id": entity_id,
+            "name": (state.get("attributes") or {}).get("friendly_name", entity_id),
+            "device_class": device_class,
+            "suggested_type": alarmo_type,
+        })
+    return candidates
+
+
+def handle_alarmo_get_sensors() -> dict:
+    """Étape 1 de la reconstruction de la page Alarme : capteurs déjà configurés
+    dans Alarmo (WS alarmo/sensors, seule voie de lecture — pas de REST GET côté
+    Alarmo, cf. websockets.py::websocket_get_sensors) + capteurs HA candidats pas
+    encore ajoutés (_alarmo_candidate_sensors)."""
+    result = _ha_ws_call("alarmo/sensors")
+    sensors = result.get("result") if result and result.get("success") else {}
+    return {
+        "sensors": sensors or {},
+        "candidates": _alarmo_candidate_sensors(sensors or {}),
+    }
+
+
 def write_frigate_config():
     """Écrit /homeassistant/frigate.yml. Le prepare script Frigate le copie dans son
     stockage privé à chaque démarrage — c'est la seule voie de config utilisée."""
@@ -5174,6 +5226,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         route = route.split("?")[0]
         if route == "/camera/scan":
             self._handle_camera_scan()
+        elif route == "/alarmo/sensors":
+            self._handle_alarmo_sensors_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -5183,6 +5237,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok({"cameras": cameras})
         except Exception as e:
             warn(f"[camera-scan] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_sensors_route(self):
+        try:
+            self._ok(handle_alarmo_get_sensors())
+        except Exception as e:
+            warn(f"[alarmo-sensors] {e}")
             self._reject(500, str(e))
 
 
