@@ -3929,9 +3929,11 @@ def _handle_ha_command(payload: bytes):
         warn(f"[ha/command] Type inconnu : {cmd_type}")
 
 
-def _detect_device_type(exposes: list[dict]) -> str:
-    """Port Python de detectDeviceType() (web/src/app/api/webhooks/pi/devices-sync/route.ts)
-    — utilisé uniquement par le chemin direct Supabase, cf. HANDOFF §36."""
+def _detect_device_type(
+    exposes: list[dict], ieee_address: str | None = None, ha_entities: list[dict] | None = None
+) -> str:
+    """Port Python de detectDeviceType() (ex web/src/app/api/webhooks/pi/devices-sync/route.ts,
+    renommé depuis) — utilisé uniquement par le chemin direct Supabase, cf. HANDOFF §36."""
     types = [e.get("type", "") for e in exposes]
     names = [e.get("name", "") for e in exposes]
     if "light" in types: return "light"
@@ -3942,10 +3944,21 @@ def _detect_device_type(exposes: list[dict]) -> str:
     if "occupancy" in names or "motion" in names: return "sensor-motion"
     if "contact" in names: return "sensor-contact"
     if "temperature" in names or "humidity" in names: return "sensor-temp"
+    # Sirène : signal fiable = HA a déjà créé l'entité native siren.* pour ce
+    # device — Z2M le fait pour tout appareil exposant "warning" depuis
+    # Koenkk/zigbee2mqtt#31000 (vérifié source 2026-07-28), prioritaire sur
+    # "outlet" (une sirène mal détectée remonterait sinon comme prise "plug").
+    if ieee_address and ha_entities:
+        if any(
+            ieee_address in (e.get("unique_id") or "") and (e.get("entity_id") or "").startswith("siren.")
+            for e in ha_entities
+        ):
+            return "siren"
     if "outlet" in types: return "plug"
-    # Sirène Zigbee (Develco/Heiman/Woox/Bosch…) : expose top-level "warning"
-    # (composite) sur toutes les sirènes standard Z2M — vérifié sur la doc Z2M
-    # (SIRZB-110, HS2WD-E), pas de type "siren" natif chez Z2M. (2026-07-27)
+    # Repli si l'entité HA n'est pas encore enregistrée (juste après appairage,
+    # avant que Z2M/HA n'aient eu le temps de créer l'entité siren.*) : expose
+    # top-level "warning" (composite) sur toutes les sirènes standard Z2M —
+    # vérifié sur la doc Z2M (SIRZB-110, HS2WD-E). (2026-07-27)
     if "warning" in names: return "siren"
     # TODO clavier de verrouillage (Alarmo) : pas encore de modèle matériel choisi,
     # donc pas de signature d'exposes fiable à détecter ici — à faire une fois le
@@ -3959,6 +3972,7 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
     filtrage (coordinateur/interview non terminée exclus) fait par la route Vercel."""
     try:
         payload_devices = []
+        ha_entities = None  # chargé paresseusement, une seule fois pour toute la synchro
         for d in devices_list:
             if d.get("type") == "Coordinator": continue
             if not d.get("interview_completed"): continue
@@ -3967,7 +3981,10 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
 
             definition = d.get("definition") or {}
             exposes = definition.get("exposes") or []
-            device_type = _detect_device_type(exposes)
+            if ha_entities is None:
+                result = _ha_ws_call("config/entity_registry/list")
+                ha_entities = result.get("result", []) if result and result.get("success") else []
+            device_type = _detect_device_type(exposes, ieee_address=ieee, ha_entities=ha_entities)
             friendly_name = d.get("friendly_name")
             default_name = friendly_name if (friendly_name and friendly_name != ieee) \
                 else (definition.get("model") or ieee)
