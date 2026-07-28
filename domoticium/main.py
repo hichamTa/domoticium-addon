@@ -93,14 +93,11 @@ Z2M_SLUG       = "45df7312_zigbee2mqtt"
 MATTER_SLUG    = "core_matter_server"
 THREAD_SLUG    = "core_openthread_border_router"
 FRIGATE_REPO   = "https://github.com/hichamTa/frigate-hass-addons"
-# Alarmo n'est PAS un add-on Supervisor (contrairement à Frigate ci-dessus) mais une
-# intégration HA classique (custom_component), installée via HACS — cf. install_hacs()
-# / install_alarmo() plus bas. HACS lui-même est déposé de la même façon que Frigate
-# ci-dessus le serait pour un add-on : zip de release GitHub, pas de script bash
-# interactif. Repos publics, vérifiés manuellement (2026-07-27).
+# HACS : intégrations HA classiques (custom_component) installées via HACS plutôt
+# qu'en add-on Supervisor — cf. install_hacs(). Zip de release GitHub, pas de
+# script bash interactif. Repo public, vérifié manuellement (2026-07-27).
 HACS_GH_REPO     = "hacs/integration"
 HACS_DIR         = "/homeassistant/custom_components/hacs"
-ALARMO_FULL_NAME = "nielsfaber/alarmo"
 FRIGATE_SLUG   = "582436be_frigate"
 # Ancien dépôt Frigate (officiel, upstream) — Frigate n'y lit JAMAIS notre frigate.yml
 # (CONFIG_FILE non défini dans son config.yaml, donc find_config_file() résout vers son
@@ -1463,11 +1460,6 @@ def _hacs_poll_device_flow(flow_id: str):
         step_type = step.get("type")
         if step_type == "create_entry":
             log("✓ [hacs] Autorisation GitHub validée — HACS configuré")
-            # install_alarmo() a déjà tourné une fois au démarrage AVANT que cette
-            # autorisation soit validée (install_hacs() avait donc renvoyé False à ce
-            # moment-là) — sans cet appel, Alarmo ne serait jamais installé avant le
-            # prochain redémarrage complet de l'addon. On complète la séquence ici.
-            install_alarmo()
             return
         if step_type == "abort":
             warn(f"[hacs] Flow d'autorisation abandonné : {step.get('reason')}")
@@ -1478,9 +1470,9 @@ def _hacs_poll_device_flow(flow_id: str):
 
 
 def install_hacs() -> bool:
-    """Dépose et autorise HACS — nécessaire une seule fois par site, partagé avec
-    Alarmo ET la future intégration Frigate (HACS déjà décidé pour Frigate, cf.
-    HANDOFF — même bootstrap réutilisé ici plutôt que dupliqué).
+    """Dépose et autorise HACS — nécessaire une seule fois par site, réutilisable
+    par toute future intégration installée via HACS (Frigate notamment, cf.
+    HANDOFF — bootstrap générique, pas dupliqué par intégration).
 
     Retourne True si HACS est installé ET déjà autorisé (config entry présente).
     Retourne False si l'installation est en cours, ou si l'autorisation GitHub est
@@ -1539,7 +1531,7 @@ def install_hacs() -> bool:
     url  = placeholders.get("url", "https://github.com/login/device")
     if code:
         log(f"⚠ [hacs] ACTION REQUISE (une seule fois pour ce site) — va sur {url} et entre le code : {code}")
-        log("[hacs] Sert aussi pour Alarmo et la future intégration Frigate (HACS).")
+        log("[hacs] Sert aussi à toute future intégration installée via HACS (Frigate).")
         threading.Thread(target=_hacs_poll_device_flow, args=(flow_id,), daemon=True).start()
     else:
         warn(f"[hacs] Pas de code d'autorisation détecté dans la réponse : {step}")
@@ -1549,7 +1541,7 @@ def install_hacs() -> bool:
 def _hacs_get_repository(full_name: str, category: str = "integration") -> dict | None:
     """Retourne le dict repo HACS (id/installed/pending_upgrade…) pour full_name,
     en l'ajoutant comme dépôt custom si HACS ne le connaît pas encore par défaut
-    (cas d'Alarmo, absent de la liste curatée) — cf. hacs/repositories/add côté
+    (cas d'un dépôt absent de la liste curatée) — cf. hacs/repositories/add côté
     websocket/repositories.py officiel."""
     result = _ha_ws_call("hacs/repositories/list", categories=[category])
     if result and result.get("success"):
@@ -1588,194 +1580,6 @@ def _hacs_ensure_installed(full_name: str, category: str = "integration") -> boo
         return False
     log(f"✓ {full_name} {'mis à jour' if repo.get('installed') else 'installé'} via HACS")
     return True
-
-
-def _alarmo_config_entry_exists() -> bool:
-    """Même technique que _mqtt_config_entry_exists() : lecture directe du storage
-    HA (homeassistant_config:rw), pas d'appel API nécessaire pour un simple check."""
-    try:
-        with open("/homeassistant/.storage/core.config_entries") as f:
-            storage = json.load(f)
-        entries = storage.get("data", {}).get("entries", [])
-        return any(e.get("domain") == "alarmo" for e in entries)
-    except Exception as e:
-        warn(f"[alarmo] Lecture core.config_entries impossible : {e}")
-        return False
-
-
-def handle_alarmo_set_sensor(data: dict) -> tuple[bool, str]:
-    """POST /api/alarmo/sensors côté HA — pas un service, une vue HTTP dédiée
-    d'Alarmo (websockets.py::AlarmoSensorView, vérifiée dans son code source).
-    entity_id + les champs Alarmo réels (type/modes/use_exit_delay/…) — l'app web
-    envoie déjà les bons noms de champs, l'addon ne fait que relayer."""
-    entity_id = data.get("entity_id")
-    if not entity_id:
-        return False, "entity_id manquant"
-    r = ha_post("/alarmo/sensors", data)
-    if r.ok:
-        return True, ""
-    return False, f"HA {r.status_code}: {r.text[:200]}"
-
-
-def handle_alarmo_set_area(data: dict) -> tuple[bool, str]:
-    """POST /api/alarmo/area côté HA (websockets.py::AlarmoAreaView) — modes
-    d'armement (délais) de la zone par défaut si area_id absent (site mono-zone)."""
-    r = ha_post("/alarmo/area", data)
-    if r.ok:
-        return True, ""
-    return False, f"HA {r.status_code}: {r.text[:200]}"
-
-
-def handle_alarmo_set_user(data: dict) -> tuple[bool, str]:
-    """POST /api/alarmo/users côté HA (websockets.py::AlarmoUserView)."""
-    r = ha_post("/alarmo/users", data)
-    if r.ok:
-        return True, ""
-    return False, f"HA {r.status_code}: {r.text[:200]}"
-
-
-def handle_alarmo_set_automation(data: dict) -> tuple[bool, str]:
-    """POST /api/alarmo/automations côté HA (websockets.py::AlarmoAutomationView) —
-    sert à la fois pour l'onglet Notifications (type="notification", service_data
-    passé dans des templates/wildcards Alarmo) et Actions (type quelconque, appel
-    de service HA direct sans traitement de wildcard, cf. async_execute_automation
-    dans automations.py — vérifié dans le code source, pas deviné)."""
-    r = ha_post("/alarmo/automations", data)
-    if r.ok:
-        return True, ""
-    return False, f"HA {r.status_code}: {r.text[:200]}"
-
-
-# device_class HA → catégorie Alarmo — reproduit la logique de suggestion du
-# frontend d'Alarmo (le backend ne fait AUCUN filtrage par device_class lui-même,
-# vérifié dans sensors.py — ce mapping n'existe que côté frontend HA/Alarmo).
-# Correspond au tableau du README officiel d'Alarmo (2026-07-27).
-_ALARMO_DEVICE_CLASS_TO_TYPE = {
-    "door": "door", "garage_door": "door", "lock": "door", "opening": "door",
-    "window": "window",
-    "motion": "motion", "moving": "motion", "occupancy": "motion", "presence": "motion",
-    "tamper": "tamper", "sound": "tamper", "vibration": "tamper",
-    "carbon_monoxide": "environmental", "gas": "environmental", "heat": "environmental",
-    "moisture": "environmental", "safety": "environmental", "smoke": "environmental",
-}
-
-
-def _alarmo_candidate_sensors(existing: dict) -> list[dict]:
-    """Capteurs HA disponibles pour Alarmo mais pas encore ajoutés — demandé par
-    Hicham (2026-07-27) : partir des vraies entités HA plutôt que de nos propres
-    devices Domoticium, comme le fait le panneau Alarmo lui-même."""
-    result = _ha_ws_call("get_states")
-    if not result or not result.get("success"):
-        return []
-    candidates = []
-    for state in result.get("result", []):
-        entity_id = state.get("entity_id", "")
-        if not entity_id.startswith("binary_sensor.") or entity_id in existing:
-            continue
-        device_class = (state.get("attributes") or {}).get("device_class")
-        alarmo_type = _ALARMO_DEVICE_CLASS_TO_TYPE.get(device_class)
-        if not alarmo_type:
-            continue
-        candidates.append({
-            "entity_id": entity_id,
-            "name": (state.get("attributes") or {}).get("friendly_name", entity_id),
-            "device_class": device_class,
-            "suggested_type": alarmo_type,
-        })
-    return candidates
-
-
-def handle_alarmo_set_settings(data: dict) -> tuple[bool, str]:
-    """POST /api/alarmo/config côté HA (websockets.py::AlarmoConfigView) —
-    réglages globaux (onglets "Général"/"Codes" du panneau Alarmo) : code_arm_
-    required/code_disarm_required/code_mode_change_required/code_format,
-    ignore_blocking_sensors_after_trigger, disarm_after_trigger, trigger_time,
-    mqtt, master. Distinct de handle_alarmo_set_area() (délais par mode) et de
-    notre propre GET /alarmo/config (agrégat de lecture, sans rapport)."""
-    r = ha_post("/alarmo/config", data)
-    if r.ok:
-        return True, ""
-    return False, f"HA {r.status_code}: {r.text[:200]}"
-
-
-def _alarmo_notify_targets() -> list[str]:
-    """Cibles de notification disponibles — reproduit le menu déroulant "Cible"
-    du formulaire "Créer une notification" d'Alarmo (capture Hicham, 2026-07-27) :
-    ce n'est PAS une API Alarmo, juste les services HA du domaine "notify"
-    (get_services, commande WS standard HA)."""
-    result = _ha_ws_call("get_services")
-    if not result or not result.get("success"):
-        return []
-    notify_services = (result.get("result") or {}).get("notify", {})
-    return [f"notify.{name}" for name in notify_services.keys()]
-
-
-def handle_alarmo_get_config() -> dict:
-    """Lecture config Alarmo réelle — WS uniquement côté Alarmo (pas de REST GET,
-    cf. websockets.py::websocket_get_*), pour préremplir l'app avec l'état réel
-    plutôt que des défauts recalculés à chaque chargement."""
-    sensors = _ha_ws_call("alarmo/sensors")
-    areas = _ha_ws_call("alarmo/areas")
-    users = _ha_ws_call("alarmo/users")
-    automations = _ha_ws_call("alarmo/automations")
-    settings = _ha_ws_call("alarmo/config")
-    sensors_result = sensors.get("result") if sensors and sensors.get("success") else {}
-    return {
-        "sensors": sensors_result,
-        "areas": areas.get("result") if areas and areas.get("success") else {},
-        "users": users.get("result") if users and users.get("success") else {},
-        "automations": automations.get("result") if automations and automations.get("success") else {},
-        "settings": settings.get("result") if settings and settings.get("success") else {},
-        "candidates": _alarmo_candidate_sensors(sensors_result or {}),
-        "notifyTargets": _alarmo_notify_targets(),
-    }
-
-
-def install_alarmo():
-    """Installe ET met à jour Alarmo via HACS (cf. install_hacs() pour le bootstrap
-    partagé — HACS lui-même + autorisation GitHub, une fois par site). Idempotent,
-    appelé à chaque démarrage de l'addon (volontairement hors run_setup(), pour
-    pouvoir s'activer sur un site déjà provisionné sans réinitialiser toute la
-    config — cf. __main__).
-
-    NB : logique construite et vérifiée contre le code source réel de HACS et
-    d'Alarmo (websocket/*.py, config_flow.py, releases GitHub) — pas devinée —
-    mais jamais exécutée contre une vraie instance HA depuis cette session, faute
-    d'accès. À surveiller au premier déploiement réel (2026-07-27)."""
-    if not install_hacs():
-        return  # HACS pas encore prêt (installation ou autorisation GitHub en cours)
-
-    log("── Alarmo (alarme) ──────────────────────────")
-    wait_for_ha()
-
-    if _hacs_ensure_installed(ALARMO_FULL_NAME):
-        log("[alarmo] Restart HA Core pour charger Alarmo…")
-        try:
-            requests.post(
-                f"{SUP}/homeassistant/restart",
-                headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
-                timeout=60,
-            )
-        except Exception as e:
-            warn(f"[alarmo] Erreur restart HA : {e}")
-            return
-        wait_for_ha()
-
-    if _alarmo_config_entry_exists():
-        return
-
-    # Flow zéro-input : config_flow.py officiel d'Alarmo appelle
-    # self.async_create_entry(...) dès le premier appel, sans étape intermédiaire
-    # (vérifié directement dans le code source de la release, 2026-07-27).
-    flow_resp = ha_post("/config/config_entries/flow", {"handler": "alarmo"})
-    if not flow_resp.ok:
-        warn(f"[alarmo] Flow impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
-        return
-    flow = _unwrap(flow_resp.json())
-    if flow.get("type") == "create_entry":
-        log("✓ Intégration Alarmo configurée")
-    else:
-        warn(f"[alarmo] Flow inattendu (type={flow.get('type')}) : {flow}")
 
 
 def write_frigate_config():
@@ -5194,11 +4998,6 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/camera/test":          self._handle_camera_test_route,
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/sync-now":             self._handle_sync_now,
-                "/alarmo/sensor":        self._handle_alarmo_sensor_route,
-                "/alarmo/area":          self._handle_alarmo_area_route,
-                "/alarmo/user":          self._handle_alarmo_user_route,
-                "/alarmo/automation":    self._handle_alarmo_automation_route,
-                "/alarmo/settings":      self._handle_alarmo_settings_route,
             }
             handler = handlers.get(route)
             if not handler:
@@ -5276,41 +5075,6 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
     def _handle_ha_command_route(self, data):
         _handle_ha_command(json.dumps(data).encode())
         self._ok()
-
-    def _handle_alarmo_sensor_route(self, data):
-        ok, err = handle_alarmo_set_sensor(data)
-        if ok:
-            self._ok()
-        else:
-            self._reject(502, err)
-
-    def _handle_alarmo_area_route(self, data):
-        ok, err = handle_alarmo_set_area(data)
-        if ok:
-            self._ok()
-        else:
-            self._reject(502, err)
-
-    def _handle_alarmo_user_route(self, data):
-        ok, err = handle_alarmo_set_user(data)
-        if ok:
-            self._ok()
-        else:
-            self._reject(502, err)
-
-    def _handle_alarmo_automation_route(self, data):
-        ok, err = handle_alarmo_set_automation(data)
-        if ok:
-            self._ok()
-        else:
-            self._reject(502, err)
-
-    def _handle_alarmo_settings_route(self, data):
-        ok, err = handle_alarmo_set_settings(data)
-        if ok:
-            self._ok()
-        else:
-            self._reject(502, err)
 
     def _handle_camera_configure_route(self, data):
         action = data.get("action", "add")
@@ -5410,8 +5174,6 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         route = route.split("?")[0]
         if route == "/camera/scan":
             self._handle_camera_scan()
-        elif route == "/alarmo/config":
-            self._handle_alarmo_config_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -5421,13 +5183,6 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok({"cameras": cameras})
         except Exception as e:
             warn(f"[camera-scan] {e}")
-            self._reject(500, str(e))
-
-    def _handle_alarmo_config_route(self):
-        try:
-            self._ok(handle_alarmo_get_config())
-        except Exception as e:
-            warn(f"[alarmo-config] {e}")
             self._reject(500, str(e))
 
 
@@ -5559,10 +5314,5 @@ if __name__ == "__main__":
         run_setup()
     else:
         log("Déjà configuré — démarrage du service.")
-
-    # Hors run_setup() volontairement : contrairement à Z2M/Matter/Frigate (posés une
-    # fois pour toutes à la création du site), Alarmo est un chantier en cours — doit
-    # pouvoir s'installer sur un site déjà provisionné, sans repasser par force_setup.
-    install_alarmo()
 
     run_bridge()
