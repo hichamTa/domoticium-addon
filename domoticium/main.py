@@ -1612,9 +1612,13 @@ def install_alarmo():
     async_create_entry() dès la première étape, sans saisie utilisateur —
     vérifié dans le code source de la release, 2026-07-27)."""
     # Sortie rapide : dossier custom_component ET config entry présents → déjà installé
-    if (os.path.isdir("/homeassistant/custom_components/alarmo")
-            and _alarmo_config_entry_exists()):
-        return
+    if os.path.isdir("/homeassistant/custom_components/alarmo"):
+        if _alarmo_config_entry_exists():
+            log("[alarmo] ✓ Déjà installé et configuré — rien à faire")
+            return
+        log("[alarmo] Dossier présent mais config entry absente — création de l'entry")
+    else:
+        log("[alarmo] Dossier absent — installation via HACS")
 
     if not install_hacs():
         return  # HACS pas encore prêt (installation ou autorisation GitHub en cours)
