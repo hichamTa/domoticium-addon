@@ -1490,6 +1490,7 @@ def install_hacs() -> bool:
     une vraie instance HA depuis cette session (2026-07-27)."""
     if _hacs_installed_version() is None:
         log("── HACS ──────────────────────────────────────")
+        log("[hacs] Non déployé — dépôt des fichiers…")
         if not _hacs_deploy_files():
             return False
         log("[hacs] Restart HA Core pour charger HACS…")
@@ -1505,7 +1506,10 @@ def install_hacs() -> bool:
         wait_for_ha()
 
     if _hacs_config_entry_exists():
+        log("[hacs] ✓ Déjà installé et autorisé — rien à faire")
         return True
+
+    log("[hacs] Fichiers déployés mais autorisation GitHub absente — lancement du flow")
 
     # Étape 1 : formulaire "disclaimer" HACS — 4 cases à cocher obligatoires pour
     # continuer (acc_logs/acc_addons/acc_untested/acc_disable), fixes pour tout
