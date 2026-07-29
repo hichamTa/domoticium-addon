@@ -1611,6 +1611,11 @@ def install_alarmo():
     de config Alarmo via son flow zéro-input (config_flow.py d'Alarmo appelle
     async_create_entry() dès la première étape, sans saisie utilisateur —
     vérifié dans le code source de la release, 2026-07-27)."""
+    # Sortie rapide : dossier custom_component ET config entry présents → déjà installé
+    if (os.path.isdir("/homeassistant/custom_components/alarmo")
+            and _alarmo_config_entry_exists()):
+        return
+
     if not install_hacs():
         return  # HACS pas encore prêt (installation ou autorisation GitHub en cours)
 
