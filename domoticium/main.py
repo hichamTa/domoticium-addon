@@ -98,6 +98,7 @@ FRIGATE_REPO   = "https://github.com/hichamTa/frigate-hass-addons"
 # script bash interactif. Repo public, vérifié manuellement (2026-07-27).
 HACS_GH_REPO     = "hacs/integration"
 HACS_DIR         = "/homeassistant/custom_components/hacs"
+ALARMO_FULL_NAME = "nielsfaber/alarmo"
 FRIGATE_SLUG   = "582436be_frigate"
 # Ancien dépôt Frigate (officiel, upstream) — Frigate n'y lit JAMAIS notre frigate.yml
 # (CONFIG_FILE non défini dans son config.yaml, donc find_config_file() résout vers son
@@ -1460,6 +1461,10 @@ def _hacs_poll_device_flow(flow_id: str):
         step_type = step.get("type")
         if step_type == "create_entry":
             log("✓ [hacs] Autorisation GitHub validée — HACS configuré")
+            # install_alarmo() a déjà tourné au démarrage AVANT que cette
+            # autorisation soit validée (install_hacs() avait renvoyé False) —
+            # sans cet appel, Alarmo ne serait installé qu'au prochain redémarrage.
+            install_alarmo()
             return
         if step_type == "abort":
             warn(f"[hacs] Flow d'autorisation abandonné : {step.get('reason')}")
@@ -1580,6 +1585,63 @@ def _hacs_ensure_installed(full_name: str, category: str = "integration") -> boo
         return False
     log(f"✓ {full_name} {'mis à jour' if repo.get('installed') else 'installé'} via HACS")
     return True
+
+
+def _alarmo_config_entry_exists() -> bool:
+    """Même technique que _mqtt_config_entry_exists() : lecture directe du storage
+    HA, pas d'appel API nécessaire pour un simple check."""
+    try:
+        with open("/homeassistant/.storage/core.config_entries") as f:
+            storage = json.load(f)
+        entries = storage.get("data", {}).get("entries", [])
+        return any(e.get("domain") == "alarmo" for e in entries)
+    except Exception as e:
+        warn(f"[alarmo] Lecture core.config_entries impossible : {e}")
+        return False
+
+
+def install_alarmo():
+    """Installe ET met à jour Alarmo via HACS. Idempotent — appelé à chaque
+    démarrage de l'addon (volontairement hors run_setup(), pour s'activer sur
+    un site déjà provisionné sans réinitialiser toute la config).
+
+    Séquence : install_hacs() d'abord (bootstrap HACS + autorisation GitHub,
+    une seule fois par site) → _hacs_ensure_installed(ALARMO_FULL_NAME) →
+    restart HA Core si Alarmo vient d'être téléchargé → création de l'entry
+    de config Alarmo via son flow zéro-input (config_flow.py d'Alarmo appelle
+    async_create_entry() dès la première étape, sans saisie utilisateur —
+    vérifié dans le code source de la release, 2026-07-27)."""
+    if not install_hacs():
+        return  # HACS pas encore prêt (installation ou autorisation GitHub en cours)
+
+    log("── Alarmo (alarme) ──────────────────────────")
+    wait_for_ha()
+
+    if _hacs_ensure_installed(ALARMO_FULL_NAME):
+        log("[alarmo] Restart HA Core pour charger Alarmo…")
+        try:
+            requests.post(
+                f"{SUP}/homeassistant/restart",
+                headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+                timeout=60,
+            )
+        except Exception as e:
+            warn(f"[alarmo] Erreur restart HA : {e}")
+            return
+        wait_for_ha()
+
+    if _alarmo_config_entry_exists():
+        return
+
+    flow_resp = ha_post("/config/config_entries/flow", {"handler": "alarmo"})
+    if not flow_resp.ok:
+        warn(f"[alarmo] Flow impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
+        return
+    flow = _unwrap(flow_resp.json())
+    if flow.get("type") == "create_entry":
+        log("✓ Intégration Alarmo configurée")
+    else:
+        warn(f"[alarmo] Flow inattendu (type={flow.get('type')}) : {flow}")
 
 
 # device_class HA → catégorie Alarmo — reproduit la logique de suggestion du
@@ -5376,4 +5438,5 @@ if __name__ == "__main__":
     else:
         log("Déjà configuré — démarrage du service.")
 
+    install_alarmo()  # idempotent — vérifie/installe Alarmo à chaque démarrage
     run_bridge()
