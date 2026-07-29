@@ -3874,6 +3874,7 @@ def _detect_device_type(
     if "lock" in types: return "switch"
     if "occupancy" in names or "motion" in names: return "sensor-motion"
     if "contact" in names: return "sensor-contact"
+    if "water_leak" in names: return "sensor-water"
     if "temperature" in names or "humidity" in names: return "sensor-temp"
     # Sirène : signal fiable = HA a déjà créé l'entité native siren.* pour ce
     # device — Z2M le fait pour tout appareil exposant "warning" depuis
