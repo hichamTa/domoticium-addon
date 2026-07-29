@@ -3349,6 +3349,8 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
             result["motion"] = is_on
         elif dc in ("door", "window", "opening", "contact", "garage_door"):
             result["contact"] = (not is_on) if is_on is not None else None
+        elif dc == "moisture":
+            result["waterLeak"] = is_on  # HA: on = fuite détectée
         return result
 
     if domain == "climate":
@@ -5179,9 +5181,17 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             return self._reject(400, "ieee_address manquant")
         if not _local_client:
             return self._reject(503, "Mosquitto local non connecté")
+        # force=True : notre app a déjà supprimé sa propre ligne DB avant cet appel
+        # (cf. api/devices/[id]/route.ts DELETE) — un retrait "poli" (force=False)
+        # attend l'accusé de réception du device lui-même sur le réseau Zigbee, ce
+        # qui échoue avec un timeout 15s pour tout appareil à pile endormi au
+        # moment de la demande (contrairement aux appareils secteur, toujours
+        # éveillés) — vérifié dans la doc officielle Z2M. force=True retire
+        # immédiatement l'appareil de la base Z2M sans attendre cet accusé,
+        # évitant un fantôme Z2M pour un appareil déjà retiré côté app.
         _local_client.publish(
             "zigbee2mqtt/bridge/request/device/remove",
-            json.dumps({"id": ieee, "force": False}),
+            json.dumps({"id": ieee, "force": True}),
             qos=1,
         )
         self._ok()
