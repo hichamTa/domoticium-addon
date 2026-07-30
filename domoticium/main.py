@@ -579,6 +579,12 @@ def install_zigbee2mqtt():
         "permit_join": False,
         "advanced": advanced_cfg,
         "frontend": {"port": 8099},
+        # Détection en ligne/hors ligne fiable par appareil — fonctionnalité native
+        # Z2M (pas une heuristique maison) : ping actif pour les appareils secteur
+        # (10 min par défaut), suivi du dernier contact pour les appareils à pile
+        # sans jamais les pinguer (25h par défaut, cf. doc officielle Z2M) — seuils
+        # déjà pensés pour ce cas, contrairement à un seuil last_seen uniforme.
+        "availability": {"enabled": True},
     }
 
     with open(f"{z2m_dir}/configuration.yaml", "w") as f:
@@ -622,6 +628,36 @@ def install_zigbee2mqtt():
         log("✓ Zigbee2MQTT démarré")
     else:
         warn(f"✗ {r.status_code} Zigbee2MQTT restart : {r.text[:150]}")
+
+
+def _ensure_z2m_availability():
+    """Patch one-shot pour les sites déjà provisionnés (install_zigbee2mqtt() ne
+    tourne qu'à la toute première installation, cf. run_setup()) : ajoute le bloc
+    "availability" à la configuration.yaml existante s'il est absent, puis
+    redémarre Z2M pour l'appliquer. Idempotent — appelé à chaque démarrage de
+    l'addon comme install_alarmo(), devient un no-op une fois activé. Simple
+    recherche de sous-chaîne plutôt qu'un parsing YAML complet : on ne fait
+    qu'ajouter une clé de premier niveau absente, jamais modifier une valeur
+    existante — pas le risque de repliage/corruption déjà rencontré avec
+    ruamel.yaml côté Frigate (cf. HANDOFF §58-66)."""
+    cfg_path = "/homeassistant/zigbee2mqtt/configuration.yaml"
+    try:
+        with open(cfg_path) as f:
+            content = f.read()
+    except FileNotFoundError:
+        return  # Z2M pas encore installé
+    if "availability:" in content:
+        return  # déjà activé (nouvelle installation, ou patch déjà appliqué)
+
+    with open(cfg_path, "a") as f:
+        f.write("\navailability:\n  enabled: true\n")
+    log("✓ [z2m] Fonctionnalité 'availability' activée (détection en ligne/hors ligne fiable par appareil)")
+
+    r = sup_post(f"/addons/{Z2M_SLUG}/restart")
+    if r.ok:
+        log("✓ [z2m] Redémarré pour appliquer 'availability'")
+    else:
+        warn(f"✗ [z2m] Redémarrage après activation availability : {r.status_code} {r.text[:150]}")
 
 
 # ── Matter Server ─────────────────────────────────────────────────────────────
@@ -2764,6 +2800,11 @@ _sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: device
 _mqtt_broker_checked = False          # flag one-shot pour _check_and_fix_mqtt_broker
 _last_ha_status_publish:    float = 0.0   # throttle homeassistant/status online
 _last_z2m_devices_request:  float = 0.0   # throttle bridge/request/devices
+# friendly_name → ieee_address, reconstruit à chaque bridge/devices reçu — les
+# messages zigbee2mqtt/{friendly_name}/availability n'identifient le device QUE
+# par son friendly_name (jamais l'ieee), il faut ce pont pour reporter le bon
+# device à Supabase (ieee_address, seule clé stable si le nom change).
+_z2m_friendly_to_ieee: dict[str, str] = {}
 
 
 def _check_and_fix_mqtt_broker():
@@ -3932,8 +3973,10 @@ def _detect_device_type(
 def _sync_zigbee_devices_direct(devices_list) -> bool:
     """pi_sync_zigbee_devices via Supabase direct — True si réussi. Réplique le
     filtrage (coordinateur/interview non terminée exclus) fait par la route Vercel."""
+    global _z2m_friendly_to_ieee
     try:
         payload_devices = []
+        friendly_to_ieee: dict[str, str] = {}
         ha_entities = None  # chargé paresseusement, une seule fois pour toute la synchro
         for d in devices_list:
             if d.get("type") == "Coordinator": continue
@@ -3950,12 +3993,18 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
             friendly_name = d.get("friendly_name")
             default_name = friendly_name if (friendly_name and friendly_name != ieee) \
                 else (definition.get("model") or ieee)
+            if friendly_name:
+                friendly_to_ieee[friendly_name] = ieee
 
             payload_devices.append({
                 "ieee_address": ieee, "name": default_name, "z2m_name": friendly_name,
                 "type": device_type, "vendor": definition.get("vendor") or "",
                 "model": definition.get("model") or "", "features": exposes,
             })
+
+        # Reconstruit entièrement à chaque synchro plutôt qu'un merge — gère
+        # naturellement les renommages/suppressions sans entrée périmée.
+        _z2m_friendly_to_ieee = friendly_to_ieee
 
         ts = int(time.time())
         ieee_sorted = ",".join(sorted(d["ieee_address"] for d in payload_devices))
@@ -4001,6 +4050,27 @@ def _report_room_assignments_direct(room_updates) -> bool:
         return False
 
 
+def _report_device_availability_direct(ieee: str, online: bool) -> bool:
+    """pi_report_device_availability via Supabase direct — True si réussi. Reçoit
+    l'état réel de zigbee2mqtt/{friendly_name}/availability (cf. on_local_message),
+    contrairement à pi_sync_zigbee_devices qui force online=true à chaque synchro
+    périodique sans jamais le réévaluer."""
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:device_availability:{ieee}:{str(online).lower()}"
+        r = _supabase_rpc("pi_report_device_availability", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_ieee_address": ieee, "p_online": online,
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_device_availability {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_device_availability: {e}")
+        return False
+
+
 def on_local_message(client, userdata, msg):
     """Messages reçus depuis Mosquitto local (Z2M). Plus de relay cloud —
     l'état passe uniquement par run_ha_ws_bridge() → Supabase direct (pi_report_device_state)."""
@@ -4029,6 +4099,24 @@ def on_local_message(client, userdata, msg):
                 ).start()
         except Exception as exc:
             warn(f"[devices-sync] parse error: {exc}")
+        return
+
+    # ── Z2M availability (fonctionnalité native, cf. _ensure_z2m_availability) ──
+    # zigbee2mqtt/{friendly_name}/availability, jamais zigbee2mqtt/bridge/* —
+    # exclusion explicite plutôt que de supposer qu'aucun device ne s'appelle
+    # jamais "bridge".
+    if topic.endswith("/availability") and not topic.startswith("zigbee2mqtt/bridge/"):
+        friendly_name = topic[len("zigbee2mqtt/"):-len("/availability")]
+        ieee = _z2m_friendly_to_ieee.get(friendly_name)
+        if not ieee:
+            return  # pas encore vu dans un bridge/devices (device tout juste appairé)
+        try:
+            online = json.loads(payload.decode()).get("state") == "online"
+        except Exception:
+            online = payload.decode().strip() == "online"
+        threading.Thread(
+            target=_report_device_availability_direct, args=(ieee, online), daemon=True
+        ).start()
 
 
 def run_local_bridge():
@@ -5491,4 +5579,5 @@ if __name__ == "__main__":
         log("Déjà configuré — démarrage du service.")
 
     install_alarmo()  # idempotent — vérifie/installe Alarmo à chaque démarrage
+    _ensure_z2m_availability()  # idempotent — patch les sites déjà provisionnés
     run_bridge()
