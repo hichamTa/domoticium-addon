@@ -145,6 +145,14 @@ _camera_masks: dict[str, list[dict]] = {}
 # une opération qui a en réalité réussi.
 _camera_configure_lock = threading.Lock()
 
+# Un seul commissioning Matter à la fois (matter-server ne sait pas gérer 2 sessions
+# PASE simultanées vers le même discriminator — vu en test réel : 2 requêtes à 1s
+# d'intervalle, le device a bien été commissionné mais les 2 connexions WS de l'addon
+# ont chacune reçu un échec — l'une un vrai rejet matter-server côté discovery,
+# l'autre un simple timeout local sans jamais recevoir la vraie réponse. Rejeter
+# immédiatement la 2e requête plutôt que de laisser les 2 se percuter.
+_matter_commission_lock = threading.Lock()
+
 # Identifiants ICE WebRTC (STUN + TURN Cloudflare Realtime) injectés dans go2rtc via
 # frigate.yml — rafraîchis périodiquement par _turn_refresh_loop() (cf. plus bas).
 _TURN_REFRESH_INTERVAL = 24 * 3600  # 24h — identifiants Cloudflare valables 48h max
@@ -2609,7 +2617,7 @@ def _sync_matter_devices_to_app():
     _sync_matter_devices_direct(devices_payload)
 
 
-def _matter_commission_ws(code: str, timeout_s: int = 200):
+def _matter_commission_ws(code: str, request_id: str, timeout_s: int = 200):
     """Commission via matter-server WebSocket direct (port 5580).
     HA 2026+ : ni REST ni HA WebSocket ne fonctionnent pour le commissioning.
     matter-server écoute sur localhost:5580/ws (host_network=true).
@@ -2641,7 +2649,10 @@ def _matter_commission_ws(code: str, timeout_s: int = 200):
                         log("[matter-server] ✓ Dataset Thread transmis")
                     break
 
-        msg_id = "commission-1"
+        # message_id unique par tentative (pas une constante fixe) — 2 tentatives
+        # concurrentes vers le même discriminator avaient sinon le même id, source
+        # de confusion diagnostiquée en conditions réelles (cf. _matter_commission_lock).
+        msg_id = f"commission-{request_id}"
         _send({"message_id": msg_id, "command": "commission_with_code",
                "args": {"code": code, "network_only": False}})
         log(f"[matter-server] commission_with_code envoyé — attente résultat (max {timeout_s}s)…")
@@ -2682,11 +2693,26 @@ def _matter_commission_ws(code: str, timeout_s: int = 200):
 def handle_matter_commission(request_id: str, code: str):
     """Commissionne un device Matter via matter-server WebSocket (thread de fond).
     Le résultat est poussé vers Supabase (sites.last_commission_status) via ingest —
-    l'app le lit par polling pendant la fenêtre de commissioning."""
+    l'app le lit par polling pendant la fenêtre de commissioning.
+
+    Une seule tentative à la fois (_matter_commission_lock) : matter-server ne gère
+    pas 2 sessions PASE concurrentes vers le même discriminator — vu en test réel,
+    2 requêtes envoyées à 1s d'intervalle ont fait échouer les 2 côté addon (l'une
+    par un vrai rejet de discovery, l'autre par timeout sans jamais recevoir la
+    vraie réponse) alors que matter-server avait réellement commissionné le device
+    entre-temps (retrouvé ensuite par la sync périodique via get_nodes())."""
+    if not _matter_commission_lock.acquire(blocking=False):
+        warn(f"Matter commission {request_id[:8]}… rejetée — un appairage est déjà en cours")
+        _post_ingest_commission_status(
+            request_id, False,
+            error="Un appairage Matter est déjà en cours — attends qu'il se termine avant de réessayer."
+        )
+        return
+
     def _do():
         try:
             log(f"Matter commission {request_id[:8]}… code={code}")
-            success, detail = _matter_commission_ws(code)
+            success, detail = _matter_commission_ws(code, request_id)
             if success:
                 log(f"✓ Matter commission réussie — node_id={detail}")
                 _post_ingest_commission_status(request_id, True, node_id=detail)
@@ -2702,6 +2728,8 @@ def handle_matter_commission(request_id: str, code: str):
         except Exception as exc:
             warn(f"Matter commission: {exc}")
             _post_ingest_commission_status(request_id, False, error=str(exc))
+        finally:
+            _matter_commission_lock.release()
 
     threading.Thread(target=_do, daemon=True).start()
 
