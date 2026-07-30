@@ -2609,7 +2609,7 @@ def _sync_matter_devices_direct(devices_payload) -> bool:
         rpc_devices = [{
             "node_id": d["node_id"], "name": d["name"],
             "type": d["device_type"], "vendor": d.get("vendor_name") or "",
-            "model": d.get("product_name") or "",
+            "model": d.get("product_name") or "", "online": d.get("online", True),
         } for d in devices_payload]
 
         ts = int(time.time())
@@ -2648,6 +2648,11 @@ def _sync_matter_devices_to_app():
             "vendor_name": vendor,
             "product_name": product,
             "device_type": device_type,
+            # matter-server suit déjà nativement la joignabilité par nœud (champ
+            # "available" de MatterNodeData, vérifié dans son code source) — pas
+            # besoin d'un mécanisme séparé comme pour Zigbee (§109), juste
+            # transmettre ce qu'il sait déjà à ce cycle de synchro périodique.
+            "online": bool(node.get("available", False)),
         })
 
     _sync_matter_devices_direct(devices_payload)
