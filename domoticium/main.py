@@ -581,10 +581,16 @@ def install_zigbee2mqtt():
         "frontend": {"port": 8099},
         # Détection en ligne/hors ligne fiable par appareil — fonctionnalité native
         # Z2M (pas une heuristique maison) : ping actif pour les appareils secteur
-        # (10 min par défaut), suivi du dernier contact pour les appareils à pile
-        # sans jamais les pinguer (25h par défaut, cf. doc officielle Z2M) — seuils
-        # déjà pensés pour ce cas, contrairement à un seuil last_seen uniforme.
-        "availability": {"enabled": True},
+        # (10 min par défaut, inchangé). Pour les appareils à pile, Z2M ne les
+        # ping JAMAIS (impossible physiquement — un end-device Zigbee dort la
+        # plupart du temps, le coordinateur ne peut pas le joindre à la demande) —
+        # réduire ce délai ne coûte donc RIEN en autonomie, ça ne fait que
+        # réduire la tolérance de silence avant de déclarer hors ligne. Défaut
+        # Z2M 25h jugé trop long par Hicham pour du matériel d'alarme à pile —
+        # 1h choisi comme réglage global (décision explicite, pas de distinction
+        # par type d'équipement pour rester simple face à du matériel futur de
+        # marques variées, 2026-07-30).
+        "availability": {"enabled": True, "passive": {"timeout": 60}},
     }
 
     with open(f"{z2m_dir}/configuration.yaml", "w") as f:
@@ -632,26 +638,41 @@ def install_zigbee2mqtt():
 
 def _ensure_z2m_availability():
     """Patch one-shot pour les sites déjà provisionnés (install_zigbee2mqtt() ne
-    tourne qu'à la toute première installation, cf. run_setup()) : ajoute le bloc
-    "availability" à la configuration.yaml existante s'il est absent, puis
+    tourne qu'à la toute première installation, cf. run_setup()) : ajoute/met à
+    jour le bloc "availability" de la configuration.yaml existante, puis
     redémarre Z2M pour l'appliquer. Idempotent — appelé à chaque démarrage de
-    l'addon comme install_alarmo(), devient un no-op une fois activé. Simple
-    recherche de sous-chaîne plutôt qu'un parsing YAML complet : on ne fait
-    qu'ajouter une clé de premier niveau absente, jamais modifier une valeur
-    existante — pas le risque de repliage/corruption déjà rencontré avec
-    ruamel.yaml côté Frigate (cf. HANDOFF §58-66)."""
+    l'addon comme install_alarmo(), devient un no-op une fois à jour. Remplacement
+    de sous-chaîne exacte plutôt qu'un parsing YAML complet : jamais de valeur
+    modifiée à l'aveugle — pas le risque de repliage/corruption déjà rencontré
+    avec ruamel.yaml côté Frigate (cf. HANDOFF §58-66). Timeout "passive" à 60 min
+    (au lieu du défaut Z2M 25h) : décision explicite d'Hicham pour du matériel
+    d'alarme à pile, sans coût batterie — Z2M ne ping JAMAIS les appareils à
+    pile (impossible physiquement en Zigbee), ce réglage ne fait que réduire la
+    tolérance de silence avant de déclarer hors ligne (2026-07-30)."""
     cfg_path = "/homeassistant/zigbee2mqtt/configuration.yaml"
     try:
         with open(cfg_path) as f:
             content = f.read()
     except FileNotFoundError:
         return  # Z2M pas encore installé
-    if "availability:" in content:
-        return  # déjà activé (nouvelle installation, ou patch déjà appliqué)
 
-    with open(cfg_path, "a") as f:
-        f.write("\navailability:\n  enabled: true\n")
-    log("✓ [z2m] Fonctionnalité 'availability' activée (détection en ligne/hors ligne fiable par appareil)")
+    old_block = "\navailability:\n  enabled: true\n"
+    new_block = "\navailability:\n  enabled: true\n  passive:\n    timeout: 60\n"
+
+    if new_block in content:
+        return  # déjà à jour
+    if old_block in content:
+        content = content.replace(old_block, new_block)  # upgrade depuis v2.9.69
+    elif "availability:" in content:
+        # Forme inattendue (édition manuelle ?) — on ne touche à rien plutôt que
+        # de risquer une corruption sur un contenu qu'on ne reconnaît pas.
+        return
+    else:
+        content += new_block
+
+    with open(cfg_path, "w") as f:
+        f.write(content)
+    log("✓ [z2m] Fonctionnalité 'availability' activée/mise à jour (passive.timeout=60min)")
 
     r = sup_post(f"/addons/{Z2M_SLUG}/restart")
     if r.ok:
