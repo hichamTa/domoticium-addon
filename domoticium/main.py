@@ -1780,6 +1780,87 @@ def handle_alarmo_get_sensors() -> dict:
     }
 
 
+# Étape 2 : ajout d'un capteur candidat à Alarmo. Vérifié dans la source officielle
+# (websockets.py::AlarmoSensorView, POST /api/alarmo/sensors) — SEUL entity_id est
+# obligatoire ; "modes" vaut [] par défaut si omis, donc un capteur créé sans modes
+# explicites est inerte (jamais surveillé, quel que soit l'état du panneau). On
+# n'expose donc jamais un ajout sans modes côté web.
+_ALARMO_MODE_MAP = {"away": "armed_away", "home": "armed_home", "night": "armed_night"}
+
+
+def handle_alarmo_update_sensor(entity_id: str, sensor_type: str, modes: list, always_on: bool = False) -> dict:
+    if not entity_id or not entity_id.startswith("binary_sensor."):
+        return {"ok": False, "detail": "entity_id invalide"}
+    if sensor_type not in _ALARMO_DEVICE_CLASS_TO_TYPE.values() and sensor_type != "other":
+        return {"ok": False, "detail": f"type inconnu: {sensor_type}"}
+    alarmo_modes = [_ALARMO_MODE_MAP[m] for m in modes if m in _ALARMO_MODE_MAP]
+    r = ha_post("/alarmo/sensors", {
+        "entity_id": entity_id,
+        "type": sensor_type,
+        "modes": alarmo_modes,
+        "always_on": bool(always_on),
+    })
+    if r.ok:
+        return {"ok": True}
+    warn(f"[alarmo-sensor] {entity_id} → {r.status_code}: {r.text[:200]}")
+    return {"ok": False, "detail": f"Alarmo {r.status_code}: {r.text[:200]}"}
+
+
+def _ensure_alarmo_night_mode():
+    """Patch one-shot idempotent (même principe que _ensure_z2m_availability) :
+    Alarmo active tout seul les modes "absent"/"présent" à sa toute première
+    installation (store.py::async_factory_default, vérifié dans la source
+    officielle) mais PAS "nuit" — sans quoi cocher "nuit" sur un capteur serait
+    sans effet, le mode lui-même n'existant pas encore côté panneau. Un seul
+    appel one-shot par site suffit (persiste en base Alarmo), mais on le revérifie
+    à chaque démarrage pour couvrir les sites déjà provisionnés avant ce fix."""
+    areas_result = _ha_ws_call("alarmo/areas")
+    if not areas_result or not areas_result.get("success"):
+        return
+    areas = areas_result.get("result") or {}
+    if not areas:
+        return
+    # Un seul secteur chez nous (pas de gouvernance multi-zone) — cf. décision produit,
+    # une "zone" Alarmo est un panneau indépendant, pas une pièce.
+    area_id, area = next(iter(areas.items()))
+    modes = area.get("modes") or {}
+    if (modes.get("armed_night") or {}).get("enabled"):
+        log("[alarmo] ✓ Mode nuit déjà activé — rien à faire")
+        return
+    away = modes.get("armed_away") or {}
+    home = modes.get("armed_home") or {}
+    payload = {
+        "area_id": area_id,
+        "modes": {
+            # attr.evolve() côté Alarmo remplace tout le dict "modes" — il faut
+            # renvoyer les modes déjà activés pour ne pas les écraser.
+            "armed_away": {
+                "enabled": bool(away.get("enabled", True)),
+                "exit_time": away.get("exit_time", 60),
+                "entry_time": away.get("entry_time", 60),
+                "trigger_time": away.get("trigger_time", 1800),
+            },
+            "armed_home": {
+                "enabled": bool(home.get("enabled", True)),
+                "exit_time": home.get("exit_time"),
+                "entry_time": home.get("entry_time"),
+                "trigger_time": home.get("trigger_time", 1800),
+            },
+            "armed_night": {
+                "enabled": True,
+                "exit_time": 60,
+                "entry_time": 60,
+                "trigger_time": 1800,
+            },
+        },
+    }
+    r = ha_post("/alarmo/area", payload)
+    if r.ok:
+        log("[alarmo] ✓ Mode nuit activé")
+    else:
+        warn(f"[alarmo] Activation mode nuit échouée ({r.status_code}): {r.text[:200]}")
+
+
 def write_frigate_config():
     """Écrit /homeassistant/frigate.yml. Le prepare script Frigate le copie dans son
     stockage privé à chaque démarrage — c'est la seule voie de config utilisée."""
@@ -5276,6 +5357,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/camera/test":          self._handle_camera_test_route,
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/sync-now":             self._handle_sync_now,
+                "/alarmo/sensor":        self._handle_alarmo_sensor_route,
             }
             handler = handlers.get(route)
             if not handler:
@@ -5451,6 +5533,17 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         _sync_requested.set()
         self._ok()
 
+    def _handle_alarmo_sensor_route(self, data):
+        entity_id = data.get("entityId", "")
+        sensor_type = data.get("type", "other")
+        modes = data.get("modes") or []
+        always_on = data.get("alwaysOn", False)
+        result = handle_alarmo_update_sensor(entity_id, sensor_type, modes, always_on)
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
     def do_GET(self):
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
@@ -5611,5 +5704,6 @@ if __name__ == "__main__":
         log("Déjà configuré — démarrage du service.")
 
     install_alarmo()  # idempotent — vérifie/installe Alarmo à chaque démarrage
+    _ensure_alarmo_night_mode()  # idempotent — active le mode nuit une fois par site
     _ensure_z2m_availability()  # idempotent — patch les sites déjà provisionnés
     run_bridge()
