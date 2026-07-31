@@ -1788,17 +1788,40 @@ def handle_alarmo_get_sensors() -> dict:
 _ALARMO_MODE_MAP = {"away": "armed_away", "home": "armed_home", "night": "armed_night"}
 
 
+def _alarmo_get_sole_area():
+    """Une seule zone Alarmo chez nous (cf. décision produit — une zone Alarmo est
+    un panneau indépendant, pas une pièce). Retourne (area_id, area_data) ou (None, None)."""
+    areas_result = _ha_ws_call("alarmo/areas")
+    if not areas_result or not areas_result.get("success"):
+        return None, None
+    areas = areas_result.get("result") or {}
+    if not areas:
+        return None, None
+    return next(iter(areas.items()))
+
+
 def handle_alarmo_update_sensor(entity_id: str, sensor_type: str, modes: list, always_on: bool = False) -> dict:
     if not entity_id or not entity_id.startswith("binary_sensor."):
         return {"ok": False, "detail": "entity_id invalide"}
     if sensor_type not in _ALARMO_DEVICE_CLASS_TO_TYPE.values() and sensor_type != "other":
         return {"ok": False, "detail": f"type inconnu: {sensor_type}"}
+    # Bug trouvé en conditions réelles (2026-07-31) : un capteur sans "area" assignée
+    # n'est JAMAIS évalué par aucune zone, même dans une installation à zone unique
+    # (vérifié dans sensors.py : `if config["area"] != area_id: continue` — un capteur
+    # avec area=None ne correspond jamais à un vrai area_id). Le panneau natif Alarmo
+    # l'affichait d'ailleurs avec un triangle d'avertissement. Il faut donc toujours
+    # résoudre et transmettre l'unique zone existante, même si l'utilisateur ne la
+    # choisit jamais (aucune notion de zone exposée côté web).
+    area_id, _ = _alarmo_get_sole_area()
+    if not area_id:
+        return {"ok": False, "detail": "Aucune zone Alarmo trouvée"}
     alarmo_modes = [_ALARMO_MODE_MAP[m] for m in modes if m in _ALARMO_MODE_MAP]
     r = ha_post("/alarmo/sensors", {
         "entity_id": entity_id,
         "type": sensor_type,
         "modes": alarmo_modes,
         "always_on": bool(always_on),
+        "area": area_id,
     })
     if r.ok:
         return {"ok": True}
@@ -1814,15 +1837,9 @@ def _ensure_alarmo_night_mode():
     sans effet, le mode lui-même n'existant pas encore côté panneau. Un seul
     appel one-shot par site suffit (persiste en base Alarmo), mais on le revérifie
     à chaque démarrage pour couvrir les sites déjà provisionnés avant ce fix."""
-    areas_result = _ha_ws_call("alarmo/areas")
-    if not areas_result or not areas_result.get("success"):
+    area_id, area = _alarmo_get_sole_area()
+    if not area_id:
         return
-    areas = areas_result.get("result") or {}
-    if not areas:
-        return
-    # Un seul secteur chez nous (pas de gouvernance multi-zone) — cf. décision produit,
-    # une "zone" Alarmo est un panneau indépendant, pas une pièce.
-    area_id, area = next(iter(areas.items()))
     modes = area.get("modes") or {}
     if (modes.get("armed_night") or {}).get("enabled"):
         log("[alarmo] ✓ Mode nuit déjà activé — rien à faire")
