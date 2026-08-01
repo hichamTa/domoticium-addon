@@ -1839,6 +1839,16 @@ def handle_alarmo_update_sensor(entity_id: str, sensor_type: str, modes: list, a
     return {"ok": False, "detail": f"Alarmo {r.status_code}: {r.text[:200]}"}
 
 
+def handle_alarmo_remove_sensor(entity_id: str) -> dict:
+    if not entity_id or not entity_id.startswith("binary_sensor."):
+        return {"ok": False, "detail": "entity_id invalide"}
+    r = ha_post("/alarmo/sensors", {"entity_id": entity_id, "remove": True})
+    if r.ok:
+        return {"ok": True}
+    warn(f"[alarmo-sensor-remove] {entity_id} → {r.status_code}: {r.text[:200]}")
+    return {"ok": False, "detail": f"Alarmo {r.status_code}: {r.text[:200]}"}
+
+
 def _ensure_alarmo_night_mode():
     """Patch one-shot idempotent (même principe que _ensure_z2m_availability) :
     Alarmo active tout seul les modes "absent"/"présent" à sa toute première
@@ -5586,10 +5596,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_alarmo_sensor_route(self, data):
         entity_id = data.get("entityId", "")
-        sensor_type = data.get("type", "other")
-        modes = data.get("modes") or []
-        always_on = data.get("alwaysOn", False)
-        result = handle_alarmo_update_sensor(entity_id, sensor_type, modes, always_on)
+        if data.get("remove"):
+            result = handle_alarmo_remove_sensor(entity_id)
+        else:
+            sensor_type = data.get("type", "other")
+            modes = data.get("modes") or []
+            always_on = data.get("alwaysOn", False)
+            result = handle_alarmo_update_sensor(entity_id, sensor_type, modes, always_on)
         if result.get("ok"):
             self._ok(result)
         else:
