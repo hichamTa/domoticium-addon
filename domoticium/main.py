@@ -1969,6 +1969,13 @@ def _migrate_matter_device_merge(old_node_id, new_node_id, device_name: str):
             else:
                 warn(f"[matter-merge] Alarmo migration échouée : {result.get('detail')}")
 
+    # ── Retrait du nœud mort côté matter-server ─────────────────────────────────
+    # Sans ça, matter-server continue de reporter l'ancien node_id à chaque cycle
+    # de synchro (jamais oublié tant qu'il n'est pas explicitement retiré du
+    # fabric) — recréant un fantôme anonyme au cycle suivant (demande Hicham,
+    # 2026-08-01 : "il faudrait le supprimer une fois la fusion faite").
+    _matter_remove_node(int(old_node_id))
+
     # ── Automatisations ──────────────────────────────────────────────────────
     try:
         ts = int(time.time())
@@ -2966,6 +2973,41 @@ def _matter_get_nodes():
     except Exception as e:
         warn(f"[matter-server] get_nodes: {e}")
         return None
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def _matter_remove_node(node_id: int) -> bool:
+    """Retire un node du fabric matter-server (commande remove_node — vérifiée dans
+    la source officielle, device_controller.py : tente unpair_device puis nettoie
+    son storage même si l'appareil est injoignable, exactement notre cas pour un
+    nœud mort). Utilisé après une fusion confirmée par le client (cf.
+    handle_matter_merge_confirm) pour que le nœud renouvelé ne réapparaisse plus
+    comme fantôme au cycle de synchro suivant (demande Hicham, 2026-08-01)."""
+    s = None
+    try:
+        s, _recv, _send, info = _matter_ws_connect(timeout_s=20)
+        if not s:
+            warn(f"[matter-server] remove_node connexion : {info}")
+            return False
+        msg_id = f"remove-node-{node_id}"
+        _send({"message_id": msg_id, "command": "remove_node", "args": {"node_id": node_id}})
+        while True:
+            msg = _recv()
+            mid = msg.get("message_id") or msg.get("messageId")
+            if mid == msg_id:
+                if "error_code" in msg or "errorCode" in msg or "error" in msg:
+                    warn(f"[matter-server] remove_node {node_id} échoué : {json.dumps(msg)[:200]}")
+                    return False
+                log(f"[matter-server] ✓ Node {node_id} retiré du fabric")
+                return True
+    except Exception as e:
+        warn(f"[matter-server] remove_node {node_id}: {e}")
+        return False
     finally:
         if s:
             try:
