@@ -3078,6 +3078,16 @@ _last_z2m_devices_request:  float = 0.0   # throttle bridge/request/devices
 # par son friendly_name (jamais l'ieee), il faut ce pont pour reporter le bon
 # device à Supabase (ieee_address, seule clé stable si le nom change).
 _z2m_friendly_to_ieee: dict[str, str] = {}
+# friendly_name → online, messages availability arrivés AVANT que le cache ci-dessus
+# ne soit peuplé (ex: juste après un redémarrage addon — Mosquitto souscrit
+# quasi instantanément, alors que le 1er cycle de sync qui peuple le cache ci-dessus
+# attend ~30s, cf. logs "premier sync dans 30s"). Sans ce tampon, un message
+# "online" retenu par Mosquitto reçu dans cette fenêtre était silencieusement
+# perdu (ieee introuvable → ignoré) — si c'était la SEULE transition offline→online
+# depuis la dernière vraie coupure, l'alerte correspondante restait bloquée pour
+# toujours, jusqu'à la prochaine vraie coupure de ce device. Rejoué dans
+# _sync_zigbee_devices_direct() dès que le cache ci-dessus est reconstruit.
+_pending_z2m_availability: dict[str, bool] = {}
 
 
 def _check_and_fix_mqtt_broker():
@@ -4279,6 +4289,19 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
         # naturellement les renommages/suppressions sans entrée périmée.
         _z2m_friendly_to_ieee = friendly_to_ieee
 
+        # Rejoue les messages availability arrivés avant que le cache ci-dessus ne
+        # soit prêt (cf. _pending_z2m_availability) — sans ça, une transition
+        # offline→online reçue dans cette fenêtre reste silencieusement perdue et
+        # l'alerte correspondante ne se résout jamais toute seule.
+        if _pending_z2m_availability:
+            for pending_name in list(_pending_z2m_availability.keys()):
+                ieee = friendly_to_ieee.get(pending_name)
+                if ieee:
+                    online = _pending_z2m_availability.pop(pending_name)
+                    threading.Thread(
+                        target=_report_device_availability_direct, args=(ieee, online), daemon=True
+                    ).start()
+
         ts = int(time.time())
         ieee_sorted = ",".join(sorted(d["ieee_address"] for d in payload_devices))
         message = f"{SITE_PREFIX}:{ts}:zigbee_sync:{ieee_sorted}"
@@ -4380,13 +4403,18 @@ def on_local_message(client, userdata, msg):
     # jamais "bridge".
     if topic.endswith("/availability") and not topic.startswith("zigbee2mqtt/bridge/"):
         friendly_name = topic[len("zigbee2mqtt/"):-len("/availability")]
-        ieee = _z2m_friendly_to_ieee.get(friendly_name)
-        if not ieee:
-            return  # pas encore vu dans un bridge/devices (device tout juste appairé)
         try:
             online = json.loads(payload.decode()).get("state") == "online"
         except Exception:
             online = payload.decode().strip() == "online"
+        ieee = _z2m_friendly_to_ieee.get(friendly_name)
+        if not ieee:
+            # Pas encore résolu (device tout juste appairé, ou redémarrage récent —
+            # cf. commentaire _pending_z2m_availability) : mémorisé pour être rejoué
+            # dès que _sync_zigbee_devices_direct() reconstruit le cache, plutôt que
+            # silencieusement perdu.
+            _pending_z2m_availability[friendly_name] = online
+            return
         threading.Thread(
             target=_report_device_availability_direct, args=(ieee, online), daemon=True
         ).start()
