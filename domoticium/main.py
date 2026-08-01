@@ -1919,6 +1919,102 @@ def handle_alarmo_remove_sensor(entity_id: str) -> dict:
     return {"ok": False, "detail": f"Alarmo {r.status_code}: {r.text[:200]}"}
 
 
+_ALARMO_MODE_MAP_REVERSE = {v: k for k, v in _ALARMO_MODE_MAP.items()}
+
+
+def _resolve_entity_for_matter_node(node_id: int) -> str | None:
+    """entity_id principal d'un node Matter, via l'entity_registry HA (unique_id,
+    _matter_node_id_from_unique_id). Utilisé pour la migration après fusion de
+    doublon (pi_sync_matter_devices) — l'ancien entity_id peut encore exister dans
+    le registre HA même si le node correspondant est mort côté matter-server."""
+    result = _ha_ws_call("config/entity_registry/list")
+    entities = result.get("result", []) if result and result.get("success") else []
+    for e in entities:
+        if _matter_node_id_from_unique_id(e.get("unique_id")) == node_id:
+            return e.get("entity_id")
+    return None
+
+
+def _migrate_matter_device_merge(old_node_id, new_node_id, device_name: str):
+    """Suite d'une fusion automatique de doublon Matter (cf. pi_sync_matter_devices,
+    migration 0055) : l'équipement garde le même id/nom/pièce côté app (rien à
+    migrer là), mais son entity_id HA change — tout ce qui référence l'ancien
+    entity_id EN DUR doit être explicitement mis à jour :
+    - Alarmo (config interne, jamais recalculée dynamiquement)
+    - Automatisations (entity_id figé dans trigger/action au moment de leur création,
+      contrairement aux scènes qui référencent notre device_id, stable)
+    Décidé avec Hicham le 2026-08-01."""
+    if old_node_id is None or new_node_id is None:
+        return
+    old_entity = _resolve_entity_for_matter_node(int(old_node_id))
+    new_entity = _resolve_entity_for_matter_node(int(new_node_id))
+    if not old_entity or not new_entity or old_entity == new_entity:
+        warn(f"[matter-merge] entity_id introuvable pour la fusion {old_node_id}→{new_node_id} ({device_name})")
+        return
+    log(f"[matter-merge] '{device_name}' : {old_entity} → {new_entity}")
+
+    # ── Alarmo ────────────────────────────────────────────────────────────────
+    sensors_result = _ha_ws_call("alarmo/sensors")
+    sensors = sensors_result.get("result") if sensors_result and sensors_result.get("success") else {}
+    old_config = (sensors or {}).get(old_entity)
+    if old_config:
+        modes = [_ALARMO_MODE_MAP_REVERSE[m] for m in (old_config.get("modes") or []) if m in _ALARMO_MODE_MAP_REVERSE]
+        sensor_type = old_config.get("type") or "other"
+        always_on = bool(old_config.get("always_on"))
+        handle_alarmo_remove_sensor(old_entity)
+        if modes:
+            result = handle_alarmo_update_sensor(new_entity, sensor_type, modes, always_on)
+            if result.get("ok"):
+                log(f"[matter-merge] Alarmo migré : {new_entity} ({sensor_type}, {modes})")
+            else:
+                warn(f"[matter-merge] Alarmo migration échouée : {result.get('detail')}")
+
+    # ── Automatisations ──────────────────────────────────────────────────────
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:migrate_entity:{old_entity}:{new_entity}"
+        r = _supabase_rpc("pi_migrate_entity_references", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_old_entity_id": old_entity, "p_new_entity_id": new_entity,
+        }, timeout=15)
+        if r.status_code >= 300:
+            warn(f"[matter-merge] pi_migrate_entity_references {r.status_code}: {r.text[:200]}")
+            return
+        automations = r.json() or []
+        for auto in automations:
+            _republish_automation(auto["id"], auto["name"], auto["trigger"], auto["action"])
+        if automations:
+            log(f"[matter-merge] {len(automations)} automatisation(s) migrée(s) et republiée(s) vers HA")
+    except Exception as e:
+        warn(f"[matter-merge] migration automatisations : {e}")
+
+
+def _republish_automation(automation_id: str, name: str, trigger_json: str, action_json: str):
+    """Republie une automatisation vers HA — même logique que le cmd_type
+    'automation_upsert' de _handle_ha_command(), réutilisée après une migration
+    d'entity_id (cf. _migrate_matter_device_merge)."""
+    object_id = f"domoticium_auto_{automation_id.replace('-', '_')}"
+    try:
+        trigger_data = json.loads(trigger_json) if trigger_json else {}
+        action_data = json.loads(action_json) if action_json else []
+    except Exception as e:
+        warn(f"[matter-merge] JSON automation {automation_id} invalide : {e}")
+        return
+    auto_cfg = {
+        "alias":     name,
+        "trigger":   trigger_data.get("triggers", []),
+        "condition": trigger_data.get("conditions", []),
+        "action":    action_data,
+        "mode":      "single",
+    }
+    r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
+    if r.ok:
+        ha_post("/services/automation/reload", {})
+        log(f"[matter-merge] Automation HA republiée : {object_id}")
+    else:
+        warn(f"[matter-merge] Erreur republication automation {object_id} : {r.status_code} {r.text[:200]}")
+
+
 def _ensure_alarmo_night_mode():
     """Patch one-shot idempotent (même principe que _ensure_z2m_availability) :
     Alarmo active tout seul les modes "absent"/"présent" à sa toute première
@@ -2872,12 +2968,16 @@ def _extract_matter_device_info(node: dict):
 
 
 def _sync_matter_devices_direct(devices_payload) -> bool:
-    """pi_sync_matter_devices via Supabase direct — True si réussi."""
+    """pi_sync_matter_devices via Supabase direct — True si réussi. Gère aussi la
+    fusion automatique de doublon (node_id renouvelé, cf. pi_sync_matter_devices) :
+    migre Alarmo + les automatisations vers le nouvel entity_id pour chaque fusion
+    rapportée par la fonction SQL."""
     try:
         rpc_devices = [{
             "node_id": d["node_id"], "name": d["name"],
             "type": d["device_type"], "vendor": d.get("vendor_name") or "",
             "model": d.get("product_name") or "", "online": d.get("online", True),
+            "explicitly_added": d.get("explicitly_added", False),
         } for d in devices_payload]
 
         ts = int(time.time())
@@ -2891,6 +2991,19 @@ def _sync_matter_devices_direct(devices_payload) -> bool:
             warn(f"[supabase] pi_sync_matter_devices {r.status_code}: {r.text[:200]}")
             return False
         log(f"[supabase] pi_sync_matter_devices — {len(rpc_devices)} devices, réponse: {r.text[:120]}")
+
+        try:
+            rows = r.json()
+            merges = (rows[0].get("merge_details") or []) if rows else []
+        except Exception:
+            merges = []
+        for m in merges:
+            threading.Thread(
+                target=_migrate_matter_device_merge,
+                args=(m.get("old_node_id"), m.get("new_node_id"), m.get("device_name")),
+                daemon=True,
+            ).start()
+
         return True
     except Exception as e:
         warn(f"[supabase] pi_sync_matter_devices: {e}")
@@ -2910,6 +3023,8 @@ def _sync_matter_devices_to_app():
         node_id, vendor, product, device_type = _extract_matter_device_info(node)
         if node_id is None:
             continue
+        explicitly_added = node_id in _explicitly_commissioned_matter_nodes
+        _explicitly_commissioned_matter_nodes.discard(node_id)
         devices_payload.append({
             "node_id": node_id,
             "name": product or f"Matter #{node_id}",
@@ -2921,6 +3036,7 @@ def _sync_matter_devices_to_app():
             # besoin d'un mécanisme séparé comme pour Zigbee (§109), juste
             # transmettre ce qu'il sait déjà à ce cycle de synchro périodique.
             "online": bool(node.get("available", False)),
+            "explicitly_added": explicitly_added,
         })
 
     _sync_matter_devices_direct(devices_payload)
@@ -3025,6 +3141,10 @@ def handle_matter_commission(request_id: str, code: str):
             if success:
                 log(f"✓ Matter commission réussie — node_id={detail}")
                 _post_ingest_commission_status(request_id, True, node_id=detail)
+                try:
+                    _explicitly_commissioned_matter_nodes.add(int(detail))
+                except (TypeError, ValueError):
+                    pass
                 # Pas d'enregistrement Supabase ponctuel ici (fragile — un seul device,
                 # un seul essai) : on déclenche une réconciliation complète immédiate
                 # (_sync_matter_devices_to_app via _sync_all_to_ha), même mécanisme
@@ -3088,6 +3208,12 @@ _z2m_friendly_to_ieee: dict[str, str] = {}
 # toujours, jusqu'à la prochaine vraie coupure de ce device. Rejoué dans
 # _sync_zigbee_devices_direct() dès que le cache ci-dessus est reconstruit.
 _pending_z2m_availability: dict[str, bool] = {}
+# node_id Matter commissionnés explicitement via "Ajouter un équipement" (cf.
+# handle_matter_commission) — exclus de la détection de fusion de doublon
+# (pi_sync_matter_devices) : un vrai nouvel achat, identique à un équipement déjà
+# hors ligne, ne doit jamais être confondu avec ce dernier. Retiré dès consommé
+# par le premier cycle de sync qui voit ce node_id (cf. _sync_matter_devices_to_app).
+_explicitly_commissioned_matter_nodes: set[int] = set()
 
 
 def _check_and_fix_mqtt_broker():
@@ -4115,11 +4241,16 @@ def _handle_ha_command(payload: bytes):
                 warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
 
         elif cmd_type == "automation_upsert":
+            # "condition" était silencieusement ignoré ici alors que web/src/app/api/
+            # automations/route.ts l'envoie bien — toute automatisation avec condition
+            # perdait cette condition dès sa création/mise à jour. Trouvé en construisant
+            # _republish_automation() (migration Matter, 2026-08-01), corrigé au passage.
             auto_cfg = {
-                "alias":   data.get("alias", object_id),
-                "trigger": data.get("trigger", []),
-                "action":  data.get("action", []),
-                "mode":    "single",
+                "alias":     data.get("alias", object_id),
+                "trigger":   data.get("trigger", []),
+                "condition": data.get("condition", []),
+                "action":    data.get("action", []),
+                "mode":      "single",
             }
             r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
             if r.ok:
