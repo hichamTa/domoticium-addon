@@ -1742,15 +1742,14 @@ _ALARMO_DEVICE_CLASS_TO_TYPE = {
 }
 
 
-def _alarmo_candidate_sensors(existing: dict) -> list[dict]:
+def _alarmo_candidate_sensors(existing: dict, states: list) -> list[dict]:
     """Capteurs HA disponibles pour Alarmo mais pas encore ajoutés — on part des
     vraies entités HA (get_states + device_class) plutôt que de nos propres
-    devices Domoticium, comme le fait le panneau Alarmo lui-même."""
-    result = _ha_ws_call("get_states")
-    if not result or not result.get("success"):
-        return []
+    devices Domoticium, comme le fait le panneau Alarmo lui-même. "states" est
+    pré-récupéré par l'appelant (partagé avec le nom natif des capteurs déjà
+    configurés, pour un seul appel get_states)."""
     candidates = []
-    for state in result.get("result", []):
+    for state in states:
         entity_id = state.get("entity_id", "")
         if not entity_id.startswith("binary_sensor.") or entity_id in existing:
             continue
@@ -1784,9 +1783,42 @@ def handle_alarmo_get_sensors() -> dict:
     for s in sensors.values():
         if s.get("area") and area_name:
             s["area_name"] = area_name
+
+    states_result = _ha_ws_call("get_states")
+    states = states_result.get("result", []) if states_result and states_result.get("success") else []
+    states_by_entity = {s.get("entity_id"): s for s in states}
+    for entity_id, s in sensors.items():
+        state = states_by_entity.get(entity_id)
+        if state:
+            s["native_name"] = (state.get("attributes") or {}).get("friendly_name", entity_id)
+
+    candidates = _alarmo_candidate_sensors(sensors, states)
+
+    # Résout l'ieee Zigbee de chaque capteur (configuré ou candidat) via
+    # l'entity_registry HA (unique_id, cf. _IEEE_RE) — le web s'en sert pour
+    # afficher le nom personnalisé assigné lors de l'ajout de l'équipement
+    # (table `devices`, jamais poussé vers Z2M/HA) plutôt que le nom natif
+    # Z2M (demande Hicham, 2026-08-01 : "les noms ne font pas professionnel").
+    registry_result = _ha_ws_call("config/entity_registry/list")
+    registry = registry_result.get("result", []) if registry_result and registry_result.get("success") else []
+    uid_by_entity = {e.get("entity_id"): e.get("unique_id") or "" for e in registry}
+
+    def _ieee_for(entity_id):
+        m = _IEEE_RE.search(uid_by_entity.get(entity_id, ""))
+        return m.group(0) if m else None
+
+    for entity_id, s in sensors.items():
+        ieee = _ieee_for(entity_id)
+        if ieee:
+            s["ieee_address"] = ieee
+    for c in candidates:
+        ieee = _ieee_for(c["entity_id"])
+        if ieee:
+            c["ieee_address"] = ieee
+
     return {
         "sensors": sensors,
-        "candidates": _alarmo_candidate_sensors(sensors),
+        "candidates": candidates,
     }
 
 
