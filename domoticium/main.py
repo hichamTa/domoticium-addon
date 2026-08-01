@@ -1794,27 +1794,36 @@ def handle_alarmo_get_sensors() -> dict:
 
     candidates = _alarmo_candidate_sensors(sensors, states)
 
-    # Résout l'ieee Zigbee de chaque capteur (configuré ou candidat) via
-    # l'entity_registry HA (unique_id, cf. _IEEE_RE) — le web s'en sert pour
+    # Résout l'ieee Zigbee OU le node_id Matter de chaque capteur (configuré ou
+    # candidat) via l'entity_registry HA (unique_id) — le web s'en sert pour
     # afficher le nom personnalisé assigné lors de l'ajout de l'équipement
-    # (table `devices`, jamais poussé vers Z2M/HA) plutôt que le nom natif
-    # Z2M (demande Hicham, 2026-08-01 : "les noms ne font pas professionnel").
+    # (table `devices`, jamais poussé vers Z2M/HA ni vers matter-server) plutôt
+    # que le nom natif (demande Hicham, 2026-08-01 : "les noms ne font pas
+    # professionnel"). Bug trouvé en conditions réelles le jour même : capteurs
+    # Matter (ex: "MYGGSPRAY wrlss mtn sensor", déjà identifié Matter en §117)
+    # jamais résolus — seul l'ieee Zigbee était tenté, pas _matter_node_id_from_unique_id.
     registry_result = _ha_ws_call("config/entity_registry/list")
     registry = registry_result.get("result", []) if registry_result and registry_result.get("success") else []
     uid_by_entity = {e.get("entity_id"): e.get("unique_id") or "" for e in registry}
 
-    def _ieee_for(entity_id):
-        m = _IEEE_RE.search(uid_by_entity.get(entity_id, ""))
-        return m.group(0) if m else None
+    def _identify(entity_id):
+        uid = uid_by_entity.get(entity_id, "")
+        m = _IEEE_RE.search(uid)
+        if m:
+            return "ieee_address", m.group(0)
+        node_id = _matter_node_id_from_unique_id(uid)
+        if node_id is not None:
+            return "matter_node_id", node_id
+        return None, None
 
     for entity_id, s in sensors.items():
-        ieee = _ieee_for(entity_id)
-        if ieee:
-            s["ieee_address"] = ieee
+        key, value = _identify(entity_id)
+        if key:
+            s[key] = value
     for c in candidates:
-        ieee = _ieee_for(c["entity_id"])
-        if ieee:
-            c["ieee_address"] = ieee
+        key, value = _identify(c["entity_id"])
+        if key:
+            c[key] = value
 
     return {
         "sensors": sensors,
