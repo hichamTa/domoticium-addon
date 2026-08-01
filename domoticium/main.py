@@ -2201,7 +2201,14 @@ def _enable_watchdogs_once():
         warn(f"[watchdog] Domoticium : {e}")
         ok = False
 
-    for slug in (MOSQUITTO_SLUG, FRIGATE_SLUG, MATTER_SLUG, Z2M_SLUG, THREAD_SLUG):
+    # Frigate volontairement exclu (cf. _disable_frigate_watchdog_once) : son propre
+    # endpoint de santé (http://[HOST]:5000/, défini dans le config.yaml de l'add-on
+    # Frigate lui-même) échoue parfois à cause d'un microservice d'auth interne à
+    # Frigate (port 5001, hors de notre contrôle) sans que Frigate soit réellement en
+    # panne — activer son Watchdog exposerait à des redémarrages intempestifs sur un
+    # faux positif. Découvert après le premier déploiement de cette fonction
+    # (2026-07-22), jamais retiré de cette liste jusqu'à ce correctif.
+    for slug in (MOSQUITTO_SLUG, MATTER_SLUG, Z2M_SLUG, THREAD_SLUG):
         if not _is_addon_installed(slug):
             continue
         try:
@@ -2217,6 +2224,32 @@ def _enable_watchdogs_once():
 
     if ok:
         open(_WATCHDOG_ENABLED_MARKER, "w").close()
+
+
+_FRIGATE_WATCHDOG_DISABLED_MARKER = "/data/.frigate_watchdog_disabled"
+
+
+def _disable_frigate_watchdog_once():
+    """Correctif rétroactif : _enable_watchdogs_once() (v2.9.3, 2026-07-22) activait
+    aussi le Watchdog sur Frigate, avant que le problème de faux positif (endpoint de
+    santé Frigate cassé par son propre microservice d'auth interne) ne soit découvert
+    plus tard le même jour. Le marker de _enable_watchdogs_once() empêche toute
+    ré-application automatique — donc les sites déjà provisionnés avant ce correctif
+    gardent le Watchdog activé à tort sur Frigate tant qu'on ne le désactive pas
+    explicitement ici, une fois, idempotent via son propre marker."""
+    if os.path.exists(_FRIGATE_WATCHDOG_DISABLED_MARKER):
+        return
+    if not _is_addon_installed(FRIGATE_SLUG):
+        return
+    try:
+        r = sup_post(f"/addons/{FRIGATE_SLUG}/options", {"watchdog": False})
+        if r.ok:
+            log("[watchdog] ✓ désactivé pour Frigate (faux positifs évités)")
+            open(_FRIGATE_WATCHDOG_DISABLED_MARKER, "w").close()
+        else:
+            warn(f"[watchdog] échec désactivation pour Frigate : HTTP {r.status_code}")
+    except Exception as e:
+        warn(f"[watchdog] désactivation Frigate : {e}")
 
 
 _LEGACY_REST_COMMANDS_MARKER = "/data/.legacy_rest_commands_removed"
@@ -5769,6 +5802,7 @@ def run_bridge():
     threading.Thread(target=_remove_legacy_heartbeat_automation_once, daemon=True).start()
     threading.Thread(target=_remove_legacy_rest_commands_once, daemon=True).start()
     threading.Thread(target=_enable_watchdogs_once, daemon=True).start()
+    threading.Thread(target=_disable_frigate_watchdog_once, daemon=True).start()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
