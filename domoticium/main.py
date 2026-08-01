@@ -1774,9 +1774,19 @@ def handle_alarmo_get_sensors() -> dict:
     encore ajoutés (_alarmo_candidate_sensors)."""
     result = _ha_ws_call("alarmo/sensors")
     sensors = result.get("result") if result and result.get("success") else {}
+    sensors = sensors or {}
+    # sensor["area"] est l'area_id technique (horodatage Unix, cf. _alarmo_get_sole_area) —
+    # pas affichable tel quel côté web (demande Hicham 2026-07-31 : "ça fait plus
+    # professionnel" de voir le vrai nom de la zone). Une seule zone chez nous, un seul
+    # nom à résoudre pour tous les capteurs.
+    _, area = _alarmo_get_sole_area()
+    area_name = (area or {}).get("name")
+    for s in sensors.values():
+        if s.get("area") and area_name:
+            s["area_name"] = area_name
     return {
-        "sensors": sensors or {},
-        "candidates": _alarmo_candidate_sensors(sensors or {}),
+        "sensors": sensors,
+        "candidates": _alarmo_candidate_sensors(sensors),
     }
 
 
@@ -1876,6 +1886,30 @@ def _ensure_alarmo_night_mode():
         log("[alarmo] ✓ Mode nuit activé")
     else:
         warn(f"[alarmo] Activation mode nuit échouée ({r.status_code}): {r.text[:200]}")
+
+
+_ALARMO_FACTORY_DEFAULT_NAME = "Alarmo"  # store.py::async_factory_default, en dur côté Alarmo
+
+
+def _ensure_alarmo_area_name():
+    """Patch one-shot idempotent : renomme la zone "Alarmo" (nom par défaut imposé
+    par Alarmo à sa création, store.py::async_factory_default) en "Habitation" —
+    plus professionnel pour un client final (demande Hicham, 2026-07-31). Ne
+    renomme QUE si le nom est encore le défaut Alarmo intouché — jamais un nom
+    déjà personnalisé par nous ou un client, contrairement à _ensure_alarmo_night_mode()
+    qui force toujours l'état voulu (un nom est un choix libre, un mode d'armement
+    ne l'est pas). Important : renommer change aussi l'entity_id du panneau
+    (`alarm_control_panel.{slugify(name)}`, vérifié dans alarm_control_panel.py) —
+    volontairement fait tôt (juste après la création de la zone), avant qu'un client
+    n'ait pu câbler une automatisation ou un clavier physique dessus."""
+    area_id, area = _alarmo_get_sole_area()
+    if not area_id or (area.get("name") or "") != _ALARMO_FACTORY_DEFAULT_NAME:
+        return
+    r = ha_post("/alarmo/area", {"area_id": area_id, "name": "Habitation"})
+    if r.ok:
+        log("[alarmo] ✓ Zone renommée en 'Habitation'")
+    else:
+        warn(f"[alarmo] Renommage de zone échoué ({r.status_code}): {r.text[:200]}")
 
 
 def write_frigate_config():
@@ -5722,5 +5756,6 @@ if __name__ == "__main__":
 
     install_alarmo()  # idempotent — vérifie/installe Alarmo à chaque démarrage
     _ensure_alarmo_night_mode()  # idempotent — active le mode nuit une fois par site
+    _ensure_alarmo_area_name()  # idempotent — renomme la zone "Alarmo" → "Habitation"
     _ensure_z2m_availability()  # idempotent — patch les sites déjà provisionnés
     run_bridge()
