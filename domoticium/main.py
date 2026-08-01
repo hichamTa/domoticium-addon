@@ -3023,6 +3023,9 @@ _MATTER_DEVICE_TYPES = {
     0x0103: "switch", 0x010A: "plug",                     # OnOff Light Switch, Plug
     0x0202: "cover",                                       # Window Covering
     0x0301: "thermostat",
+    0x000A: "lock",                                        # Door Lock (vérifié CSA Device Library 1.4)
+    0x002B: "fan",                                         # Fan (vérifié CSA Device Library 1.4)
+    0x0042: "valve",                                        # Water Valve (vérifié CSA Device Library 1.4)
     0x0015: "sensor-contact",                              # Contact Sensor
     0x0107: "sensor-motion",                                # Occupancy Sensor
     0x0302: "sensor-temp",                                  # Temperature Sensor
@@ -3674,6 +3677,7 @@ def _backfill_camera_entity_links():
     WRITABLE_DOMAINS = {
         "switch", "select", "number", "input_boolean", "input_number",
         "input_select", "button", "light", "cover", "climate", "lock", "fan",
+        "valve", "humidifier",
     }
 
     for e in entities:
@@ -3772,8 +3776,8 @@ def run_ha_ws_bridge():
     Seul canal d'état — remplace entièrement EMQX et les automations HA State Stream."""
     # Domaines HA à persister (filtre pour réduire le trafic — tout ce que l'app affiche)
     RELAY_DOMAINS = {
-        "light", "switch", "cover", "lock", "fan", "climate", "sensor",
-        "binary_sensor", "input_boolean", "media_player", "camera",
+        "light", "switch", "cover", "lock", "fan", "valve", "humidifier", "climate",
+        "sensor", "binary_sensor", "input_boolean", "media_player", "camera",
         "alarm_control_panel", "scene", "automation",
     }
     while True:
@@ -3870,6 +3874,10 @@ def _ha_state_to_normalized(entity_id: str, state: str) -> dict:
             return {}
     if domain == "climate":
         return {"on": state != "off"}
+    if domain == "lock":
+        return {"on": state == "locked"}
+    if domain == "valve":
+        return {"on": state not in ("closed", "unavailable")}
     return {"on": state == "on"}
 
 
@@ -4430,7 +4438,8 @@ def _detect_device_type(
     if "switch" in types: return "switch"
     if "cover" in types: return "cover"
     if "climate" in types or "thermostat" in types: return "thermostat"
-    if "lock" in types: return "switch"
+    if "lock" in types: return "lock"
+    if "fan" in types: return "fan"
     if "occupancy" in names or "motion" in names: return "sensor-motion"
     if "contact" in names: return "sensor-contact"
     if "water_leak" in names: return "sensor-water"
@@ -5084,8 +5093,10 @@ ALLOWED_SERVICES = {
     "switch":        {"turn_on", "turn_off", "toggle"},
     "climate":       {"set_temperature", "set_hvac_mode", "turn_on", "turn_off"},
     "cover":         {"open_cover", "close_cover", "stop_cover", "set_cover_position"},
-    "lock":          {"lock", "unlock"},
+    "lock":          {"lock", "unlock", "open"},
     "fan":           {"turn_on", "turn_off", "toggle", "set_percentage"},
+    "valve":         {"open_valve", "close_valve", "stop_valve", "set_valve_position", "toggle"},
+    "humidifier":    {"turn_on", "turn_off", "toggle", "set_humidity"},
     "media_player":  {"turn_on", "turn_off", "volume_set", "media_play", "media_pause"},
     "homeassistant": {"turn_on", "turn_off", "toggle"},
     "scene":         {"turn_on"},
