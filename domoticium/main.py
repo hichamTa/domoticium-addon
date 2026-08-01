@@ -1790,6 +1790,35 @@ def handle_alarmo_get_sensors() -> dict:
     }
 
 
+# Point 2 (suite étape 2) : armer/désarmer depuis l'app. L'entité alarm_control_panel
+# elle-même (état live, armer/désarmer) n'est PAS une commande spécifique à Alarmo —
+# ce sont des services HA standard (alarm_control_panel.alarm_arm_away/home/night,
+# alarm_disarm), déjà whitelistés dans ALLOWED_SERVICES et exécutables via la route
+# générique /cmd existante. Seul manque un moyen de savoir QUEL entity_id est le
+# panneau de ce site (dépend du nom de la zone, jamais supposé fixe — cf. §118/§119,
+# le renommage change justement l'entity_id) et son état actuel.
+def handle_alarmo_get_panel_state() -> dict:
+    area_id, _ = _alarmo_get_sole_area()
+    if not area_id:
+        return {"entity_id": None, "state": None}
+    entities_result = _ha_ws_call("alarmo/entities")
+    entities = entities_result.get("result") if entities_result and entities_result.get("success") else []
+    entity_id = next((e.get("entity_id") for e in entities or [] if e.get("area_id") == area_id), None)
+    if not entity_id:
+        return {"entity_id": None, "state": None}
+    r = ha_get(f"/states/{entity_id}")
+    if not r.ok:
+        return {"entity_id": entity_id, "state": None}
+    payload = r.json()
+    attrs = payload.get("attributes") or {}
+    return {
+        "entity_id": entity_id,
+        "state": payload.get("state"),
+        "code_arm_required": bool(attrs.get("code_arm_required", False)),
+        "code_format": attrs.get("code_format"),
+    }
+
+
 # Étape 2 : ajout d'un capteur candidat à Alarmo. Vérifié dans la source officielle
 # (websockets.py::AlarmoSensorView, POST /api/alarmo/sensors) — SEUL entity_id est
 # obligatoire ; "modes" vaut [] par défaut si omis, donc un capteur créé sans modes
@@ -5619,6 +5648,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._handle_camera_scan()
         elif route == "/alarmo/sensors":
             self._handle_alarmo_sensors_route()
+        elif route == "/alarmo/panel":
+            self._handle_alarmo_panel_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -5635,6 +5666,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok(handle_alarmo_get_sensors())
         except Exception as e:
             warn(f"[alarmo-sensors] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_panel_route(self):
+        try:
+            self._ok(handle_alarmo_get_panel_state())
+        except Exception as e:
+            warn(f"[alarmo-panel] {e}")
             self._reject(500, str(e))
 
 
