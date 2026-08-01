@@ -2015,6 +2015,51 @@ def _republish_automation(automation_id: str, name: str, trigger_json: str, acti
         warn(f"[matter-merge] Erreur republication automation {object_id} : {r.status_code} {r.text[:200]}")
 
 
+def handle_matter_merge_confirm(suggestion_id: str) -> dict:
+    """Le client confirme qu'un nouvel équipement Matter détecté est bien le même
+    appareil physique qu'un équipement existant hors ligne (cf. matter_merge_suggestions,
+    jamais fusionné automatiquement — décision Hicham 2026-08-01). Applique la fusion
+    en base (pi_apply_matter_merge) puis migre Alarmo/automatisations."""
+    if not suggestion_id:
+        return {"ok": False, "detail": "suggestionId manquant"}
+    ts = int(time.time())
+    message = f"{SITE_PREFIX}:{ts}:apply_matter_merge:{suggestion_id}"
+    r = _supabase_rpc("pi_apply_matter_merge", {
+        "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+        "p_suggestion_id": suggestion_id,
+    }, timeout=15)
+    if r.status_code >= 300:
+        warn(f"[matter-merge] pi_apply_matter_merge {r.status_code}: {r.text[:200]}")
+        return {"ok": False, "detail": f"Supabase {r.status_code}"}
+    rows = r.json() or []
+    if not rows or rows[0].get("old_node_id") is None:
+        return {"ok": False, "detail": "Suggestion introuvable ou déjà traitée"}
+    row = rows[0]
+    threading.Thread(
+        target=_migrate_matter_device_merge,
+        args=(row["old_node_id"], row["new_node_id"], row["device_name"]),
+        daemon=True,
+    ).start()
+    return {"ok": True}
+
+
+def handle_matter_merge_reject(suggestion_id: str) -> dict:
+    """Le client indique que ce n'est PAS le même appareil — la suggestion est
+    écartée, les deux équipements restent distincts définitivement."""
+    if not suggestion_id:
+        return {"ok": False, "detail": "suggestionId manquant"}
+    ts = int(time.time())
+    message = f"{SITE_PREFIX}:{ts}:reject_matter_merge:{suggestion_id}"
+    r = _supabase_rpc("pi_reject_matter_merge", {
+        "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+        "p_suggestion_id": suggestion_id,
+    }, timeout=15)
+    if r.status_code >= 300:
+        warn(f"[matter-merge] pi_reject_matter_merge {r.status_code}: {r.text[:200]}")
+        return {"ok": False, "detail": f"Supabase {r.status_code}"}
+    return {"ok": True}
+
+
 def _ensure_alarmo_night_mode():
     """Patch one-shot idempotent (même principe que _ensure_z2m_availability) :
     Alarmo active tout seul les modes "absent"/"présent" à sa toute première
@@ -2968,10 +3013,10 @@ def _extract_matter_device_info(node: dict):
 
 
 def _sync_matter_devices_direct(devices_payload) -> bool:
-    """pi_sync_matter_devices via Supabase direct — True si réussi. Gère aussi la
-    fusion automatique de doublon (node_id renouvelé, cf. pi_sync_matter_devices) :
-    migre Alarmo + les automatisations vers le nouvel entity_id pour chaque fusion
-    rapportée par la fonction SQL."""
+    """pi_sync_matter_devices via Supabase direct — True si réussi. Un doublon
+    détecté (node_id renouvelé) ne fusionne plus automatiquement ici — une
+    suggestion en attente est créée côté SQL, confirmée explicitement par le
+    client (cf. handle_matter_merge_confirm, route /matter/merge/confirm)."""
     try:
         rpc_devices = [{
             "node_id": d["node_id"], "name": d["name"],
@@ -2991,19 +3036,6 @@ def _sync_matter_devices_direct(devices_payload) -> bool:
             warn(f"[supabase] pi_sync_matter_devices {r.status_code}: {r.text[:200]}")
             return False
         log(f"[supabase] pi_sync_matter_devices — {len(rpc_devices)} devices, réponse: {r.text[:120]}")
-
-        try:
-            rows = r.json()
-            merges = (rows[0].get("merge_details") or []) if rows else []
-        except Exception:
-            merges = []
-        for m in merges:
-            threading.Thread(
-                target=_migrate_matter_device_merge,
-                args=(m.get("old_node_id"), m.get("new_node_id"), m.get("device_name")),
-                daemon=True,
-            ).start()
-
         return True
     except Exception as e:
         warn(f"[supabase] pi_sync_matter_devices: {e}")
@@ -5677,6 +5709,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/sync-now":             self._handle_sync_now,
                 "/alarmo/sensor":        self._handle_alarmo_sensor_route,
+                "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
+                "/matter/merge/reject":  self._handle_matter_merge_reject_route,
             }
             handler = handlers.get(route)
             if not handler:
@@ -5861,6 +5895,20 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             modes = data.get("modes") or []
             always_on = data.get("alwaysOn", False)
             result = handle_alarmo_update_sensor(entity_id, sensor_type, modes, always_on)
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
+    def _handle_matter_merge_confirm_route(self, data):
+        result = handle_matter_merge_confirm(data.get("suggestionId", ""))
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
+    def _handle_matter_merge_reject_route(self, data):
+        result = handle_matter_merge_reject(data.get("suggestionId", ""))
         if result.get("ok"):
             self._ok(result)
         else:
