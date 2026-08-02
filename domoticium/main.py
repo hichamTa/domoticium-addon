@@ -3222,12 +3222,6 @@ def handle_matter_commission(request_id: str, code: str):
                     _explicitly_commissioned_matter_nodes.add(int(detail))
                 except (TypeError, ValueError):
                     pass
-                # Pas d'enregistrement Supabase ponctuel ici (fragile — un seul device,
-                # un seul essai) : on déclenche une réconciliation complète immédiate
-                # (_sync_matter_devices_to_app via _sync_all_to_ha), même mécanisme
-                # auto-réparateur que Zigbee. Le nouveau device sera repris avec les
-                # autres au prochain cycle (déclenché tout de suite, pas dans 60s).
-                _sync_requested.set()
             else:
                 warn(f"⚠ Matter commission échouée: {detail}")
                 _post_ingest_commission_status(request_id, False, error=detail)
@@ -3235,6 +3229,18 @@ def handle_matter_commission(request_id: str, code: str):
             warn(f"Matter commission: {exc}")
             _post_ingest_commission_status(request_id, False, error=str(exc))
         finally:
+            # Réveille la réconciliation complète (_sync_matter_devices_to_app via
+            # _sync_all_to_ha) dans TOUS les cas — succès, échec ET exception — pas
+            # seulement en cas de succès détecté par CE thread. Course PASE déjà
+            # documentée plus haut (cf. _matter_commission_lock) : matter-server peut
+            # avoir réellement commissionné le device même quand notre appel WS
+            # timeout ou échoue côté addon, auquel cas l'ancien code ne réveillait
+            # jamais la synchro — le device restait invisible dans l'appli jusqu'au
+            # prochain cycle périodique naturel (~5 min), pas "tout de suite" comme
+            # visé. Trouvé en conditions réelles (Hicham, 2026-08-02, §134) : ajout
+            # via l'onglet Matter de l'appli, équipement bien présent côté Z2M/Matter,
+            # mais apparu dans l'appli seulement ~5 minutes plus tard.
+            _sync_requested.set()
             _matter_commission_lock.release()
 
     threading.Thread(target=_do, daemon=True).start()
