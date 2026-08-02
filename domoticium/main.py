@@ -3931,6 +3931,45 @@ def _ha_entity_to_normalized_patch(entity_id: str, state: str, attributes: dict)
     return {**state_patch, **attr_patch}
 
 
+# Attributs "capacité" (limites propres à l'appareil — jamais son état courant) vs
+# attributs "état" (_ha_attributes_to_normalized ci-dessus) : une fois qu'un
+# appareil Zigbee OU Matter est une entité HA, les deux exposent ces limites de la
+# même façon générique (min_temp/max_temp d'un climate, current_position d'un
+# cover/valve qui en a une, percentage_step d'un fan, min/max_humidity d'un
+# humidifier…) — jusqu'ici seul Zigbee avait un équivalent (les "exposes" Z2M, lus
+# séparément). §130 (2026-08-02) : lire ces attributs HA bruts directement comble
+# ce point aveugle pour Matter, sans dupliquer un schéma par protocole.
+def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
+    domain = entity_id.split(".")[0]
+    result: dict = {}
+
+    if domain == "climate":
+        if isinstance(attrs.get("min_temp"), (int, float)):
+            result["minTemp"] = attrs["min_temp"]
+        if isinstance(attrs.get("max_temp"), (int, float)):
+            result["maxTemp"] = attrs["max_temp"]
+        if isinstance(attrs.get("target_temp_step"), (int, float)):
+            result["tempStep"] = attrs["target_temp_step"]
+
+    elif domain == "fan":
+        if isinstance(attrs.get("percentage_step"), (int, float)):
+            result["percentageStep"] = attrs["percentage_step"]
+
+    elif domain in ("cover", "valve"):
+        # Présence de l'attribut (pas sa valeur) = signal de support natif HA — un
+        # cover/valve tout-ou-rien ne l'expose jamais.
+        if "current_position" in attrs:
+            result["supportsPosition"] = True
+
+    elif domain == "humidifier":
+        if isinstance(attrs.get("min_humidity"), (int, float)):
+            result["minHumidity"] = attrs["min_humidity"]
+        if isinstance(attrs.get("max_humidity"), (int, float)):
+            result["maxHumidity"] = attrs["max_humidity"]
+
+    return result
+
+
 # ── Batch d'états : accumule les state_changed, flush toutes les 2.5s ────────
 # Réduit les appels Vercel de ×N (un par event) à 1 par fenêtre temporelle.
 # La déduplication par entity_id garantit qu'on n'envoie que le dernier état connu.
@@ -4051,11 +4090,12 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
     """pi_report_device_state via Supabase direct — True si réussi."""
     try:
         patch = _ha_entity_to_normalized_patch(entity_id, state, attributes)
+        capabilities = _ha_attributes_to_capabilities(entity_id, attributes)
         ts = int(time.time())
         message = f"{SITE_PREFIX}:{ts}:device_state:{entity_id}"
         r = _supabase_rpc("pi_report_device_state", {
             "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_ha_entity_id": entity_id, "p_patch": patch,
+            "p_ha_entity_id": entity_id, "p_patch": patch, "p_capabilities": capabilities,
         })
         if r.status_code >= 300:
             warn(f"[supabase] pi_report_device_state({entity_id}) {r.status_code}: {r.text[:120]}")
