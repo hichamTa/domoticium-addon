@@ -3842,6 +3842,19 @@ def run_ha_ws_bridge():
                             args=(entity_id, ha_action, data),
                             daemon=True,
                         ).start()
+                    # Une entité créée/retirée dans HA (Matter ou natif — Zigbee est
+                    # déjà instantané via zigbee2mqtt/bridge/devices, cf. on_local_message)
+                    # réveille tout de suite le cycle de synchro périodique plutôt que
+                    # d'attendre jusqu'à 5 min — que le device ait été appairé/retiré
+                    # depuis notre appli ou directement dans HA. Même mécanisme que le
+                    # commissioning Matter réussi ou la reconnexion EMQX (_sync_requested,
+                    # un réveil ponctuel, pas un nouveau minuteur) — ne recrée pas le
+                    # risque de quota Vercel du 2026-07-18, qui venait d'une PÉRIODE trop
+                    # courte, pas d'un déclenchement événementiel. Corrige le délai
+                    # signalé par Hicham (2026-08-02, §133) pour un appareil ajouté ou
+                    # retiré directement dans HA plutôt que via l'appli.
+                    if action in ("create", "remove"):
+                        _sync_requested.set()
 
         except Exception as e:
             warn(f"[ha-ws-bridge] Erreur: {e} — reconnexion dans 15s")
