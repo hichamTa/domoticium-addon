@@ -2140,6 +2140,82 @@ def _ensure_alarmo_area_name():
         warn(f"[alarmo] Renommage de zone échoué ({r.status_code}): {r.text[:200]}")
 
 
+def _alarmo_panel_entity_id(area_id: str) -> str | None:
+    """entity_id du panneau alarm_control_panel de la zone — factorisé, utilisé par
+    handle_alarmo_get_panel_state() et _ensure_alarmo_sos_automation()."""
+    entities_result = _ha_ws_call("alarmo/entities")
+    entities = entities_result.get("result") if entities_result and entities_result.get("success") else []
+    return next((e.get("entity_id") for e in entities or [] if e.get("area_id") == area_id), None)
+
+
+_SOS_AUTOMATION_OBJECT_ID = "domoticium_sos_trigger"
+_sos_wired_for: str | None = None  # friendly_name du clavier déjà câblé — évite de republier l'automation à chaque cycle bridge/devices si rien n'a changé
+
+
+def _ensure_alarmo_sos_automation(devices_list):
+    """Câble le bouton SOS d'un clavier Zigbee vers alarm_control_panel.alarm_trigger
+    sur la zone Alarmo — appelé à chaque réception de zigbee2mqtt/bridge/devices
+    (cf. _sync_zigbee_devices_direct), donc réactif dès qu'un clavier compatible
+    est appairé, sans attendre un redémarrage.
+
+    Précondition explicite demandée par Hicham (2026-08-02) : "juste après avoir
+    installé Alarmo et s'être assuré de la bonne installation de celui-ci" —
+    _alarmo_get_sole_area() retourne None tant qu'Alarmo n'est pas installé/configuré,
+    donc rien ne se passe avant, même idempotent (pas de risque de câbler sur une
+    zone qui n'existe pas encore).
+
+    Détection GÉNÉRIQUE, pas un modèle figé (même principe que §136) : n'importe
+    quel appareil Zigbee dont les exposes Z2M documentent une action "emergency" est
+    traité comme clavier SOS, pas seulement un modèle Develco précis.
+
+    Piège connu, à surveiller en conditions réelles : sur le clavier Develco/frient
+    KEYZB-110 (celui d'Hicham), un bug Z2M non résolu (issue #19123, vérifié
+    2026-08-02) envoie parfois une action VIDE au lieu de "emergency" lors de l'appui
+    SOS — cette automation reste correcte (déclenche bien sur "emergency" quand Z2M
+    le rapporte correctement), mais un test réel sur le clavier physique est
+    nécessaire pour confirmer la fiabilité réelle du bouton lui-même, pas garanti
+    par ce fix seul."""
+    global _sos_wired_for
+    area_id, _ = _alarmo_get_sole_area()
+    if not area_id:
+        return  # Alarmo pas encore installé/configuré
+
+    friendly_name = None
+    for d in devices_list:
+        exposes = (d.get("definition") or {}).get("exposes") or []
+        for expose in exposes:
+            if expose.get("name") == "action" and "emergency" in (expose.get("values") or []):
+                friendly_name = d.get("friendly_name")
+                break
+        if friendly_name:
+            break
+    if not friendly_name or friendly_name == _sos_wired_for:
+        return  # pas de clavier compatible appairé, ou déjà câblé sans changement
+
+    panel_entity_id = _alarmo_panel_entity_id(area_id)
+    if not panel_entity_id:
+        return
+
+    auto_cfg = {
+        "type": "automation_upsert",
+        "object_id": _SOS_AUTOMATION_OBJECT_ID,
+        "alias": "Domoticium — SOS clavier",
+        "trigger": [{
+            "platform": "mqtt",
+            "topic": f"zigbee2mqtt/{friendly_name}",
+            "value_template": "{{ value_json.action }}",
+            "payload": "emergency",
+        }],
+        "action": [{
+            "action": "alarm_control_panel.alarm_trigger",
+            "target": {"entity_id": panel_entity_id},
+        }],
+    }
+    _handle_ha_command(json.dumps(auto_cfg).encode())
+    _sos_wired_for = friendly_name
+    log(f"[alarmo] ✓ SOS câblé sur le clavier '{friendly_name}' → {panel_entity_id}")
+
+
 def write_frigate_config():
     """Écrit /homeassistant/frigate.yml. Le prepare script Frigate le copie dans son
     stockage privé à chaque démarrage — c'est la seule voie de config utilisée."""
@@ -4561,6 +4637,13 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
         # Reconstruit entièrement à chaque synchro plutôt qu'un merge — gère
         # naturellement les renommages/suppressions sans entrée périmée.
         _z2m_friendly_to_ieee = friendly_to_ieee
+
+        # SOS clavier — best-effort, ne doit jamais faire échouer la synchro
+        # principale des devices si Alarmo/HA est momentanément indisponible.
+        try:
+            _ensure_alarmo_sos_automation(devices_list)
+        except Exception as exc:
+            warn(f"[alarmo] SOS automation: {exc}")
 
         # Rejoue les messages availability arrivés avant que le cache ci-dessus ne
         # soit prêt (cf. _pending_z2m_availability) — sans ça, une transition
