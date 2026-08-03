@@ -2148,6 +2148,29 @@ def _alarmo_panel_entity_id(area_id: str) -> str | None:
     return next((e.get("entity_id") for e in entities or [] if e.get("area_id") == area_id), None)
 
 
+def _find_ias_ace_keypad(devices_list, required_actions: set[str]) -> str | None:
+    """Détection GÉNÉRIQUE d'un clavier d'alarme Zigbee — pas un modèle figé (même
+    principe que §136). N'importe quel appareil dont les exposes Z2M documentent
+    TOUTES les actions demandées est traité comme clavier compatible.
+
+    Ces noms d'action ("disarm", "arm_day_zones", "arm_night_zones", "arm_all_zones",
+    "emergency"…) ne sont PAS propres à un fabricant — vérifié (2026-08-03) : ce sont
+    les valeurs standard du cluster Zigbee ZCL "IAS Ancillary Control Equipment"
+    (IAS ACE, device type 0x0401), conçu précisément pour les claviers d'alarme.
+    N'importe quelle marque qui respecte ce cluster standard (Hive KEYPAD001,
+    Linkind, Xfinity XHK1-UE, Develco/frient KEYZB-110…) expose donc exactement le
+    même vocabulaire — cette détection n'est pas limitée au clavier d'Hicham."""
+    for d in devices_list:
+        exposes = (d.get("definition") or {}).get("exposes") or []
+        for expose in exposes:
+            if expose.get("name") != "action":
+                continue
+            values = set(expose.get("values") or [])
+            if required_actions.issubset(values):
+                return d.get("friendly_name")
+    return None
+
+
 _SOS_AUTOMATION_OBJECT_ID = "domoticium_sos_trigger"
 _sos_wired_for: str | None = None  # friendly_name du clavier déjà câblé — évite de republier l'automation à chaque cycle bridge/devices si rien n'a changé
 
@@ -2164,10 +2187,6 @@ def _ensure_alarmo_sos_automation(devices_list):
     donc rien ne se passe avant, même idempotent (pas de risque de câbler sur une
     zone qui n'existe pas encore).
 
-    Détection GÉNÉRIQUE, pas un modèle figé (même principe que §136) : n'importe
-    quel appareil Zigbee dont les exposes Z2M documentent une action "emergency" est
-    traité comme clavier SOS, pas seulement un modèle Develco précis.
-
     Piège connu, à surveiller en conditions réelles : sur le clavier Develco/frient
     KEYZB-110 (celui d'Hicham), un bug Z2M non résolu (issue #19123, vérifié
     2026-08-02) envoie parfois une action VIDE au lieu de "emergency" lors de l'appui
@@ -2180,15 +2199,7 @@ def _ensure_alarmo_sos_automation(devices_list):
     if not area_id:
         return  # Alarmo pas encore installé/configuré
 
-    friendly_name = None
-    for d in devices_list:
-        exposes = (d.get("definition") or {}).get("exposes") or []
-        for expose in exposes:
-            if expose.get("name") == "action" and "emergency" in (expose.get("values") or []):
-                friendly_name = d.get("friendly_name")
-                break
-        if friendly_name:
-            break
+    friendly_name = _find_ias_ace_keypad(devices_list, {"emergency"})
     if not friendly_name or friendly_name == _sos_wired_for:
         return  # pas de clavier compatible appairé, ou déjà câblé sans changement
 
@@ -2214,6 +2225,121 @@ def _ensure_alarmo_sos_automation(devices_list):
     _handle_ha_command(json.dumps(auto_cfg).encode())
     _sos_wired_for = friendly_name
     log(f"[alarmo] ✓ SOS câblé sur le clavier '{friendly_name}' → {panel_entity_id}")
+
+
+_KEYPAD_ARM_OBJECT_ID = "domoticium_keypad_arm"
+_KEYPAD_FEEDBACK_OBJECT_ID = "domoticium_keypad_feedback"
+_keypad_wired_for: str | None = None  # friendly_name du clavier déjà câblé (arm/disarm + retour LED)
+
+# mode clavier (ZCL IAS ACE) → service Alarmo à appeler, avec le code tapé
+_KEYPAD_ACTION_TO_SERVICE = {
+    "disarm":          "alarm_control_panel.alarm_disarm",
+    "arm_day_zones":   "alarm_control_panel.alarm_arm_home",
+    "arm_night_zones": "alarm_control_panel.alarm_arm_night",
+    "arm_all_zones":   "alarm_control_panel.alarm_arm_away",
+}
+
+# état réel du panneau Alarmo → mode à republier vers le clavier (ses LED) — même
+# vocabulaire ZCL IAS ACE que les actions reçues, dans l'autre sens.
+_ALARMO_STATE_TO_KEYPAD_MODE = {
+    "disarmed":     "disarm",
+    "armed_home":   "arm_day_zones",
+    "armed_night":  "arm_night_zones",
+    "armed_away":   "arm_all_zones",
+    "pending":      "entry_delay",
+    "arming":       "exit_delay",
+    "triggered":    "in_alarm",
+}
+
+
+def _ensure_alarmo_keypad_control(devices_list):
+    """Câble l'armement/désarmement complet (Absent/Présent/Nuit + code) d'un
+    clavier Zigbee vers Alarmo, DANS LES DEUX SENS — Alarmo n'a aucune prise en
+    charge native d'un clavier physique (vérifié dans son README + un exemple
+    communautaire déjà construit pour ce type de clavier, 2026-08-03) :
+
+    1. Clavier → Alarmo : le clavier publie {action, action_code, action_transaction}
+       sur son topic MQTT — une automation appelle le service alarm_control_panel
+       correspondant avec le code tapé. Alarmo reste la SEULE autorité de validation
+       du code (déjà le cas pour les boutons de l'app et code_arm_required) — pas de
+       liste de codes dupliquée ici, contrairement à certains exemples communautaires
+       qui revalident eux-mêmes le code (risque de désynchronisation entre 2 listes,
+       écarté explicitement avec Hicham, 2026-08-03).
+    2. Alarmo → clavier : dès que l'état RÉEL du panneau change, une 2e automation
+       republie ce même état vers le clavier (zigbee2mqtt/{clavier}/set) pour que ses
+       LED reflètent la vérité — jamais ce que le client vient juste de taper (un
+       code refusé ne fait donc simplement rien, pas de fausse confirmation "armé").
+
+    Même précondition et même détection générique que _ensure_alarmo_sos_automation
+    (cf. _find_ias_ace_keypad) — n'importe quel clavier conforme au cluster Zigbee
+    standard IAS ACE, pas un modèle figé."""
+    global _keypad_wired_for
+    area_id, _ = _alarmo_get_sole_area()
+    if not area_id:
+        return  # Alarmo pas encore installé/configuré
+
+    friendly_name = _find_ias_ace_keypad(devices_list, {"disarm", "arm_all_zones"})
+    if not friendly_name or friendly_name == _keypad_wired_for:
+        return
+
+    panel_entity_id = _alarmo_panel_entity_id(area_id)
+    if not panel_entity_id:
+        return
+
+    keypad_topic = f"zigbee2mqtt/{friendly_name}"
+
+    arm_cfg = {
+        "type": "automation_upsert",
+        "object_id": _KEYPAD_ARM_OBJECT_ID,
+        "alias": "Domoticium — Armement clavier",
+        "trigger": [{"platform": "mqtt", "topic": keypad_topic}],
+        "action": [{
+            "choose": [
+                {
+                    "conditions": [{
+                        "condition": "template",
+                        "value_template": f"{{{{ trigger.payload_json.action == '{action}' }}}}",
+                    }],
+                    "sequence": [{
+                        "action": service,
+                        "target": {"entity_id": panel_entity_id},
+                        # default('') : un clavier sans code configuré (code_arm_required
+                        # désactivé) peut omettre action_code du payload — un template
+                        # non défini planterait sinon l'appel de service.
+                        "data": {"code": "{{ trigger.payload_json.action_code | default('') }}"},
+                    }],
+                }
+                for action, service in _KEYPAD_ACTION_TO_SERVICE.items()
+            ],
+        }],
+    }
+    _handle_ha_command(json.dumps(arm_cfg).encode())
+
+    feedback_cfg = {
+        "type": "automation_upsert",
+        "object_id": _KEYPAD_FEEDBACK_OBJECT_ID,
+        "alias": "Domoticium — Retour LED clavier",
+        "trigger": [{"platform": "state", "entity_id": panel_entity_id}],
+        "action": [{
+            "choose": [
+                {
+                    "conditions": [{"condition": "state", "entity_id": panel_entity_id, "state": state}],
+                    "sequence": [{
+                        "action": "mqtt.publish",
+                        "data": {
+                            "topic": f"{keypad_topic}/set",
+                            "payload": json.dumps({"arm_mode": {"mode": mode}}),
+                        },
+                    }],
+                }
+                for state, mode in _ALARMO_STATE_TO_KEYPAD_MODE.items()
+            ],
+        }],
+    }
+    _handle_ha_command(json.dumps(feedback_cfg).encode())
+
+    _keypad_wired_for = friendly_name
+    log(f"[alarmo] ✓ Armement/désarmement clavier câblé sur '{friendly_name}' ↔ {panel_entity_id}")
 
 
 def write_frigate_config():
@@ -4638,12 +4764,17 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
         # naturellement les renommages/suppressions sans entrée périmée.
         _z2m_friendly_to_ieee = friendly_to_ieee
 
-        # SOS clavier — best-effort, ne doit jamais faire échouer la synchro
-        # principale des devices si Alarmo/HA est momentanément indisponible.
+        # SOS + armement/désarmement clavier — best-effort, ne doit jamais faire
+        # échouer la synchro principale des devices si Alarmo/HA est momentanément
+        # indisponible.
         try:
             _ensure_alarmo_sos_automation(devices_list)
         except Exception as exc:
             warn(f"[alarmo] SOS automation: {exc}")
+        try:
+            _ensure_alarmo_keypad_control(devices_list)
+        except Exception as exc:
+            warn(f"[alarmo] Keypad automation: {exc}")
 
         # Rejoue les messages availability arrivés avant que le cache ci-dessus ne
         # soit prêt (cf. _pending_z2m_availability) — sans ça, une transition
