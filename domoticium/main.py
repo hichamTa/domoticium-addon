@@ -13,6 +13,7 @@ Phase 2 (service permanent) :
   • Commissionnement Matter
 """
 import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, uuid, zipfile
+from datetime import datetime, date
 import paho.mqtt.client as mqtt
 import requests
 
@@ -1872,6 +1873,158 @@ def handle_alarmo_get_keypad_status() -> dict:
     séparé, cohérent avec le reste de la synchro (best-effort, jamais bloquant)."""
     friendly_name = _find_ias_ace_keypad(_last_z2m_devices_list, {"disarm", "arm_all_zones"})
     return {"detected": friendly_name is not None, "name": friendly_name}
+
+
+# Codes/utilisateurs Alarmo — demande Hicham (2026-08-05) après avoir remarqué
+# qu'on avait construit tout le nécessaire pour SAISIR un code (pavé numérique,
+# étape "test" de l'assistant) mais rien pour en CRÉER un. Vérifié dans le code
+# source d'Alarmo (websockets.py::AlarmoUserView) plutôt que deviné : endpoint
+# POST /api/alarmo/users, distinct de /alarmo/area et /alarmo/sensor déjà
+# utilisés — Alarmo supporte nativement plusieurs utilisateurs nommés avec
+# permissions (can_arm/can_disarm), mais AUCUNE notion de calendrier (horaires,
+# expiration) — c'est _alarmo_calendar_loop() plus bas qui l'ajoute par-dessus.
+def handle_alarmo_get_users() -> dict:
+    """Liste des utilisateurs/codes Alarmo (WS alarmo/users, seule voie de
+    lecture, même principe que alarmo/sensors). Le hash bcrypt du code n'est
+    JAMAIS transmis au web (à sens unique, inutile côté client de toute façon,
+    cf. README Alarmo : "if you lose your pincode, you cannot unlock the
+    alarm") — seuls code_format/code_length (utiles pour l'UI) le sont."""
+    result = _ha_ws_call("alarmo/users")
+    users = result.get("result") if result and result.get("success") else {}
+    users = users or {}
+    return {
+        uid: {
+            "user_id": u.get("user_id", uid),
+            "name": u.get("name", ""),
+            "enabled": u.get("enabled", True),
+            "code_format": u.get("code_format") or None,
+            "code_length": u.get("code_length") or 0,
+        }
+        for uid, u in users.items()
+    }
+
+
+def _ensure_alarmo_code_required():
+    """Active l'exigence de code sur la zone dès qu'un utilisateur vient d'être
+    créé — idempotent (comportement par défaut d'Alarmo : code_arm_required=
+    false, cf. §147/149, sans quoi un code créé ne serait jamais demandé)."""
+    area_id, area = _alarmo_get_sole_area()
+    if not area_id:
+        return
+    if area.get("code_arm_required") and area.get("code_disarm_required"):
+        return
+    r = ha_post("/alarmo/area", {
+        "area_id": area_id,
+        "code_arm_required": True,
+        "code_disarm_required": True,
+    })
+    if r.ok:
+        log("[alarmo] ✓ Code requis pour armer/désarmer activé")
+    else:
+        warn(f"[alarmo] Activation code requis échouée ({r.status_code}): {r.text[:200]}")
+
+
+def handle_alarmo_set_user(action: str, user_id: str | None, name: str | None,
+                            code: str | None, enabled: bool) -> dict:
+    """CRUD utilisateur Alarmo. Le code stocké est bcrypt à sens unique (vérifié
+    dans __init__.py::async_update_user_config) — changer le code d'un
+    utilisateur EXISTANT nécessite donc un "old_code" que nous n'avons jamais
+    (jamais stocké nulle part côté nous) : "reset_code" supprime puis recrée
+    l'utilisateur plutôt que de tenter une vraie mise à jour du code."""
+    if action == "remove":
+        if not user_id:
+            return {"ok": False, "detail": "user_id requis"}
+        r = ha_post("/alarmo/users", {"user_id": user_id, "remove": True})
+        return {"ok": r.ok}
+
+    if action == "rename_or_toggle":
+        if not user_id:
+            return {"ok": False, "detail": "user_id requis"}
+        payload = {"user_id": user_id, "enabled": enabled}
+        if name:
+            payload["name"] = name
+        r = ha_post("/alarmo/users", payload)
+        body = r.json() if r.ok else {}
+        ok = r.ok and body.get("success", True)
+        return {"ok": ok, "detail": None if ok else body.get("error")}
+
+    if action in ("create", "reset_code"):
+        if not name or not code:
+            return {"ok": False, "detail": "name et code requis"}
+        if action == "reset_code" and user_id:
+            del_r = ha_post("/alarmo/users", {"user_id": user_id, "remove": True})
+            if not del_r.ok:
+                return {"ok": False, "detail": "suppression de l'ancien code échouée"}
+        r = ha_post("/alarmo/users", {
+            "name": name, "code": code, "enabled": enabled,
+            "can_arm": True, "can_disarm": True,
+        })
+        body = r.json() if r.ok else {}
+        if not r.ok or not body.get("success", True):
+            detail = body.get("error") if r.ok else r.text[:200]
+            return {"ok": False, "detail": detail or "échec inconnu"}
+        # AlarmoUserView répond {"success", "error"} — jamais le user_id créé
+        # (vérifié dans le code source) : on relit la liste pour le retrouver
+        # (les noms sont garantis uniques par Alarmo lui-même, cf. _validate_user_name).
+        users = handle_alarmo_get_users()
+        new_id = next((uid for uid, u in users.items() if u.get("name") == name), None)
+        _ensure_alarmo_code_required()
+        return {"ok": True, "user_id": new_id}
+
+    return {"ok": False, "detail": f"action inconnue: {action}"}
+
+
+def _alarmo_calendar_loop():
+    """Applique le calendrier (horaires + date d'expiration) des codes
+    temporaires — Alarmo n'a nativement AUCUNE notion de calendrier (vérifié
+    source, cf. handle_alarmo_get_users), un utilisateur est juste activé ou
+    désactivé. Toutes les 60s, relit les règles programmées depuis Supabase
+    (pi_get_alarmo_user_schedules, même schéma signé HMAC que les autres
+    fonctions pi_*) et appelle alarmo.enable_user/disable_user en conséquence.
+    Toujours réaffirme l'état voulu plutôt que de diffuser — même principe
+    idempotent que le reste de la synchro Alarmo (_ensure_alarmo_*)."""
+    while True:
+        time.sleep(60)
+        if not INGEST_SECRET:
+            continue
+        try:
+            ts = int(time.time())
+            message = f"{SITE_PREFIX}:{ts}:get_alarmo_schedules"
+            r = _supabase_rpc("pi_get_alarmo_user_schedules", {
+                "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            })
+            schedules = r.json() if r.ok else []
+        except Exception as exc:
+            warn(f"[alarmo-calendar] lecture calendrier: {exc}")
+            continue
+        if not schedules:
+            continue
+
+        now_dt = datetime.now()
+        today = now_dt.date()
+        now_time = now_dt.time()
+
+        for sched in schedules:
+            name = sched.get("name")
+            if not name:
+                continue
+            expires_at = sched.get("expires_at")
+            expired = bool(expires_at) and date.fromisoformat(expires_at) < today
+            if expired:
+                should_enable = False
+            else:
+                vf, vu = sched.get("valid_from_time"), sched.get("valid_until_time")
+                if vf and vu:
+                    vf_t = datetime.strptime(vf, "%H:%M:%S").time()
+                    vu_t = datetime.strptime(vu, "%H:%M:%S").time()
+                    should_enable = (vf_t <= now_time <= vu_t) if vf_t <= vu_t else (now_time >= vf_t or now_time <= vu_t)
+                else:
+                    should_enable = True  # pas de plage définie, seulement une expiration
+            verb = "enable_user" if should_enable else "disable_user"
+            try:
+                ha_post(f"/services/alarmo/{verb}", {"name": name})
+            except Exception as exc:
+                warn(f"[alarmo-calendar] {verb} {name}: {exc}")
 
 
 # Étape 2 : ajout d'un capteur candidat à Alarmo. Vérifié dans la source officielle
@@ -6055,6 +6208,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/sync-now":             self._handle_sync_now,
                 "/alarmo/sensor":        self._handle_alarmo_sensor_route,
+                "/alarmo/user":          self._handle_alarmo_user_route,
                 "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
                 "/matter/merge/reject":  self._handle_matter_merge_reject_route,
             }
@@ -6246,6 +6400,19 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._reject(400, result.get("detail", "échec"))
 
+    def _handle_alarmo_user_route(self, data):
+        result = handle_alarmo_set_user(
+            data.get("action", ""),
+            data.get("userId"),
+            data.get("name"),
+            data.get("code"),
+            data.get("enabled", True),
+        )
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
     def _handle_matter_merge_confirm_route(self, data):
         result = handle_matter_merge_confirm(data.get("suggestionId", ""))
         if result.get("ok"):
@@ -6275,6 +6442,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._handle_alarmo_panel_route()
         elif route == "/alarmo/keypad":
             self._handle_alarmo_keypad_route()
+        elif route == "/alarmo/users":
+            self._handle_alarmo_users_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -6305,6 +6474,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok(handle_alarmo_get_keypad_status())
         except Exception as e:
             warn(f"[alarmo-keypad] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_users_route(self):
+        try:
+            self._ok(handle_alarmo_get_users())
+        except Exception as e:
+            warn(f"[alarmo-users] {e}")
             self._reject(500, str(e))
 
 
@@ -6376,6 +6552,7 @@ def run_bridge():
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     threading.Thread(target=_ha_sync_loop,   daemon=True).start()
+    threading.Thread(target=_alarmo_calendar_loop, daemon=True).start()
     threading.Thread(target=run_local_bridge, daemon=True).start()
     # Bridge HA WebSocket → Supabase (ingest) : seul canal d'état, remplace EMQX
     threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
