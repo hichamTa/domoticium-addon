@@ -1860,6 +1860,20 @@ def handle_alarmo_get_panel_state() -> dict:
     }
 
 
+def handle_alarmo_get_keypad_status() -> dict:
+    """Détection live d'un clavier physique — demandée par Hicham (2026-08-04) pour
+    l'étape "clavier" de l'assistant de configuration web, qui n'affichait jusqu'ici
+    qu'un message générique statique. Réutilise _find_ias_ace_keypad(), la MÊME
+    fonction qui décide déjà si _ensure_alarmo_keypad_control() câble les
+    automatisations d'armement — la réponse ici est donc garantie cohérente avec la
+    réalité (jamais un signal indirect/dérivé qui pourrait diverger). Lit
+    _last_z2m_devices_list (rempli à chaque zigbee2mqtt/bridge/devices reçu) plutôt
+    que d'interroger Z2M à la demande — répond instantanément depuis ce thread HTTP
+    séparé, cohérent avec le reste de la synchro (best-effort, jamais bloquant)."""
+    friendly_name = _find_ias_ace_keypad(_last_z2m_devices_list, {"disarm", "arm_all_zones"})
+    return {"detected": friendly_name is not None, "name": friendly_name}
+
+
 # Étape 2 : ajout d'un capteur candidat à Alarmo. Vérifié dans la source officielle
 # (websockets.py::AlarmoSensorView, POST /api/alarmo/sensors) — SEUL entity_id est
 # obligatoire ; "modes" vaut [] par défaut si omis, donc un capteur créé sans modes
@@ -3483,6 +3497,10 @@ _last_z2m_devices_request:  float = 0.0   # throttle bridge/request/devices
 # par son friendly_name (jamais l'ieee), il faut ce pont pour reporter le bon
 # device à Supabase (ieee_address, seule clé stable si le nom change).
 _z2m_friendly_to_ieee: dict[str, str] = {}
+# Dernier payload brut zigbee2mqtt/bridge/devices reçu — permet à la route
+# /alarmo/keypad (thread HTTP séparé, cf. _CommandHandler) de répondre
+# instantanément sans redemander la liste à Z2M à chaque requête web.
+_last_z2m_devices_list: list = []
 # friendly_name → online, messages availability arrivés AVANT que le cache ci-dessus
 # ne soit peuplé (ex: juste après un redémarrage addon — Mosquitto souscrit
 # quasi instantanément, alors que le 1er cycle de sync qui peuple le cache ci-dessus
@@ -4877,6 +4895,8 @@ def on_local_message(client, userdata, msg):
         try:
             devices_list = json.loads(payload.decode())
             if isinstance(devices_list, list):
+                global _last_z2m_devices_list
+                _last_z2m_devices_list = devices_list
                 threading.Thread(
                     target=_sync_devices_to_app, args=(devices_list,), daemon=True
                 ).start()
@@ -6253,6 +6273,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._handle_alarmo_sensors_route()
         elif route == "/alarmo/panel":
             self._handle_alarmo_panel_route()
+        elif route == "/alarmo/keypad":
+            self._handle_alarmo_keypad_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -6276,6 +6298,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok(handle_alarmo_get_panel_state())
         except Exception as e:
             warn(f"[alarmo-panel] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_keypad_route(self):
+        try:
+            self._ok(handle_alarmo_get_keypad_status())
+        except Exception as e:
+            warn(f"[alarmo-keypad] {e}")
             self._reject(500, str(e))
 
 
