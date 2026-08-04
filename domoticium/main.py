@@ -1882,13 +1882,41 @@ def handle_alarmo_get_keypad_status() -> dict:
 # POST /api/alarmo/users, distinct de /alarmo/area et /alarmo/sensor déjà
 # utilisés — Alarmo supporte nativement plusieurs utilisateurs nommés avec
 # permissions (can_arm/can_disarm), mais AUCUNE notion de calendrier (horaires,
-# expiration) — c'est _alarmo_calendar_loop() plus bas qui l'ajoute par-dessus.
+# expiration). Le calendrier vit UNIQUEMENT dans un fichier local sur le Pi
+# (ALARMO_SCHEDULES_FILE, même principe que CAMERAS_FILE) — Hicham a fait
+# remarquer (à raison) qu'une 1ère version qui interrogeait Supabase en boucle
+# pour ça coûterait cher à l'échelle (des centaines de clients, la plupart sans
+# aucun code programmé) alors que l'addon connaît déjà tout ce qu'il faut dès
+# qu'un code est créé — plus aucun appel réseau récurrent nécessaire.
+ALARMO_SCHEDULES_FILE = "/data/alarmo_schedules.json"
+_alarmo_schedules: dict = {}  # user_id -> {mode, valid_from_time, valid_until_time, expires_at}
+
+
+def _load_alarmo_schedules():
+    global _alarmo_schedules
+    try:
+        with open(ALARMO_SCHEDULES_FILE) as f:
+            _alarmo_schedules = json.load(f)
+    except FileNotFoundError:
+        _alarmo_schedules = {}
+
+
+def _save_alarmo_schedules():
+    try:
+        with open(ALARMO_SCHEDULES_FILE, "w") as f:
+            json.dump(_alarmo_schedules, f)
+    except Exception as e:
+        warn(f"[alarmo-schedules] écriture échouée: {e}")
+
+
 def handle_alarmo_get_users() -> dict:
     """Liste des utilisateurs/codes Alarmo (WS alarmo/users, seule voie de
-    lecture, même principe que alarmo/sensors). Le hash bcrypt du code n'est
-    JAMAIS transmis au web (à sens unique, inutile côté client de toute façon,
-    cf. README Alarmo : "if you lose your pincode, you cannot unlock the
-    alarm") — seuls code_format/code_length (utiles pour l'UI) le sont."""
+    lecture, même principe que alarmo/sensors), enrichie avec le calendrier
+    lu depuis le fichier local — un seul endroit à interroger côté web pour
+    tout savoir sur un code. Le hash bcrypt du code n'est JAMAIS transmis
+    (à sens unique, inutile côté client de toute façon, cf. README Alarmo :
+    "if you lose your pincode, you cannot unlock the alarm") — seuls
+    code_format/code_length (utiles pour l'UI) le sont."""
     result = _ha_ws_call("alarmo/users")
     users = result.get("result") if result and result.get("success") else {}
     users = users or {}
@@ -1899,6 +1927,10 @@ def handle_alarmo_get_users() -> dict:
             "enabled": u.get("enabled", True),
             "code_format": u.get("code_format") or None,
             "code_length": u.get("code_length") or 0,
+            "mode": _alarmo_schedules.get(uid, {}).get("mode", "permanent"),
+            "valid_from_time": _alarmo_schedules.get(uid, {}).get("valid_from_time"),
+            "valid_until_time": _alarmo_schedules.get(uid, {}).get("valid_until_time"),
+            "expires_at": _alarmo_schedules.get(uid, {}).get("expires_at"),
         }
         for uid, u in users.items()
     }
@@ -1924,17 +1956,35 @@ def _ensure_alarmo_code_required():
         warn(f"[alarmo] Activation code requis échouée ({r.status_code}): {r.text[:200]}")
 
 
-def handle_alarmo_set_user(action: str, user_id: str | None, name: str | None,
-                            code: str | None, enabled: bool) -> dict:
-    """CRUD utilisateur Alarmo. Le code stocké est bcrypt à sens unique (vérifié
-    dans __init__.py::async_update_user_config) — changer le code d'un
-    utilisateur EXISTANT nécessite donc un "old_code" que nous n'avons jamais
-    (jamais stocké nulle part côté nous) : "reset_code" supprime puis recrée
-    l'utilisateur plutôt que de tenter une vraie mise à jour du code."""
+def _local_schedule_entry(mode: str | None, valid_from_time: str | None,
+                           valid_until_time: str | None, expires_at: str | None) -> dict:
+    scheduled = mode == "scheduled"
+    return {
+        "mode": mode or "permanent",
+        "valid_from_time": valid_from_time if scheduled else None,
+        "valid_until_time": valid_until_time if scheduled else None,
+        "expires_at": expires_at if scheduled else None,
+    }
+
+
+def handle_alarmo_set_user(
+    action: str, user_id: str | None, name: str | None, code: str | None, enabled: bool,
+    mode: str | None = None, valid_from_time: str | None = None,
+    valid_until_time: str | None = None, expires_at: str | None = None,
+) -> dict:
+    """CRUD utilisateur Alarmo + calendrier local (ALARMO_SCHEDULES_FILE). Le
+    code stocké par Alarmo est bcrypt à sens unique (vérifié dans
+    __init__.py::async_update_user_config) — changer le code d'un utilisateur
+    EXISTANT nécessite donc un "old_code" que nous n'avons jamais : "reset_code"
+    supprime puis recrée l'utilisateur plutôt que de tenter une vraie mise à
+    jour du code (le calendrier déjà en place est conservé et transféré vers
+    le nouvel id généré, l'appelant n'a rien à refaire)."""
     if action == "remove":
         if not user_id:
             return {"ok": False, "detail": "user_id requis"}
         r = ha_post("/alarmo/users", {"user_id": user_id, "remove": True})
+        if r.ok and _alarmo_schedules.pop(user_id, None) is not None:
+            _save_alarmo_schedules()
         return {"ok": r.ok}
 
     if action == "rename_or_toggle":
@@ -1948,9 +1998,17 @@ def handle_alarmo_set_user(action: str, user_id: str | None, name: str | None,
         ok = r.ok and body.get("success", True)
         return {"ok": ok, "detail": None if ok else body.get("error")}
 
+    if action == "update_schedule":
+        if not user_id:
+            return {"ok": False, "detail": "user_id requis"}
+        _alarmo_schedules[user_id] = _local_schedule_entry(mode, valid_from_time, valid_until_time, expires_at)
+        _save_alarmo_schedules()
+        return {"ok": True}
+
     if action in ("create", "reset_code"):
         if not name or not code:
             return {"ok": False, "detail": "name et code requis"}
+        carried_over_schedule = _alarmo_schedules.pop(user_id, None) if (action == "reset_code" and user_id) else None
         if action == "reset_code" and user_id:
             del_r = ha_post("/alarmo/users", {"user_id": user_id, "remove": True})
             if not del_r.ok:
@@ -1969,54 +2027,52 @@ def handle_alarmo_set_user(action: str, user_id: str | None, name: str | None,
         users = handle_alarmo_get_users()
         new_id = next((uid for uid, u in users.items() if u.get("name") == name), None)
         _ensure_alarmo_code_required()
+        if new_id:
+            if action == "create":
+                _alarmo_schedules[new_id] = _local_schedule_entry(mode, valid_from_time, valid_until_time, expires_at)
+            elif carried_over_schedule:
+                _alarmo_schedules[new_id] = carried_over_schedule
+            _save_alarmo_schedules()
         return {"ok": True, "user_id": new_id}
 
     return {"ok": False, "detail": f"action inconnue: {action}"}
 
 
-_ALARMO_CALENDAR_INTERVAL = 300  # 5 min — cf. commentaire ci-dessous (coût à l'échelle)
+_ALARMO_CALENDAR_INTERVAL = 60  # purement local désormais — plus de coût réseau, cf. commentaire ci-dessous
 
 
 def _alarmo_calendar_loop():
     """Applique le calendrier (horaires + date d'expiration) des codes
     temporaires — Alarmo n'a nativement AUCUNE notion de calendrier (vérifié
     source, cf. handle_alarmo_get_users), un utilisateur est juste activé ou
-    désactivé. Toutes les 5 minutes, relit les règles programmées depuis
-    Supabase (pi_get_alarmo_user_schedules, même schéma signé HMAC que les
-    autres fonctions pi_*) et appelle alarmo.enable_user/disable_user en
-    conséquence. Toujours réaffirme l'état voulu plutôt que de diffuser — même
-    principe idempotent que le reste de la synchro Alarmo (_ensure_alarmo_*).
-
-    Intervalle volontairement large (pas 60s) : cette requête part vers
-    Supabase pour TOUS les sites en continu, y compris ceux sans aucun code
-    programmé (la grande majorité) — à 60s et 1000 clients ça ferait ~1000
-    requêtes/minute en pure perte. Une précision à la minute près n'apporte
-    rien pour un usage type "code de la femme de ménage" ; 5 minutes de marge
-    est largement suffisant et divise la charge par 5 sans rien perdre en
-    pratique (signalé par Hicham, 2026-08-05)."""
+    désactivé. Lit UNIQUEMENT le fichier local ALARMO_SCHEDULES_FILE (poussé
+    une seule fois à la création/modification d'un code, cf.
+    handle_alarmo_set_user) — plus aucun appel réseau récurrent vers Supabase
+    (la 1ère version interrogeait Supabase toutes les 5 min pour CHAQUE site,
+    même sans aucun code programmé — à l'échelle de centaines de clients ça
+    n'aurait servi à rien la plupart du temps ; signalé par Hicham, 2026-08-05).
+    Le seul appel réseau restant (_ha_ws_call, résoudre le nom depuis l'id) est
+    local à Home Assistant sur ce même Pi, pas vers le cloud. Toujours réaffirme
+    l'état voulu plutôt que de diffuser — même principe idempotent que le reste
+    de la synchro Alarmo (_ensure_alarmo_*)."""
     while True:
         time.sleep(_ALARMO_CALENDAR_INTERVAL)
-        if not INGEST_SECRET:
+        if not _alarmo_schedules:
             continue
         try:
-            ts = int(time.time())
-            message = f"{SITE_PREFIX}:{ts}:get_alarmo_schedules"
-            r = _supabase_rpc("pi_get_alarmo_user_schedules", {
-                "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            })
-            schedules = r.json() if r.ok else []
+            users = handle_alarmo_get_users()
         except Exception as exc:
-            warn(f"[alarmo-calendar] lecture calendrier: {exc}")
-            continue
-        if not schedules:
+            warn(f"[alarmo-calendar] lecture utilisateurs: {exc}")
             continue
 
         now_dt = datetime.now()
         today = now_dt.date()
         now_time = now_dt.time()
 
-        for sched in schedules:
-            name = sched.get("name")
+        for uid, sched in list(_alarmo_schedules.items()):
+            if sched.get("mode") != "scheduled":
+                continue
+            name = users.get(uid, {}).get("name")
             if not name:
                 continue
             expires_at = sched.get("expires_at")
@@ -6418,6 +6474,10 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             data.get("name"),
             data.get("code"),
             data.get("enabled", True),
+            data.get("mode"),
+            data.get("validFromTime"),
+            data.get("validUntilTime"),
+            data.get("expiresAt"),
         )
         if result.get("ok"):
             self._ok(result)
@@ -6548,6 +6608,7 @@ def _turn_refresh_loop():
 def run_bridge():
     _load_cameras()
     _load_camera_masks()
+    _load_alarmo_schedules()
     global _turn_ice_servers
     # synchrone — requis avant la 1ère écriture frigate.yml ; repli STUN local si le
     # 1er fetch échoue (pas de restart en jeu ici, juste la valeur initiale)
