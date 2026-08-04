@@ -2153,6 +2153,48 @@ def handle_alarmo_remove_sensor(entity_id: str) -> dict:
     return {"ok": False, "detail": f"Alarmo {r.status_code}: {r.text[:200]}"}
 
 
+# Regroupement logique de capteurs (anti-fausse-alerte) — demande Hicham
+# (2026-08-05, "je veux tout"). Vérifié dans le README Alarmo officiel : dans
+# un groupe, le déclenchement d'UN SEUL capteur est ignoré — il faut que 2
+# capteurs DIFFÉRENTS du même groupe se déclenchent l'un après l'autre, dans
+# le délai configuré, pour que l'alarme se déclenche vraiment (ex: mouvement
+# salon + mouvement couloir, pas juste un chat qui traverse une pièce).
+# Endpoint POST /api/alarmo/sensor_groups, vérifié dans websockets.py::
+# AlarmoSensorGroupView — mêmes sémantiques create/update/remove que
+# /alarmo/sensor (pas de group_id → création, group_id + remove → suppression,
+# group_id seul → mise à jour, cf. __init__.py::async_update_sensor_group_config).
+def handle_alarmo_get_sensor_groups() -> dict:
+    """Liste des groupes de capteurs (WS alarmo/sensor_groups, seule voie de
+    lecture, même principe que alarmo/sensors)."""
+    result = _ha_ws_call("alarmo/sensor_groups")
+    groups = result.get("result") if result and result.get("success") else {}
+    return groups or {}
+
+
+def handle_alarmo_set_sensor_group(
+    group_id: str | None, name: str | None, entities: list | None,
+    timeout: int | None, remove: bool = False,
+) -> dict:
+    if remove:
+        if not group_id:
+            return {"ok": False, "detail": "group_id requis"}
+        r = ha_post("/alarmo/sensor_groups", {"group_id": group_id, "remove": True})
+        return {"ok": r.ok}
+
+    # Un groupe à moins de 2 capteurs ne se déclenche jamais (cf. README :
+    # "needs to have at least 2 sensors to function correctly") — refusé ici
+    # plutôt que de laisser créer silencieusement un groupe inutilisable.
+    if not name or not entities or len(entities) < 2:
+        return {"ok": False, "detail": "Au moins 2 capteurs sont requis dans un groupe"}
+    payload = {"name": name, "entities": entities, "timeout": timeout or 30, "event_count": 2}
+    if group_id:
+        payload["group_id"] = group_id
+    r = ha_post("/alarmo/sensor_groups", payload)
+    if not r.ok:
+        return {"ok": False, "detail": r.text[:200]}
+    return {"ok": True}
+
+
 _ALARMO_MODE_MAP_REVERSE = {v: k for k, v in _ALARMO_MODE_MAP.items()}
 
 
@@ -2574,6 +2616,79 @@ def _ensure_alarmo_keypad_control(devices_list):
 
     _keypad_wired_for = friendly_name
     log(f"[alarmo] ✓ Armement/désarmement clavier câblé sur '{friendly_name}' ↔ {panel_entity_id}")
+
+
+# Action matérielle sur déclenchement (sirène/lumières) — demande Hicham
+# (2026-08-05, "je veux tout" après explication des 3 features Alarmo
+# manquantes). Volontairement PAS construit via le panneau propriétaire
+# "Actions" d'Alarmo (README §Automations) : une automatisation HA générique
+# déclenchée sur l'état du panneau fait exactement la même chose, même schéma
+# déjà utilisé pour le clavier (_ensure_alarmo_keypad_control) — pas de
+# nouvelle logique à apprendre. Leçon retenue de la refonte du calendrier des
+# codes (2026-08-05) : aucun stockage dupliqué — l'automatisation HA créée EST
+# la seule source de vérité, relue directement plutôt que copiée ailleurs.
+_ALARM_ACTION_OBJECT_ID = "domoticium_alarm_action"
+
+
+def handle_alarm_action_get() -> dict:
+    """Relit l'entity_id actuellement câblé (ou None si aucune action configurée)
+    directement depuis la config HA de l'automatisation — jamais stocké ailleurs."""
+    r = ha_get(f"/config/automation/config/{_ALARM_ACTION_OBJECT_ID}")
+    if not r.ok:
+        return {"entity_id": None}
+    try:
+        cfg = r.json()
+        entity_id = cfg["action"][0]["choose"][0]["sequence"][0]["target"]["entity_id"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        entity_id = None
+    return {"entity_id": entity_id}
+
+
+def handle_alarm_action_set(target_entity: str | None) -> dict:
+    """Crée/remplace l'automatisation qui allume target_entity quand l'alarme se
+    déclenche et l'éteint au désarmement — target_entity=None supprime
+    l'automatisation existante (désactive la fonctionnalité proprement).
+    Domaine (switch/light/script/input_boolean) déduit de l'entity_id, jamais
+    supposé fixe — n'importe quel équipement contrôlable convient."""
+    area_id, _ = _alarmo_get_sole_area()
+    if not area_id:
+        return {"ok": False, "detail": "Alarmo non configuré"}
+    panel_entity_id = _alarmo_panel_entity_id(area_id)
+    if not panel_entity_id:
+        return {"ok": False, "detail": "Panneau Alarmo introuvable"}
+
+    if not target_entity:
+        r = requests.delete(f"{API}/config/automation/config/{_ALARM_ACTION_OBJECT_ID}", headers=HDRS, timeout=10)
+        if r.ok or r.status_code == 404:
+            ha_post("/services/automation/reload", {})
+            return {"ok": True}
+        return {"ok": False, "detail": r.text[:200]}
+
+    domain = target_entity.split(".", 1)[0]
+    auto_cfg = {
+        "alias": "Domoticium — Action sur déclenchement",
+        "trigger": [{"platform": "state", "entity_id": panel_entity_id}],
+        "condition": [],
+        "action": [{
+            "choose": [
+                {
+                    "conditions": [{"condition": "state", "entity_id": panel_entity_id, "state": "triggered"}],
+                    "sequence": [{"action": f"{domain}.turn_on", "target": {"entity_id": target_entity}}],
+                },
+                {
+                    "conditions": [{"condition": "state", "entity_id": panel_entity_id, "state": "disarmed"}],
+                    "sequence": [{"action": f"{domain}.turn_off", "target": {"entity_id": target_entity}}],
+                },
+            ],
+        }],
+        "mode": "single",
+    }
+    r = ha_post(f"/config/automation/config/{_ALARM_ACTION_OBJECT_ID}", auto_cfg)
+    if not r.ok:
+        return {"ok": False, "detail": r.text[:200]}
+    ha_post("/services/automation/reload", {})
+    log(f"[alarmo] ✓ Action sur déclenchement câblée → {target_entity}")
+    return {"ok": True}
 
 
 def write_frigate_config():
@@ -6276,6 +6391,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/sync-now":             self._handle_sync_now,
                 "/alarmo/sensor":        self._handle_alarmo_sensor_route,
                 "/alarmo/user":          self._handle_alarmo_user_route,
+                "/alarmo/action":        self._handle_alarm_action_set_route,
+                "/alarmo/sensor-group":  self._handle_alarmo_sensor_group_route,
                 "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
                 "/matter/merge/reject":  self._handle_matter_merge_reject_route,
             }
@@ -6484,6 +6601,26 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._reject(400, result.get("detail", "échec"))
 
+    def _handle_alarm_action_set_route(self, data):
+        result = handle_alarm_action_set(data.get("entityId"))
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
+    def _handle_alarmo_sensor_group_route(self, data):
+        result = handle_alarmo_set_sensor_group(
+            data.get("groupId"),
+            data.get("name"),
+            data.get("entities"),
+            data.get("timeout"),
+            data.get("remove", False),
+        )
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
     def _handle_matter_merge_confirm_route(self, data):
         result = handle_matter_merge_confirm(data.get("suggestionId", ""))
         if result.get("ok"):
@@ -6515,6 +6652,10 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._handle_alarmo_keypad_route()
         elif route == "/alarmo/users":
             self._handle_alarmo_users_route()
+        elif route == "/alarmo/action":
+            self._handle_alarm_action_get_route()
+        elif route == "/alarmo/sensor-groups":
+            self._handle_alarmo_sensor_groups_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -6552,6 +6693,20 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok(handle_alarmo_get_users())
         except Exception as e:
             warn(f"[alarmo-users] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarm_action_get_route(self):
+        try:
+            self._ok(handle_alarm_action_get())
+        except Exception as e:
+            warn(f"[alarm-action] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_sensor_groups_route(self):
+        try:
+            self._ok(handle_alarmo_get_sensor_groups())
+        except Exception as e:
+            warn(f"[alarmo-sensor-groups] {e}")
             self._reject(500, str(e))
 
 
