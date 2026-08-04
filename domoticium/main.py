@@ -1974,17 +1974,28 @@ def handle_alarmo_set_user(action: str, user_id: str | None, name: str | None,
     return {"ok": False, "detail": f"action inconnue: {action}"}
 
 
+_ALARMO_CALENDAR_INTERVAL = 300  # 5 min — cf. commentaire ci-dessous (coût à l'échelle)
+
+
 def _alarmo_calendar_loop():
     """Applique le calendrier (horaires + date d'expiration) des codes
     temporaires — Alarmo n'a nativement AUCUNE notion de calendrier (vérifié
     source, cf. handle_alarmo_get_users), un utilisateur est juste activé ou
-    désactivé. Toutes les 60s, relit les règles programmées depuis Supabase
-    (pi_get_alarmo_user_schedules, même schéma signé HMAC que les autres
-    fonctions pi_*) et appelle alarmo.enable_user/disable_user en conséquence.
-    Toujours réaffirme l'état voulu plutôt que de diffuser — même principe
-    idempotent que le reste de la synchro Alarmo (_ensure_alarmo_*)."""
+    désactivé. Toutes les 5 minutes, relit les règles programmées depuis
+    Supabase (pi_get_alarmo_user_schedules, même schéma signé HMAC que les
+    autres fonctions pi_*) et appelle alarmo.enable_user/disable_user en
+    conséquence. Toujours réaffirme l'état voulu plutôt que de diffuser — même
+    principe idempotent que le reste de la synchro Alarmo (_ensure_alarmo_*).
+
+    Intervalle volontairement large (pas 60s) : cette requête part vers
+    Supabase pour TOUS les sites en continu, y compris ceux sans aucun code
+    programmé (la grande majorité) — à 60s et 1000 clients ça ferait ~1000
+    requêtes/minute en pure perte. Une précision à la minute près n'apporte
+    rien pour un usage type "code de la femme de ménage" ; 5 minutes de marge
+    est largement suffisant et divise la charge par 5 sans rien perdre en
+    pratique (signalé par Hicham, 2026-08-05)."""
     while True:
-        time.sleep(60)
+        time.sleep(_ALARMO_CALENDAR_INTERVAL)
         if not INGEST_SECRET:
             continue
         try:
