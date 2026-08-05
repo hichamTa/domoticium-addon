@@ -1937,16 +1937,16 @@ def handle_alarmo_get_users() -> dict:
 
 
 def _ensure_alarmo_code_required():
-    """Active l'exigence de code sur la zone dès qu'un utilisateur vient d'être
-    créé — idempotent (comportement par défaut d'Alarmo : code_arm_required=
-    false, cf. §147/149, sans quoi un code créé ne serait jamais demandé)."""
-    area_id, area = _alarmo_get_sole_area()
-    if not area_id:
-        return
-    if area.get("code_arm_required") and area.get("code_disarm_required"):
-        return
-    r = ha_post("/alarmo/area", {
-        "area_id": area_id,
+    """Active l'exigence de code — réglage GLOBAL d'Alarmo (POST /api/alarmo/config,
+    AlarmoConfigView), PAS un réglage par zone. Bug réel trouvé en conditions
+    réelles (2026-08-05, Hicham : "je peux armer/désarmer sans code via l'app")
+    : la 1ère version postait vers /api/alarmo/area (AlarmoAreaView), dont le
+    schéma Voluptuous n'accepte même pas code_arm_required/code_disarm_required
+    comme clés — requête rejetée en silence à chaque création de code (2 codes
+    créés, jamais requis). Vérifié dans le code source (websockets.py) : ces 2
+    clés n'existent QUE dans le schéma d'AlarmoConfigView. Idempotent, pas de
+    vérification préalable nécessaire (POST sans effet si déjà à true)."""
+    r = ha_post("/alarmo/config", {
         "code_arm_required": True,
         "code_disarm_required": True,
     })
@@ -5135,6 +5135,15 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
             _ensure_alarmo_keypad_control(devices_list)
         except Exception as exc:
             warn(f"[alarmo] Keypad automation: {exc}")
+        # Auto-guérison : les codes créés avant le fix du 2026-08-05 (mauvais
+        # endpoint /alarmo/area) sont restés jamais requis — cette relecture
+        # périodique corrige ça toute seule dès que l'addon est mis à jour, sans
+        # qu'Hicham ait besoin de recréer un code pour redéclencher le fix.
+        try:
+            if handle_alarmo_get_users():
+                _ensure_alarmo_code_required()
+        except Exception as exc:
+            warn(f"[alarmo] Vérification code requis: {exc}")
 
         # Rejoue les messages availability arrivés avant que le cache ci-dessus ne
         # soit prêt (cf. _pending_z2m_availability) — sans ça, une transition
