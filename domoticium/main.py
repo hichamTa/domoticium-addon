@@ -4661,7 +4661,13 @@ def _run_camera_watchdog():
 
 
 def _report_device_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
-    """pi_report_device_state via Supabase direct — True si réussi."""
+    """pi_report_device_state via Supabase direct — True si réussi. p_raw_state
+    (état HA brut) permet à la fonction Postgres de mettre à jour une entité
+    SECONDAIRE (device_entities — ex: température/CO2/PM2.5 d'un capteur
+    multi-mesures) quand aucun device principal ne correspond à cet entity_id —
+    ces mesures n'étaient jusqu'ici JAMAIS rafraîchies après leur liaison
+    initiale (bug trouvé en conditions réelles, Hicham, 2026-08-05 : "mon
+    capteur est resté figé depuis plusieurs jours")."""
     try:
         patch = _ha_entity_to_normalized_patch(entity_id, state, attributes)
         capabilities = _ha_attributes_to_capabilities(entity_id, attributes)
@@ -4670,6 +4676,7 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
         r = _supabase_rpc("pi_report_device_state", {
             "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
             "p_ha_entity_id": entity_id, "p_patch": patch, "p_capabilities": capabilities,
+            "p_raw_state": state,
         })
         if r.status_code >= 300:
             warn(f"[supabase] pi_report_device_state({entity_id}) {r.status_code}: {r.text[:120]}")
