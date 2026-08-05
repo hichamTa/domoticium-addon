@@ -6365,7 +6365,15 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         self._respond(code, {"error": msg})
 
     def _ok(self, data=None):
-        self._respond(200, data or {"ok": True})
+        # `data or {...}` était le bug : un dict VIDE ({}) est falsy en Python,
+        # donc une réponse légitimement vide (ex: handle_alarmo_get_users() sans
+        # aucun code créé, handle_alarmo_get_sensor_groups() sans aucun groupe)
+        # se faisait silencieusement remplacer par {"ok": true} — trouvé en
+        # conditions réelles (2026-08-05) : {"users": [true]} côté web au lieu de
+        # {"users": []}, qui plantait le rendu (React "missing key" sur un
+        # tableau contenant le booléen `true`). Seul `None` (rien fourni du
+        # tout par l'appelant) doit déclencher le repli.
+        self._respond(200, data if data is not None else {"ok": True})
 
     def do_POST(self):
         if not INGEST_SECRET:
