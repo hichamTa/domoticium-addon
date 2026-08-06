@@ -2065,12 +2065,27 @@ def _alarmo_calendar_loop():
     de la synchro Alarmo (_ensure_alarmo_*)."""
     while True:
         time.sleep(_ALARMO_CALENDAR_INTERVAL)
-        if not _alarmo_schedules:
-            continue
         try:
             users = handle_alarmo_get_users()
         except Exception as exc:
             warn(f"[alarmo-calendar] lecture utilisateurs: {exc}")
+            continue
+
+        # Auto-guérison de l'exigence de code (§155) — était câblée sur le cycle
+        # de synchro Zigbee (_sync_zigbee_devices_direct), qui dépend de messages
+        # Z2M bridge/devices : sur une installation instable (matériel posé sur
+        # une table, pas encore fixé — cas réel d'Hicham, 2026-08-06), ce cycle
+        # peut ne jamais se déclencher, laissant le correctif sans effet. Ce
+        # thread-ci tourne seul (indépendamment de tout matériel Zigbee et,
+        # depuis ce fix, même sans code programmé) — le bon endroit pour
+        # réaffirmer ce réglage de façon fiable, à chaque cycle.
+        if users:
+            try:
+                _ensure_alarmo_code_required()
+            except Exception as exc:
+                warn(f"[alarmo-calendar] vérification code requis: {exc}")
+
+        if not _alarmo_schedules:
             continue
 
         now_dt = datetime.now()
@@ -5143,15 +5158,6 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
             _ensure_alarmo_keypad_control(devices_list)
         except Exception as exc:
             warn(f"[alarmo] Keypad automation: {exc}")
-        # Auto-guérison : les codes créés avant le fix du 2026-08-05 (mauvais
-        # endpoint /alarmo/area) sont restés jamais requis — cette relecture
-        # périodique corrige ça toute seule dès que l'addon est mis à jour, sans
-        # qu'Hicham ait besoin de recréer un code pour redéclencher le fix.
-        try:
-            if handle_alarmo_get_users():
-                _ensure_alarmo_code_required()
-        except Exception as exc:
-            warn(f"[alarmo] Vérification code requis: {exc}")
 
         # Rejoue les messages availability arrivés avant que le cache ci-dessus ne
         # soit prêt (cf. _pending_z2m_availability) — sans ça, une transition
