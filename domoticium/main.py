@@ -1858,6 +1858,14 @@ def handle_alarmo_get_panel_state() -> dict:
         "state": payload.get("state"),
         "code_arm_required": bool(attrs.get("code_arm_required", False)),
         "code_format": attrs.get("code_format"),
+        # Durée totale (secondes) du délai en cours (pending/arming) — vérifié
+        # dans le code source (alarm_control_panel.py::extra_state_attributes,
+        # self.delay = exit_delay / effective_entry_delay au moment précis où
+        # l'état bascule) : c'est la durée TOTALE, pas un compte à rebours déjà
+        # décrémenté par Alarmo — le web calcule le temps restant lui-même à
+        # partir du moment où il observe ce nouvel état (demande Hicham
+        # 2026-08-06 : anneau de progression pendant l'armement).
+        "delay": attrs.get("delay"),
     }
 
 
