@@ -4486,6 +4486,18 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
         brightness = attrs.get("brightness")
         if isinstance(brightness, (int, float)):
             result["brightness"] = round((brightness / 255) * 100)
+        # Couleur (§160+) : HA calcule et expose TOUJOURS rgb_color/color_temp_kelvin
+        # de façon standard sur une entité light, quel que soit le protocole d'origine
+        # (Zigbee via Z2M, Matter via matter-server) et quel que soit le mode de
+        # couleur natif du device (xy, hs, rgb) — vérifié dans la doc HA LightEntity.
+        # Un seul code ici couvre donc Zigbee ET Matter, pas besoin de reconstruire
+        # la conversion xy/hs → rgb nous-mêmes.
+        rgb = attrs.get("rgb_color")
+        if isinstance(rgb, (list, tuple)) and len(rgb) == 3:
+            result["color"] = "#{:02x}{:02x}{:02x}".format(*(max(0, min(255, int(c))) for c in rgb))
+        color_temp_kelvin = attrs.get("color_temp_kelvin")
+        if isinstance(color_temp_kelvin, (int, float)):
+            result["colorTemp"] = round(color_temp_kelvin)
         return result
 
     if domain == "sensor":
@@ -4587,6 +4599,21 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
             result["minHumidity"] = attrs["min_humidity"]
         if isinstance(attrs.get("max_humidity"), (int, float)):
             result["maxHumidity"] = attrs["max_humidity"]
+
+    elif domain == "light":
+        # supported_color_modes (liste HA standard, ex: ["xy"], ["hs"], ["color_temp"],
+        # ["rgb"]…) — présence = source de vérité pour savoir si CE device précis
+        # supporte la couleur/temp. de couleur, pas une supposition par type.
+        modes = attrs.get("supported_color_modes") or []
+        if isinstance(modes, list):
+            if any(m in ("xy", "hs", "rgb", "rgbw", "rgbww") for m in modes):
+                result["supportsColor"] = True
+            if "color_temp" in modes:
+                result["supportsColorTemp"] = True
+        if isinstance(attrs.get("min_color_temp_kelvin"), (int, float)):
+            result["minColorTempKelvin"] = attrs["min_color_temp_kelvin"]
+        if isinstance(attrs.get("max_color_temp_kelvin"), (int, float)):
+            result["maxColorTempKelvin"] = attrs["max_color_temp_kelvin"]
 
     return result
 
@@ -4724,6 +4751,10 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
             "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
             "p_ha_entity_id": entity_id, "p_patch": patch, "p_capabilities": capabilities,
             "p_raw_state": state,
+            # Tout le dict d'attributs HA brut, sans tri — capture générique (§160+),
+            # source de vérité pour tout ce qui n'a pas encore de traitement dédié
+            # (couleur, effet, réglages avancés Zigbee, tout attribut futur inconnu).
+            "p_raw_attributes": attributes,
         })
         if r.status_code >= 300:
             warn(f"[supabase] pi_report_device_state({entity_id}) {r.status_code}: {r.text[:120]}")
