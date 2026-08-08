@@ -2513,7 +2513,13 @@ def _ensure_alarmo_sos_automation(devices_list):
         "trigger": [{
             "platform": "mqtt",
             "topic": f"zigbee2mqtt/{friendly_name}",
-            "value_template": "{{ value_json.action }}",
+            # default('') : ce topic publie TOUT l'état du clavier à chaque mise à
+            # jour (battery/heartbeat compris), pas seulement les appuis bouton — les
+            # messages sans clé "action" faisaient logguer un warning HA en boucle
+            # ("dict object has no attribute action"), trouvé en creusant le journal
+            # HA en direct (2026-08-08). Filtre Jinja standard pour ce cas, l'automation
+            # elle-même était déjà correcte (ne se déclenche que sur "emergency").
+            "value_template": "{{ value_json.action | default('') }}",
             "payload": "emergency",
         }],
         "action": [{
