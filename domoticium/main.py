@@ -4476,9 +4476,15 @@ def _ha_state_to_normalized(entity_id: str, state: str) -> dict:
         except ValueError:
             return {}
     if domain == "climate":
-        return {"on": state != "off"}
+        # §163 : le state HA d'une entité climate EST son hvac_mode ("heat"/"cool"/
+        # "auto"/"dry"/"fan_only"/"off"…) — jamais capturé jusqu'ici au-delà d'un
+        # simple on/off dérivé.
+        return {"on": state != "off", "hvacMode": state}
     if domain == "lock":
-        return {"on": state == "locked"}
+        # §163 : "jammed" existe comme 3e état réel (ni verrouillé ni déverrouillé,
+        # le loquet a essayé de bouger et s'est bloqué) — jusqu'ici confondu avec
+        # "déverrouillé" par le simple booléen "on".
+        return {"on": state == "locked", "lockState": state}
     if domain == "valve":
         return {"on": state not in ("closed", "unavailable")}
     return {"on": state == "on"}
@@ -4535,6 +4541,14 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
         target_temp = attrs.get("temperature")
         if isinstance(target_temp, (int, float)):
             result["targetTemperature"] = target_temp
+        # §163 — motifs HA standards climate (doc officielle developers.home-assistant.io/
+        # docs/core/entity/climate), jamais lus jusqu'ici : préréglage, vitesse
+        # ventilation, balayage vertical/horizontal.
+        for src, dst in (("preset_mode", "presetMode"), ("fan_mode", "climateFanMode"),
+                         ("swing_mode", "swingMode"), ("swing_horizontal_mode", "swingHorizontalMode")):
+            val = attrs.get(src)
+            if isinstance(val, str):
+                result[dst] = val
         return result
 
     # Pilotage en direct fan/cover/valve/humidifier (§158 web, généralisation du
@@ -4613,6 +4627,15 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
             result["maxTemp"] = attrs["max_temp"]
         if isinstance(attrs.get("target_temp_step"), (int, float)):
             result["tempStep"] = attrs["target_temp_step"]
+        # §163 — présence réelle par device, jamais supposée. `presetModes`
+        # partagé avec le domaine "fan" (même concept de raccourci prédéfini),
+        # les deux types de device sont mutuellement exclusifs en pratique.
+        for src, dst in (("hvac_modes", "hvacModes"), ("preset_modes", "presetModes"),
+                         ("fan_modes", "climateFanModes"), ("swing_modes", "swingModes"),
+                         ("swing_horizontal_modes", "swingHorizontalModes")):
+            val = attrs.get(src)
+            if isinstance(val, list) and val:
+                result[dst] = val
 
     elif domain == "fan":
         if isinstance(attrs.get("percentage_step"), (int, float)):
@@ -4643,6 +4666,14 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
         modes = attrs.get("available_modes")
         if isinstance(modes, list) and modes:
             result["humidifierModes"] = modes
+
+    elif domain == "lock":
+        # §163 — LockEntityFeature.OPEN = bit 1 du bitmask HA standard
+        # supported_features (vérifié doc HA officielle) : seuls les verrous qui le
+        # supportent exposent réellement lock.open (porte à loquet électrique).
+        features = attrs.get("supported_features")
+        if isinstance(features, int) and features & 1:
+            result["supportsOpen"] = True
 
     elif domain == "light":
         # supported_color_modes (liste HA standard, ex: ["xy"], ["hs"], ["color_temp"],
