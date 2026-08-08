@@ -4547,18 +4547,42 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
         percentage = attrs.get("percentage")
         if isinstance(percentage, (int, float)):
             result["percentage"] = percentage
+        # Motifs HA standards (§163, doc officielle developers.home-assistant.io/
+        # docs/core/entity/fan) — présents sur toute entité fan qui les supporte,
+        # Zigbee ou Matter, jamais lus jusqu'ici.
+        preset_mode = attrs.get("preset_mode")
+        if isinstance(preset_mode, str):
+            result["presetMode"] = preset_mode
+        direction = attrs.get("direction")
+        if isinstance(direction, str):
+            result["direction"] = direction
+        oscillating = attrs.get("oscillating")
+        if isinstance(oscillating, bool):
+            result["oscillating"] = oscillating
         return result
 
     if domain in ("cover", "valve"):
         position = attrs.get("current_position")
         if isinstance(position, (int, float)):
             result["position"] = position
+        # Tilt (§163) : attribut current_cover_tilt_position, distinct de la
+        # position — un volet vénitien pilote les deux indépendamment (vérifié
+        # doc HA officielle, jamais lu jusqu'ici). "valve" n'a pas de tilt (pas
+        # de service set_valve_tilt_position dans HA), seul "cover" l'a.
+        if domain == "cover":
+            tilt = attrs.get("current_tilt_position")
+            if isinstance(tilt, (int, float)):
+                result["tiltPosition"] = tilt
         return result
 
     if domain == "humidifier":
         target_humidity = attrs.get("humidity")
         if isinstance(target_humidity, (int, float)):
             result["targetHumidity"] = target_humidity
+        # Mode (§163, ex: "normal"/"eco"/"away"…) — doc HA officielle, jamais lu.
+        mode = attrs.get("mode")
+        if isinstance(mode, str):
+            result["humidifierMode"] = mode
         return result
 
     return result
@@ -4593,18 +4617,32 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
     elif domain == "fan":
         if isinstance(attrs.get("percentage_step"), (int, float)):
             result["percentageStep"] = attrs["percentage_step"]
+        # §163 : présence de la liste = support réel par CE device, jamais supposé.
+        preset_modes = attrs.get("preset_modes")
+        if isinstance(preset_modes, list) and preset_modes:
+            result["presetModes"] = preset_modes
+        if "direction" in attrs:
+            result["supportsDirection"] = True
+        if "oscillating" in attrs:
+            result["supportsOscillating"] = True
 
     elif domain in ("cover", "valve"):
         # Présence de l'attribut (pas sa valeur) = signal de support natif HA — un
         # cover/valve tout-ou-rien ne l'expose jamais.
         if "current_position" in attrs:
             result["supportsPosition"] = True
+        if domain == "cover" and "current_tilt_position" in attrs:
+            result["supportsTilt"] = True
 
     elif domain == "humidifier":
         if isinstance(attrs.get("min_humidity"), (int, float)):
             result["minHumidity"] = attrs["min_humidity"]
         if isinstance(attrs.get("max_humidity"), (int, float)):
             result["maxHumidity"] = attrs["max_humidity"]
+        # §163
+        modes = attrs.get("available_modes")
+        if isinstance(modes, list) and modes:
+            result["humidifierModes"] = modes
 
     elif domain == "light":
         # supported_color_modes (liste HA standard, ex: ["xy"], ["hs"], ["color_temp"],
