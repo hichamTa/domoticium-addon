@@ -5245,6 +5245,17 @@ def _detect_device_type(
     # top-level "warning" (composite) sur toutes les sirènes standard Z2M —
     # vérifié sur la doc Z2M (SIRZB-110, HS2WD-E). (2026-07-27)
     if "warning" in names: return "siren"
+    # Sirènes qui n'utilisent PAS le composite "warning" standard (modèles NEO
+    # notamment, ex: NAS-AB02B2 d'Hicham) — exposes top-level directs
+    # alarm/melody/duration/volume au lieu d'un seul composite groupé. Trouvé en
+    # vérifiant les devices déjà classés "switch" par erreur en base (2026-08-08,
+    # suite à la question d'Hicham sur d'autres types mal classés) : "Alarme
+    # entrée" (NEO NAS-AB02B2) n'a ni "warning" ni entité HA siren.* détectable,
+    # tombait dans le repli générique — pourtant un vrai boîtier sirène, cible
+    # potentielle de l'action matérielle sur déclenchement. Combinaison
+    # melody+duration+volume est un signal fort et peu ambigu (rarement présent
+    # ensemble sur un device qui ne serait pas une sirène).
+    if {"melody", "duration", "volume"}.issubset(names): return "siren"
     # Clavier d'alarme (bug réel trouvé par Hicham, 2026-08-08 : "j'ai un
     # interrupteur dans l'app alors qu'il n'y a aucune action à mener sur HA") —
     # jusqu'ici, aucune signature dédiée : un clavier IAS ACE (action/tamper/
@@ -5257,7 +5268,20 @@ def _detect_device_type(
     # arm/disarm existant.
     if _exposes_match_ias_ace_keypad(exposes, {"disarm", "arm_all_zones"}):
         return "keypad"
-    return "switch"
+    # Repli sûr (bug de fond, pas juste le clavier — question directe d'Hicham,
+    # 2026-08-08 : "est-ce que ça fera la même chose pour un autre type qui ne
+    # saurait pas se classer ?"). Réponse : oui, avant ce fix — "switch" était le
+    # repli final pour TOUT type non reconnu, donnant un faux bouton marche/arrêt
+    # à n'importe quel appareil non-actionneur qu'on n'a pas encore anticipé
+    # (vibration, fumée, CO, télécommande à boutons…), pas seulement le clavier.
+    # Exactement le même bug déjà trouvé et corrigé côté Matter en conditions
+    # réelles (_extract_matter_device_info ci-dessus, "moniteur qualité d'air
+    # affiché comme actionneur") — jamais reporté ici. "sensor-generic" est le
+    # même repli sûr : ses mesures/entités s'affichent génériquement (device_entities),
+    # jamais de faux toggle. Un vrai switch/plug Zigbee n'atteint jamais ce repli —
+    # Z2M expose toujours son type "switch"/"outlet" en top-level par convention,
+    # déjà attrapé plus haut.
+    return "sensor-generic"
 
 
 def _sync_zigbee_devices_direct(devices_list) -> bool:
