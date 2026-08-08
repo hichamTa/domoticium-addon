@@ -2447,6 +2447,21 @@ def _alarmo_panel_entity_id(area_id: str) -> str | None:
     return next((e.get("entity_id") for e in entities or [] if e.get("area_id") == area_id), None)
 
 
+def _exposes_match_ias_ace_keypad(exposes: list[dict], required_actions: set[str]) -> bool:
+    """Signature générique d'un clavier d'alarme Zigbee sur les exposes d'UN SEUL
+    appareil — factorisé de _find_ias_ace_keypad() (2026-08-08) pour être réutilisable
+    aussi par _detect_device_type(), qui ne voit qu'un device à la fois. Cf.
+    _find_ias_ace_keypad ci-dessous pour le détail de pourquoi ce vocabulaire est
+    fiable indépendamment de la marque (cluster IAS ACE standard)."""
+    for expose in exposes:
+        if expose.get("name") != "action":
+            continue
+        values = set(expose.get("values") or [])
+        if required_actions.issubset(values):
+            return True
+    return False
+
+
 def _find_ias_ace_keypad(devices_list, required_actions: set[str]) -> str | None:
     """Détection GÉNÉRIQUE d'un clavier d'alarme Zigbee — pas un modèle figé (même
     principe que §136). N'importe quel appareil dont les exposes Z2M documentent
@@ -2461,12 +2476,8 @@ def _find_ias_ace_keypad(devices_list, required_actions: set[str]) -> str | None
     même vocabulaire — cette détection n'est pas limitée au clavier d'Hicham."""
     for d in devices_list:
         exposes = (d.get("definition") or {}).get("exposes") or []
-        for expose in exposes:
-            if expose.get("name") != "action":
-                continue
-            values = set(expose.get("values") or [])
-            if required_actions.issubset(values):
-                return d.get("friendly_name")
+        if _exposes_match_ias_ace_keypad(exposes, required_actions):
+            return d.get("friendly_name")
     return None
 
 
@@ -5234,10 +5245,18 @@ def _detect_device_type(
     # top-level "warning" (composite) sur toutes les sirènes standard Z2M —
     # vérifié sur la doc Z2M (SIRZB-110, HS2WD-E). (2026-07-27)
     if "warning" in names: return "siren"
-    # TODO clavier de verrouillage (Alarmo) : pas encore de modèle matériel choisi,
-    # donc pas de signature d'exposes fiable à détecter ici — à faire une fois le
-    # matériel confirmé (cf. HANDOFF, chantier alarme). Classification manuelle
-    # possible entre-temps via AddDeviceFlow (type "keypad").
+    # Clavier d'alarme (bug réel trouvé par Hicham, 2026-08-08 : "j'ai un
+    # interrupteur dans l'app alors qu'il n'y a aucune action à mener sur HA") —
+    # jusqu'ici, aucune signature dédiée : un clavier IAS ACE (action/tamper/
+    # battery_low, aucun expose light/switch/cover/etc.) tombait systématiquement
+    # dans le repli "switch" ci-dessous, lui donnant à tort un bouton marche/arrêt
+    # dans l'app alors qu'aucun service switch.* n'existe réellement pour lui côté
+    # HA. Même signature IAS ACE générique que _find_ias_ace_keypad (cluster
+    # standard, indépendant de la marque) — {"disarm", "arm_all_zones"} suffit à
+    # identifier un clavier compatible, mêmes actions minimales que le câblage
+    # arm/disarm existant.
+    if _exposes_match_ias_ace_keypad(exposes, {"disarm", "arm_all_zones"}):
+        return "keypad"
     return "switch"
 
 
