@@ -4519,6 +4519,30 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
             result["targetTemperature"] = target_temp
         return result
 
+    # Pilotage en direct fan/cover/valve/humidifier (§158 web, généralisation du
+    # panneau de pilotage) — jusqu'ici seules leurs CAPACITÉS (limites) étaient lues
+    # (_ha_attributes_to_capabilities ci-dessous), jamais leur valeur courante :
+    # un ventilateur/volet/vanne/humidificateur n'avait donc qu'un on/off, sans
+    # vitesse/position/humidité cible affichée ni pilotable en direct (seul
+    # l'éditeur de scènes le permettait, sur un brouillon local jamais relu).
+    if domain == "fan":
+        percentage = attrs.get("percentage")
+        if isinstance(percentage, (int, float)):
+            result["percentage"] = percentage
+        return result
+
+    if domain in ("cover", "valve"):
+        position = attrs.get("current_position")
+        if isinstance(position, (int, float)):
+            result["position"] = position
+        return result
+
+    if domain == "humidifier":
+        target_humidity = attrs.get("humidity")
+        if isinstance(target_humidity, (int, float)):
+            result["targetHumidity"] = target_humidity
+        return result
+
     return result
 
 
