@@ -5410,6 +5410,30 @@ def _report_device_availability_direct(ieee: str, online: bool) -> bool:
         return False
 
 
+def _report_zigbee_state_direct(ieee: str, raw_state: dict) -> bool:
+    """pi_report_zigbee_state via Supabase direct — True si réussi. Reçoit l'état
+    COMPLET publié par Z2M sur zigbee2mqtt/{friendly_name} (cf. on_local_message) :
+    seule source de valeurs réelles pour un device Zigbee sans entité HA principale
+    liée (ex: une télécommande classée sensor-generic, cf. §167) — jusqu'ici son
+    schéma d'exposes s'affichait côté web (§168) mais sans aucune valeur, faute de
+    pipeline de capture pour ce topic (bug remonté par Hicham en conditions
+    réelles, 2026-08-09 : "—" partout sur battery/action/linkquality)."""
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:zigbee_state:{ieee}"
+        r = _supabase_rpc("pi_report_zigbee_state", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_ieee_address": ieee, "p_raw_state": raw_state,
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_zigbee_state {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_zigbee_state: {e}")
+        return False
+
+
 def on_local_message(client, userdata, msg):
     """Messages reçus depuis Mosquitto local (Z2M). Plus de relay cloud —
     l'état passe uniquement par run_ha_ws_bridge() → Supabase direct (pi_report_device_state)."""
@@ -5463,6 +5487,29 @@ def on_local_message(client, userdata, msg):
         threading.Thread(
             target=_report_device_availability_direct, args=(ieee, online), daemon=True
         ).start()
+        return
+
+    # ── Z2M état individuel d'un device → valeurs réelles des exposes (battery,
+    # linkquality, action...) — cf. _report_zigbee_state_direct ci-dessus. Topic
+    # exact "zigbee2mqtt/{friendly_name}", sans rien après (ni /availability, déjà
+    # géré au-dessus, ni /set — jamais republié par Z2M, uniquement publié PAR
+    # nous en sortie) ; exclut aussi bridge/* (logging, response, extensions...).
+    # Un friendly_name introuvable dans le cache (ex: message d'un GROUPE Z2M,
+    # pas un device) est silencieusement ignoré — comportement attendu, pas une
+    # erreur : seuls les vrais devices ont une ligne `devices.ieee_address`.
+    if topic.startswith("zigbee2mqtt/") and "/" not in topic[len("zigbee2mqtt/"):]:
+        friendly_name = topic[len("zigbee2mqtt/"):]
+        ieee = _z2m_friendly_to_ieee.get(friendly_name)
+        if ieee:
+            try:
+                raw_state = json.loads(payload.decode())
+                if isinstance(raw_state, dict):
+                    threading.Thread(
+                        target=_report_zigbee_state_direct, args=(ieee, raw_state), daemon=True
+                    ).start()
+            except Exception as exc:
+                warn(f"[zigbee-state] parse error ({friendly_name}): {exc}")
+        return
 
 
 def run_local_bridge():
