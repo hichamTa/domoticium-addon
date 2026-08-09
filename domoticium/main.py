@@ -2815,7 +2815,19 @@ def _ensure_alarmo_keypad_control(devices_list):
 #   natif. Si un client veut "allumer au déclenchement ET éteindre au
 #   désarmement", il crée 2 entrées distinctes — reproduit fidèlement le vrai
 #   comportement Alarmo plutôt que d'improviser un raccourci.
-_ALARMO_ACTION_EVENTS = {"trigger", "arm", "disarm", "entry", "leave"}
+# §184 (2026-08-09) — corrigé après un vrai bug trouvé par Hicham : le panneau
+# natif Alarmo affichait "Élément inconnu" pour "trigger". Les 5 valeurs
+# précédentes ("trigger"/"arm"/"disarm"/"entry"/"leave") venaient des
+# constantes internes `const.py::EVENT_*` — un bus d'évènements différent
+# (diagnostics), pas le vocabulaire des automatisations. Vérifié dans la VRAIE
+# source frontend (`frontend/src/types.ts::EAlarmEvent`) ET le comparateur
+# backend (`automations.py::AutomationHandler.async_alarm_state_changed`,
+# comparaison de chaînes EXACTE contre l'état alarme littéral) : les vraies
+# valeurs sont "triggered"/"armed"/"disarmed"/"pending"/"arming" — une action
+# créée avec l'ancien vocabulaire ne se serait JAMAIS déclenchée (écriture
+# acceptée sans erreur, aucune validation sémantique, juste cv.string côté
+# Alarmo), silencieusement inerte.
+_ALARMO_ACTION_EVENTS = {"triggered", "armed", "disarmed", "pending", "arming"}
 
 
 def handle_alarmo_get_automations() -> dict:
