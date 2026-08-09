@@ -1866,6 +1866,15 @@ def handle_alarmo_get_panel_state() -> dict:
         # partir du moment où il observe ce nouvel état (demande Hicham
         # 2026-08-06 : anneau de progression pendant l'armement).
         "delay": attrs.get("delay"),
+        # Horodatage HA natif du dernier changement de VALEUR d'état (pas
+        # attributs) — exactement le moment où Alarmo est passé à "pending"/
+        # "arming". Ancre fiable pour l'anneau de progression, contrairement à
+        # un simple Date.now() côté web mesuré à la 1ère observation : ce
+        # dernier repart de zéro à chaque démontage du composant (ex: changer
+        # d'onglet puis revenir), bug réel remonté par Hicham en conditions
+        # réelles (2026-08-09) — le cercle "En attente…" recommençait à 0%
+        # alors que le délai réel côté Alarmo continuait de s'écouler.
+        "last_changed": payload.get("last_changed"),
     }
 
 
