@@ -1869,6 +1869,74 @@ def handle_alarmo_get_panel_state() -> dict:
     }
 
 
+# action app (cf. web AlarmoAction) → verbe de service HA alarm_control_panel.
+_ALARMO_ACTION_TO_SERVICE = {
+    "arm_away": "alarm_arm_away", "arm_home": "alarm_arm_home", "arm_night": "alarm_arm_night",
+    "disarm": "alarm_disarm", "trigger": "alarm_trigger",
+}
+
+
+def handle_alarmo_set_panel_state(entity_id: str, action: str, code: str | None) -> dict:
+    """Arme/désarme le panneau et VÉRIFIE que l'état a réellement changé — trouvé en
+    conditions réelles (Hicham, 2026-08-09) : Alarmo ne lève aucune erreur HA en cas de
+    code manquant ou incorrect. Vérifié dans son code source
+    (alarm_control_panel.py::_validate_code) : un code manquant/faux est rejeté en
+    interne (juste un log "Wrong code provided"), le service HA répond quand même
+    200 OK — sans cette vérification, un mauvais code ne montrait RIEN à l'utilisateur,
+    ni erreur ni changement d'état. Le code manquant sur une action d'armement est un
+    cas à part : Home Assistant lui-même (check_code_arm_required, avant même qu'Alarmo
+    ne soit sollicité) lève une erreur non gérée proprement par l'API REST de HA, que
+    l'ancien code aplatissait en un 502 générique sans aucun détail exploitable (bug
+    d'origine remonté par Hicham) — la validation de présence du code se fait
+    désormais côté web AVANT l'appel (cf. alarm/page.tsx), donc ce cas ne devrait plus
+    jamais atteindre l'add-on en temps normal.
+
+    L'appel HA (`ha_post`, blocking=True côté API REST de HA) attend que le service
+    Alarmo ait fini de s'exécuter avant de répondre — Alarmo a donc déjà pris sa
+    décision (accepter/rejeter) et mis à jour l'état AVANT que `ha_post` ne rende la
+    main ici, aucun délai artificiel n'est nécessaire entre les deux lectures d'état."""
+    verb = _ALARMO_ACTION_TO_SERVICE.get(action)
+    if not verb:
+        return {"ok": False, "error": "action inconnue"}
+
+    before_r = ha_get(f"/states/{entity_id}")
+    before_state = before_r.json().get("state") if before_r.ok else None
+
+    payload = {"entity_id": entity_id}
+    if code:
+        payload["code"] = code
+    r = ha_post(f"/services/alarm_control_panel/{verb}", payload)
+    if not r.ok:
+        try:
+            detail = r.json().get("message") or r.text[:200]
+        except Exception:
+            detail = r.text[:200]
+        return {"ok": False, "error": detail}
+
+    if action == "trigger":
+        return {"ok": True}
+
+    after_r = ha_get(f"/states/{entity_id}")
+    after_state = after_r.json().get("state") if after_r.ok else None
+
+    # Lecture d'état impossible : on ne bloque pas l'utilisateur pour un simple souci
+    # de lecture, seulement quand on est SÛR que rien n'a bougé.
+    if before_state is None or after_state is None:
+        return {"ok": True}
+
+    # État cible déjà atteint avant même l'appel (ex: cliquer "Absent" alors que déjà
+    # armé "Absent") — Alarmo l'ignore silencieusement lui aussi (log "already set to
+    # X"), un vrai no-op légitime, pas un code refusé : ne jamais le signaler à tort.
+    already_there = (
+        (action == "disarm" and before_state == "disarmed")
+        or (action != "disarm" and before_state == f"armed_{action.split('_', 1)[1]}")
+    )
+    if not already_there and after_state == before_state:
+        return {"ok": False, "error": "Code incorrect"}
+
+    return {"ok": True}
+
+
 def handle_alarmo_get_keypad_status() -> dict:
     """Détection live d'un clavier physique — demandée par Hicham (2026-08-04) pour
     l'étape "clavier" de l'assistant de configuration web, qui n'affichait jusqu'ici
@@ -6665,6 +6733,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/camera/test":          self._handle_camera_test_route,
                 "/camera/ptz":           self._handle_camera_ptz_route,
                 "/sync-now":             self._handle_sync_now,
+                "/alarmo/set-panel-state": self._handle_alarmo_set_panel_state_route,
                 "/alarmo/sensor":        self._handle_alarmo_sensor_route,
                 "/alarmo/user":          self._handle_alarmo_user_route,
                 "/alarmo/action":        self._handle_alarm_action_set_route,
@@ -6697,6 +6766,17 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok()
         else:
             self._reject(502, f"HA {r.status_code}: {r.text[:200]}")
+
+    def _handle_alarmo_set_panel_state_route(self, data):
+        entity_id = data.get("entityId")
+        action = data.get("action")
+        code = data.get("code")
+        if not entity_id or not action:
+            return self._reject(400, "entityId et action requis")
+        result = handle_alarmo_set_panel_state(entity_id, action, code)
+        if not result.get("ok"):
+            return self._reject(400, result.get("error") or "Échec")
+        self._ok()
 
     def _handle_matter_commission(self, data):
         request_id = data.get("requestId") or secrets.token_hex(8)
