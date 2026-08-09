@@ -4562,6 +4562,12 @@ def run_ha_ws_bridge():
         "light", "switch", "cover", "lock", "fan", "valve", "humidifier", "climate",
         "sensor", "binary_sensor", "input_boolean", "media_player", "camera",
         "alarm_control_panel", "scene", "automation",
+        # select/number : entités secondaires de config (ex: mélodie/volume/durée
+        # d'une sirène de clavier) — jusqu'ici exclues du relai, donc jamais
+        # rafraîchies dans device_entities (état/attributs toujours vides), bug
+        # trouvé en conditions réelles (Hicham, 2026-08-10 : "Duration" affichait
+        # NaN, "Volume"/"Melody" restaient vides malgré des vraies valeurs côté HA).
+        "select", "number",
     }
     while True:
         ws_send, ws_recv, ws_close = _ha_ws_connect(long_lived=True)
