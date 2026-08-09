@@ -2867,10 +2867,21 @@ def handle_alarmo_set_automation(
         # création d'une action avec un mode coché).
         mode_map = {"away": "armed_away", "home": "armed_home", "night": "armed_night"}
         trigger["modes"] = [mode_map.get(m, m) for m in modes]
-    actions = [
-        {"entity_id": entity_id, "service": f"{entity_id.split('.', 1)[0]}.{service_verb}"}
-        for entity_id in entities
-    ]
+    # Les scènes (script.*) et automatisations (automation.*) n'ont pas de
+    # notion d'allumer/éteindre — les exposer avec le toggle Allumer/Éteindre
+    # n'aurait aucun sens (une scène s'active, une automatisation se déclenche,
+    # point). Demande Hicham 2026-08-09 : ces cibles sont forcées sur leur seul
+    # service pertinent, quel que soit service_verb ; tout le reste (lumières,
+    # prises, sirènes…) garde le comportement historique.
+    def _action_service(entity_id: str) -> str:
+        domain = entity_id.split(".", 1)[0]
+        if domain == "script":
+            return "script.turn_on"
+        if domain == "automation":
+            return "automation.trigger"
+        return f"{domain}.{service_verb}"
+
+    actions = [{"entity_id": entity_id, "service": _action_service(entity_id)} for entity_id in entities]
     payload = {
         "name": name, "type": "action",
         "triggers": [trigger], "actions": actions,
