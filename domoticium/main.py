@@ -4249,6 +4249,14 @@ def _backfill_ha_entity_links():
             "entityId": entity_id,
             "friendlyName": e.get("name") or e.get("original_name"),
             "domain": entity_id.split(".")[0] if "." in entity_id else None,
+            # Permet au web de ne jamais laisser une entité diagnostic/config
+            # (ex: "Défauts matériels", binary_sensor comme le vrai capteur
+            # d'occupation) usurper le lien ha_entity_id PRINCIPAL du device juste
+            # parce que son domaine correspond — seul un vrai état (catégorie vide)
+            # doit pouvoir le faire. Trouvé en vérifiant le résultat de ce fix
+            # (2026-08-09) : sans ça, l'ordre de retour de la liste HA déciderait
+            # au hasard, à chaque cycle, quelle entité fait autorité pour ce device.
+            "entityCategory": e.get("entity_category"),
         }
         if m:
             payload["ieeeAddress"] = m.group(0)
@@ -4994,11 +5002,13 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
             # créée — sinon état et commandes ne fonctionnent jamais pour ce device
             # (vu en test réel : capteur Matter commissionné mais état jamais à jour).
             entry = _entity_registry_entry(entity_id)
-            # entity_category "diagnostic"/"config" = jamais pertinent côté client
-            # (ex: "Nombre de redémarrages", "Raison de démarrage") — vu en test réel
-            # polluer la carte device une fois les entités secondaires affichées.
-            if entry and entry.get("entity_category") in ("diagnostic", "config"):
-                return
+            # entity_category transmis au web (pas de filtrage ici) — permet
+            # d'afficher batterie/diagnostics comme attribut secondaire (demande
+            # explicite Hicham, 2026-08-09) sans jamais la laisser usurper le lien
+            # ha_entity_id PRINCIPAL du device (cf. commentaire équivalent dans
+            # _backfill_ha_entity_links, même fix appliqué aux deux chemins).
+            if entry:
+                payload["entityCategory"] = entry.get("entity_category")
             # Nom lisible dès la liaison — ne pas attendre le 1er changement d'état
             # (name = override utilisateur, original_name = nom par défaut ; les deux
             # peuvent être absents de l'event live entity_registry_updated, vu en test
