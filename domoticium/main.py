@@ -4224,13 +4224,21 @@ def _backfill_ha_entity_links():
     ieee/node_id (ou dont l'événement a été manqué : redémarrage, erreur réseau
     ponctuelle…). Idempotent (ré-envoyer le même lien ne fait rien) — appelé à chaque
     cycle de sync. Sans ce lien pour Matter, l'état (ex: capteur d'ouverture) ne
-    remonte jamais dans l'app — vu en test réel après le 1er commissioning."""
+    remonte jamais dans l'app — vu en test réel après le 1er commissioning.
+
+    Les entités "diagnostic"/"config" (batterie, tension, infos réseau Thread,
+    défauts matériels…) étaient jusqu'ici exclues en bloc — audit en conditions
+    réelles (Hicham, 2026-08-09, sur "Capteur de mouvement" Matter) : 17 entités
+    réelles côté HA pour ce device, 1 seule captée côté app. Batterie notamment
+    manquait, alors qu'explicitement demandée pour de futures conditions
+    d'automatisation. Repli symétrique à celui déjà fait côté Zigbee (§168, web) :
+    ne plus pré-filtrer par catégorie HA — NOISE_DOMAINS côté web
+    (/api/ingest/registry, update/button/event) continue d'exclure ce qui reste
+    du bruit pur (firmware, boutons "Identifier")."""
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         return
     for e in result.get("result", []):
-        if e.get("entity_category") in ("diagnostic", "config"):
-            continue  # jamais pertinent côté client (redémarrages, raison démarrage…)
         entity_id = e.get("entity_id", "")
         unique_id = e.get("unique_id") or ""
         m = _IEEE_RE.search(unique_id)
