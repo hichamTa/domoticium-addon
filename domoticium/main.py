@@ -2492,6 +2492,57 @@ def _ensure_alarmo_night_mode():
         warn(f"[alarmo] Activation mode nuit échouée ({r.status_code}): {r.text[:200]}")
 
 
+# Réglages "Modes" (délai de sortie/entrée, temps de fonctionnement avant
+# réarmement, actif) + "Généraux" (désactivation après déclenchement) — demande
+# Hicham (2026-08-09) après avoir montré les 3 onglets natifs Alarmo
+# (Généraux/Modes/Zones) et comparé avec notre app qui n'exposait aucun des
+# deux. Limité aux 3 modes déjà connus du reste de l'app (away/home/night,
+# cf. AlarmoArmMode) — Vacances/Exception personnalisée jamais utilisés
+# ailleurs, décision explicite de ne pas les exposer maintenant.
+_ALARMO_MODE_STATE_KEYS = {"away": "armed_away", "home": "armed_home", "night": "armed_night"}
+
+
+def handle_alarmo_get_area_modes() -> dict:
+    _, area = _alarmo_get_sole_area()
+    return {"modes": (area or {}).get("modes") or {}}
+
+
+def handle_alarmo_set_area_mode(
+    mode: str, enabled: bool, exit_time: int | None, entry_time: int | None, trigger_time: int | None,
+) -> dict:
+    state_key = _ALARMO_MODE_STATE_KEYS.get(mode)
+    if not state_key:
+        return {"ok": False, "detail": "mode invalide"}
+    area_id, area = _alarmo_get_sole_area()
+    if not area_id:
+        return {"ok": False, "detail": "Alarmo non configuré"}
+    # attr.evolve() côté Alarmo remplace tout le dict "modes" d'un coup (même
+    # piège déjà rencontré dans _ensure_alarmo_night_mode) — renvoyer TOUS les
+    # modes existants, pas seulement celui modifié, sous peine d'effacer les
+    # réglages des autres modes.
+    modes = dict((area or {}).get("modes") or {})
+    modes[state_key] = {
+        "enabled": bool(enabled), "exit_time": exit_time,
+        "entry_time": entry_time, "trigger_time": trigger_time,
+    }
+    r = ha_post("/alarmo/area", {"area_id": area_id, "modes": modes})
+    if not r.ok:
+        return {"ok": False, "detail": r.text[:200]}
+    return {"ok": True}
+
+
+def handle_alarmo_get_general_config() -> dict:
+    result = _ha_ws_call("alarmo/config")
+    return result.get("result") if result and result.get("success") else {}
+
+
+def handle_alarmo_set_general_config(disarm_after_trigger: bool) -> dict:
+    r = ha_post("/alarmo/config", {"disarm_after_trigger": bool(disarm_after_trigger)})
+    if not r.ok:
+        return {"ok": False, "detail": r.text[:200]}
+    return {"ok": True}
+
+
 _ALARMO_FACTORY_DEFAULT_NAME = "Alarmo"  # store.py::async_factory_default, en dur côté Alarmo
 
 
@@ -6761,6 +6812,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/alarmo/sensor":        self._handle_alarmo_sensor_route,
                 "/alarmo/user":          self._handle_alarmo_user_route,
                 "/alarmo/automation":    self._handle_alarmo_automation_set_route,
+                "/alarmo/area-mode":     self._handle_alarmo_area_mode_set_route,
+                "/alarmo/general-config": self._handle_alarmo_general_config_set_route,
                 "/alarmo/sensor-group":  self._handle_alarmo_sensor_group_route,
                 "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
                 "/matter/merge/reject":  self._handle_matter_merge_reject_route,
@@ -6997,6 +7050,23 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._reject(400, result.get("detail", "échec"))
 
+    def _handle_alarmo_area_mode_set_route(self, data):
+        result = handle_alarmo_set_area_mode(
+            data.get("mode"), data.get("enabled"),
+            data.get("exitTime"), data.get("entryTime"), data.get("triggerTime"),
+        )
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
+    def _handle_alarmo_general_config_set_route(self, data):
+        result = handle_alarmo_set_general_config(data.get("disarmAfterTrigger"))
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(400, result.get("detail", "échec"))
+
     def _handle_alarmo_sensor_group_route(self, data):
         result = handle_alarmo_set_sensor_group(
             data.get("groupId"),
@@ -7043,6 +7113,10 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._handle_alarmo_users_route()
         elif route == "/alarmo/automations":
             self._handle_alarmo_automations_route()
+        elif route == "/alarmo/area-modes":
+            self._handle_alarmo_area_modes_route()
+        elif route == "/alarmo/general-config":
+            self._handle_alarmo_general_config_route()
         elif route == "/alarmo/sensor-groups":
             self._handle_alarmo_sensor_groups_route()
         else:
@@ -7089,6 +7163,20 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._ok(handle_alarmo_get_automations())
         except Exception as e:
             warn(f"[alarmo-automations] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_area_modes_route(self):
+        try:
+            self._ok(handle_alarmo_get_area_modes())
+        except Exception as e:
+            warn(f"[alarmo-area-modes] {e}")
+            self._reject(500, str(e))
+
+    def _handle_alarmo_general_config_route(self):
+        try:
+            self._ok(handle_alarmo_get_general_config())
+        except Exception as e:
+            warn(f"[alarmo-general-config] {e}")
             self._reject(500, str(e))
 
     def _handle_alarmo_sensor_groups_route(self):
