@@ -2794,7 +2794,16 @@ def handle_alarmo_set_automation(
 
     trigger: dict = {"event": event}
     if modes:
-        trigger["modes"] = modes
+        # Alarmo valide `modes` contre const.ARM_MODES (vérifié dans son code
+        # source) — ce sont les VALEURS D'ÉTAT complètes ("armed_away", pas
+        # "away") : notre nomenclature courte ("away"/"home"/"night", partagée
+        # avec le reste de l'app, ex. armer/désarmer) doit être traduite ici,
+        # jamais envoyée telle quelle. Sans cette traduction, Alarmo rejetait
+        # la requête en 400 (validation Voluptuous côté HA) — bug réel trouvé
+        # en conditions réelles (Hicham, 2026-08-09, "Error: 502" à la
+        # création d'une action avec un mode coché).
+        mode_map = {"away": "armed_away", "home": "armed_home", "night": "armed_night"}
+        trigger["modes"] = [mode_map.get(m, m) for m in modes]
     actions = [
         {"entity_id": entity_id, "service": f"{entity_id.split('.', 1)[0]}.{service_verb}"}
         for entity_id in entities
