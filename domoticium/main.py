@@ -2735,76 +2735,82 @@ def _ensure_alarmo_keypad_control(devices_list):
     log(f"[alarmo] ✓ Armement/désarmement clavier câblé sur '{friendly_name}' ↔ {panel_entity_id}")
 
 
-# Action matérielle sur déclenchement (sirène/lumières) — demande Hicham
-# (2026-08-05, "je veux tout" après explication des 3 features Alarmo
-# manquantes). Volontairement PAS construit via le panneau propriétaire
-# "Actions" d'Alarmo (README §Automations) : une automatisation HA générique
-# déclenchée sur l'état du panneau fait exactement la même chose, même schéma
-# déjà utilisé pour le clavier (_ensure_alarmo_keypad_control) — pas de
-# nouvelle logique à apprendre. Leçon retenue de la refonte du calendrier des
-# codes (2026-08-05) : aucun stockage dupliqué — l'automatisation HA créée EST
-# la seule source de vérité, relue directement plutôt que copiée ailleurs.
-_ALARM_ACTION_OBJECT_ID = "domoticium_alarm_action"
+# Actions matérielles sur évènement alarme (sirène/lumières...) — demande
+# Hicham (2026-08-05, "je veux tout" après explication des 3 features Alarmo
+# manquantes ; 2026-08-09, comparaison directe avec le panneau natif Alarmo
+# "Actions" — "récupère les bonnes variables", "il faut le garder tel que
+# décrit dans alarmo").
+#
+# v1 (2026-08-05→09) construisait sa PROPRE automatisation HA générique
+# (déclenchée sur l'état du panneau, une seule cible, marche/arrêt câblés en
+# dur) — délibérément PAS via le système propriétaire d'Alarmo. Abandonné :
+# Hicham a comparé avec le panneau natif Alarmo (captures à l'appui) et
+# demandé de repartir sur le vrai mécanisme Alarmo (multi-équipements,
+# plusieurs entrées possibles), avec notre propre formulaire par-dessus,
+# pas de nouvelle logique inventée.
+#
+# Vraie API Alarmo (vérifiée dans son code source, PAS supposée) :
+# - Lecture : WS `alarmo/automations` (AUCUN GET REST — AlarmoAutomationView
+#   n'a qu'un POST, confirmé par un appel réel qui renvoie 405) → dict
+#   {automation_id: {name, type, triggers, actions, enabled}}.
+# - Écriture : POST REST `/api/alarmo/automations` (mêmes principe que
+#   `/api/alarmo/sensor_groups`, déjà utilisé pour les groupes de capteurs) —
+#   `remove: true` supprime, `automation_id` fourni = modification, absent =
+#   création. `triggers: [{event, modes?}]`, `actions: [{entity_id, service}]`
+#   — `automations.py::async_execute_automation` découpe `service` en
+#   `domain.service` et appelle `hass.services.async_call()` directement,
+#   sans magie cachée : PAS d'appariement automatique marche/arrêt, une
+#   entrée = un évènement = une liste d'actions, exactement comme le panneau
+#   natif. Si un client veut "allumer au déclenchement ET éteindre au
+#   désarmement", il crée 2 entrées distinctes — reproduit fidèlement le vrai
+#   comportement Alarmo plutôt que d'improviser un raccourci.
+_ALARMO_ACTION_EVENTS = {"trigger", "arm", "disarm", "entry", "leave"}
 
 
-def handle_alarm_action_get() -> dict:
-    """Relit l'entity_id actuellement câblé (ou None si aucune action configurée)
-    directement depuis la config HA de l'automatisation — jamais stocké ailleurs."""
-    r = ha_get(f"/config/automation/config/{_ALARM_ACTION_OBJECT_ID}")
-    if not r.ok:
-        return {"entity_id": None}
-    try:
-        cfg = r.json()
-        entity_id = cfg["action"][0]["choose"][0]["sequence"][0]["target"]["entity_id"]
-    except (KeyError, IndexError, TypeError, ValueError):
-        entity_id = None
-    return {"entity_id": entity_id}
+def handle_alarmo_get_automations() -> dict:
+    result = _ha_ws_call("alarmo/automations")
+    return result.get("result") if result and result.get("success") else {}
 
 
-def handle_alarm_action_set(target_entity: str | None) -> dict:
-    """Crée/remplace l'automatisation qui allume target_entity quand l'alarme se
-    déclenche et l'éteint au désarmement — target_entity=None supprime
-    l'automatisation existante (désactive la fonctionnalité proprement).
-    Domaine (switch/light/script/input_boolean) déduit de l'entity_id, jamais
-    supposé fixe — n'importe quel équipement contrôlable convient."""
-    area_id, _ = _alarmo_get_sole_area()
-    if not area_id:
-        return {"ok": False, "detail": "Alarmo non configuré"}
-    panel_entity_id = _alarmo_panel_entity_id(area_id)
-    if not panel_entity_id:
-        return {"ok": False, "detail": "Panneau Alarmo introuvable"}
+def handle_alarmo_set_automation(
+    automation_id: str | None, name: str | None, event: str | None,
+    modes: list | None, entities: list | None, service_verb: str | None,
+    enabled: bool | None, remove: bool = False,
+) -> dict:
+    if remove:
+        if not automation_id:
+            return {"ok": False, "detail": "automationId requis"}
+        r = ha_post("/alarmo/automations", {"automation_id": automation_id, "remove": True})
+        return {"ok": True} if r.ok else {"ok": False, "detail": r.text[:200]}
 
-    if not target_entity:
-        r = requests.delete(f"{API}/config/automation/config/{_ALARM_ACTION_OBJECT_ID}", headers=HDRS, timeout=10)
-        if r.ok or r.status_code == 404:
-            ha_post("/services/automation/reload", {})
-            return {"ok": True}
-        return {"ok": False, "detail": r.text[:200]}
+    if event not in _ALARMO_ACTION_EVENTS:
+        return {"ok": False, "detail": "Évènement invalide"}
+    if service_verb not in ("turn_on", "turn_off"):
+        return {"ok": False, "detail": "Action invalide"}
+    if not entities:
+        return {"ok": False, "detail": "Au moins un équipement requis"}
+    if not name:
+        return {"ok": False, "detail": "Nom requis"}
 
-    domain = target_entity.split(".", 1)[0]
-    auto_cfg = {
-        "alias": "Domoticium — Action sur déclenchement",
-        "trigger": [{"platform": "state", "entity_id": panel_entity_id}],
-        "condition": [],
-        "action": [{
-            "choose": [
-                {
-                    "conditions": [{"condition": "state", "entity_id": panel_entity_id, "state": "triggered"}],
-                    "sequence": [{"action": f"{domain}.turn_on", "target": {"entity_id": target_entity}}],
-                },
-                {
-                    "conditions": [{"condition": "state", "entity_id": panel_entity_id, "state": "disarmed"}],
-                    "sequence": [{"action": f"{domain}.turn_off", "target": {"entity_id": target_entity}}],
-                },
-            ],
-        }],
-        "mode": "single",
+    trigger: dict = {"event": event}
+    if modes:
+        trigger["modes"] = modes
+    actions = [
+        {"entity_id": entity_id, "service": f"{entity_id.split('.', 1)[0]}.{service_verb}"}
+        for entity_id in entities
+    ]
+    payload = {
+        "name": name, "type": "action",
+        "triggers": [trigger], "actions": actions,
+        "enabled": enabled if enabled is not None else True,
     }
-    r = ha_post(f"/config/automation/config/{_ALARM_ACTION_OBJECT_ID}", auto_cfg)
+    if automation_id:
+        payload["automation_id"] = automation_id
+
+    r = ha_post("/alarmo/automations", payload)
     if not r.ok:
         return {"ok": False, "detail": r.text[:200]}
-    ha_post("/services/automation/reload", {})
-    log(f"[alarmo] ✓ Action sur déclenchement câblée → {target_entity}")
+    log(f"[alarmo] ✓ Action '{name}' câblée ({event} → {service_verb} sur {len(entities)} équipement(s))")
     return {"ok": True}
 
 
@@ -6745,7 +6751,7 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
                 "/alarmo/set-panel-state": self._handle_alarmo_set_panel_state_route,
                 "/alarmo/sensor":        self._handle_alarmo_sensor_route,
                 "/alarmo/user":          self._handle_alarmo_user_route,
-                "/alarmo/action":        self._handle_alarm_action_set_route,
+                "/alarmo/automation":    self._handle_alarmo_automation_set_route,
                 "/alarmo/sensor-group":  self._handle_alarmo_sensor_group_route,
                 "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
                 "/matter/merge/reject":  self._handle_matter_merge_reject_route,
@@ -6966,8 +6972,17 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._reject(400, result.get("detail", "échec"))
 
-    def _handle_alarm_action_set_route(self, data):
-        result = handle_alarm_action_set(data.get("entityId"))
+    def _handle_alarmo_automation_set_route(self, data):
+        result = handle_alarmo_set_automation(
+            data.get("automationId"),
+            data.get("name"),
+            data.get("event"),
+            data.get("modes"),
+            data.get("entities"),
+            data.get("service"),
+            data.get("enabled"),
+            data.get("remove", False),
+        )
         if result.get("ok"):
             self._ok(result)
         else:
@@ -7017,8 +7032,8 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._handle_alarmo_keypad_route()
         elif route == "/alarmo/users":
             self._handle_alarmo_users_route()
-        elif route == "/alarmo/action":
-            self._handle_alarm_action_get_route()
+        elif route == "/alarmo/automations":
+            self._handle_alarmo_automations_route()
         elif route == "/alarmo/sensor-groups":
             self._handle_alarmo_sensor_groups_route()
         else:
@@ -7060,11 +7075,11 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             warn(f"[alarmo-users] {e}")
             self._reject(500, str(e))
 
-    def _handle_alarm_action_get_route(self):
+    def _handle_alarmo_automations_route(self):
         try:
-            self._ok(handle_alarm_action_get())
+            self._ok(handle_alarmo_get_automations())
         except Exception as e:
-            warn(f"[alarm-action] {e}")
+            warn(f"[alarmo-automations] {e}")
             self._reject(500, str(e))
 
     def _handle_alarmo_sensor_groups_route(self):
