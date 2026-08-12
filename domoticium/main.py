@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, uuid, zipfile
+import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
 from datetime import datetime, date
 import paho.mqtt.client as mqtt
 import requests
@@ -73,6 +73,16 @@ def _pi_sign(message: str) -> str:
     appels directs vers les fonctions Postgres pi_* (cf. HANDOFF §36). Le secret
     n'est jamais transmis lui-même, seulement cette signature."""
     return hmac.new(INGEST_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+
+def _jwt_payload(token: str) -> dict:
+    """Décode le corps d'un JWT SANS vérifier sa signature — sert uniquement à en lire
+    la date d'expiration (claim "exp"), jamais à faire confiance à son contenu pour une
+    décision de sécurité (la validité réelle est vérifiée par Home Assistant lui-même
+    au moment de l'utilisation du jeton, pas ici)."""
+    part = token.split(".")[1]
+    padded = part + "=" * (-len(part) % 4)
+    return json.loads(base64.urlsafe_b64decode(padded))
 
 
 def _supabase_rpc(fn_name: str, payload: dict, timeout: float = 10.0) -> requests.Response:
@@ -6808,6 +6818,79 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
         # tout par l'appelant) doit déclencher le repli.
         self._respond(200, data if data is not None else {"ok": True})
 
+    def _respond_html(self, code, html):
+        body = html.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_ha_bootstrap_route(self):
+        """Amorce la session Home Assistant d'un technicien dans son navigateur (Phase 2
+        accès distant) : échange un billet à usage unique contre le jeton de session déjà
+        créé à l'approbation de sa demande, puis renvoie une page qui dépose ce jeton dans
+        le stockage local du navigateur avant de rediriger vers Home Assistant — ainsi
+        HA le reconnaît comme déjà connecté, sans jamais lui montrer ni lui demander de
+        mot de passe. Cf. mémoire project-remote-ha-access-consent pour le détail complet
+        du mécanisme et pourquoi (localStorage["hassTokens"], format AuthData, etc.)."""
+        try:
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = urllib.parse.parse_qs(query)
+            ticket = (params.get("ticket") or [None])[0]
+            if not ticket:
+                return self._respond_html(400, self._ha_bootstrap_error_page("Lien invalide."))
+
+            ts = int(time.time())
+            message = f"{SITE_PREFIX}:{ts}:ha_bootstrap:{ticket}"
+            r = _supabase_rpc("pi_resolve_ha_bootstrap_ticket", {
+                "p_mqtt_prefix": SITE_PREFIX,
+                "p_timestamp": ts,
+                "p_signature": _pi_sign(message),
+                "p_ticket": ticket,
+            })
+            rows = r.json() if r.ok else []
+            session_token = rows[0]["refresh_token"] if rows else None
+            if not session_token:
+                return self._respond_html(403, self._ha_bootstrap_error_page(
+                    "Ce lien a expiré ou a déjà été utilisé — redemandez l'accès depuis l'application."))
+
+            exp = _jwt_payload(session_token).get("exp")
+            expires_in = max(int(exp - time.time()), 60) if exp else 1800
+            # Host vient de l'en-tête HTTP (contrôlable par l'appelant) — la double
+            # sérialisation JSON ci-dessous empêche toute injection dans le <script>,
+            # mais on valide quand même le format par prudence avant de s'en servir.
+            host = self.headers.get("Host", "")
+            if not re.fullmatch(r"[a-zA-Z0-9.-]+\.domoticium\.fr", host):
+                return self._respond_html(400, self._ha_bootstrap_error_page("Requête invalide."))
+            auth_data = {
+                "hassUrl": f"https://{host}",
+                "clientId": None,
+                "access_token": session_token,
+                "refresh_token": "",
+                "expires_in": expires_in,
+                "expires": int(time.time() * 1000) + expires_in * 1000,
+            }
+            html = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Connexion…</title></head><body style="background:#111;color:#eee;
+font-family:sans-serif;display:flex;align-items:center;justify-content:center;
+height:100vh;margin:0"><p>Connexion à Home Assistant…</p>
+<script>
+localStorage.setItem("hassTokens", {json.dumps(json.dumps(auth_data))});
+location.replace("/");
+</script></body></html>"""
+            self._respond_html(200, html)
+        except Exception as e:
+            warn(f"[ha-bootstrap] {e}")
+            self._respond_html(500, self._ha_bootstrap_error_page("Erreur inattendue."))
+
+    def _ha_bootstrap_error_page(self, message):
+        safe = message.replace("<", "&lt;").replace(">", "&gt;")
+        return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Accès impossible</title></head><body style="background:#111;color:#eee;
+font-family:sans-serif;display:flex;align-items:center;justify-content:center;
+height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></html>"""
+
     def do_POST(self):
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
@@ -7124,12 +7207,22 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
             self._reject(400, result.get("detail", "échec"))
 
     def do_GET(self):
+        route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
+        route = route.split("?")[0]
+
+        # SEULE route accessible sans X-Site-Secret : conçue pour être ouverte
+        # directement par le navigateur d'un technicien (qui ne peut évidemment pas
+        # connaître ce secret), pas par notre backend. Sécurisée autrement : billet à
+        # usage unique, de courte durée de vie, vérifié par Supabase avant toute
+        # livraison — cf. _handle_ha_bootstrap_route et migration 0085. Toutes les
+        # autres routes gardent la vérification classique ci-dessous, inchangée.
+        if route == "/ha-bootstrap":
+            return self._handle_ha_bootstrap_route()
+
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
         if self.headers.get("X-Site-Secret") != INGEST_SECRET:
             return self._reject(401, "Non autorisé")
-        route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
-        route = route.split("?")[0]
         if route == "/camera/scan":
             self._handle_camera_scan()
         elif route == "/alarmo/sensors":
