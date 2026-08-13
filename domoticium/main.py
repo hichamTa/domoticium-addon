@@ -7469,6 +7469,22 @@ if __name__ == "__main__":
     log("  DÉMARRAGE DOMOTICIUM")
     log("══════════════════════════════════════════════")
 
+    # Tout au début, avant Frigate/Zigbee2MQTT/Matter — idempotent, patch aussi les
+    # sites déjà provisionnés. Volontairement AVANT tout le reste (et pas à la fin,
+    # première version) : le redémarrage HA que ça peut déclencher la toute première
+    # fois doit être réglé avant que des étapes sensibles au timing ne commencent
+    # (appairage Zigbee/Matter en cours plus loin dans l'installation) plutôt que de
+    # risquer de tomber en plein milieu.
+    wait_for_ha()
+    if _ensure_ha_trusted_proxy():
+        log("[trusted-proxy] Redémarrage HA Core pour appliquer le nouveau réglage…")
+        try:
+            requests.post(f"{SUP}/homeassistant/restart",
+                          headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}, timeout=60)
+        except Exception as e:
+            warn(f"[trusted-proxy] Erreur restart HA : {e}")
+        wait_for_ha()
+
     # Écrire la config Frigate AVANT tout le reste.
     # Le prepare script Frigate copie /homeassistant/frigate.yml → addon_config privé
     # (/config/config.yml dans le conteneur Frigate) si ce dernier n'existe pas encore.
@@ -7490,17 +7506,5 @@ if __name__ == "__main__":
     _ensure_alarmo_night_mode()  # idempotent — active le mode nuit une fois par site
     _ensure_alarmo_area_name()  # idempotent — renomme la zone "Alarmo" → "Habitation"
     _ensure_z2m_availability()  # idempotent — patch les sites déjà provisionnés
-
-    # idempotent — patch les sites déjà provisionnés avant l'accès distant HA (Phase 2) ;
-    # ne redémarre HA que la toute première fois où le bloc est réellement ajouté (le
-    # réglage http.trusted_proxies n'est pas pris en compte sans redémarrage complet).
-    if _ensure_ha_trusted_proxy():
-        log("[trusted-proxy] Redémarrage HA Core pour appliquer le nouveau réglage…")
-        try:
-            requests.post(f"{SUP}/homeassistant/restart",
-                          headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}, timeout=60)
-        except Exception as e:
-            warn(f"[trusted-proxy] Erreur restart HA : {e}")
-        wait_for_ha()
 
     run_bridge()
