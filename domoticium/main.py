@@ -3240,6 +3240,51 @@ def remove_legacy_mqtt_discovery_prefix():
         warn(f"remove_legacy_mqtt_discovery_prefix: {e}")
 
 
+_HA_TRUSTED_PROXY_MARKER = "# domoticium-trusted-proxy"
+
+
+def _ensure_ha_trusted_proxy():
+    """Idempotent, tourne à chaque démarrage (patch aussi les sites déjà provisionnés
+    avant l'accès distant HA, Phase 2) : Home Assistant refuse par défaut les requêtes
+    venant d'un reverse proxy inconnu (cf. homeassistant.components.http.forwarded) —
+    depuis que le tunnel Cloudflare route désormais Home Assistant lui-même (racine du
+    hostname, plus seulement les caméras/l'addon), il faut déclarer 127.0.0.1 (là où
+    cloudflared se connecte) comme proxy de confiance, sinon 400 Bad Request systématique.
+    Erreur réelle observée en conditions réelles le 2026-08-13 : "A request from a
+    reverse proxy was received from 127.0.0.1, but your HTTP integration is not
+    set-up for reverse proxies" — jamais un problème avant ce jour car HA n'était
+    jusque-là jamais exposé derrière le tunnel, seulement les caméras et l'addon.
+    Ne touche jamais à un bloc "http:" déjà personnalisé par l'utilisateur — log
+    seulement, pour ne jamais corrompre une config existante qu'on ne maîtrise pas."""
+    main_cfg = "/homeassistant/configuration.yaml"
+    try:
+        with open(main_cfg) as f:
+            content = f.read()
+    except FileNotFoundError:
+        return False
+
+    if _HA_TRUSTED_PROXY_MARKER in content:
+        return False  # déjà fait
+
+    if re.search(r"(?m)^http:\s*$", content):
+        warn("[trusted-proxy] Un bloc 'http:' existe déjà dans configuration.yaml — "
+             "vérifier manuellement que use_x_forwarded_for/trusted_proxies (127.0.0.1) y figurent.")
+        return False
+
+    block = (
+        f"\n{_HA_TRUSTED_PROXY_MARKER} — requis pour l'accès distant technicien (Phase 2),"
+        " Home Assistant est désormais exposé (protégé par Cloudflare Access) via le tunnel\n"
+        "http:\n"
+        "  use_x_forwarded_for: true\n"
+        "  trusted_proxies:\n"
+        "    - 127.0.0.1\n"
+    )
+    with open(main_cfg, "a") as f:
+        f.write(block)
+    log("✓ configuration.yaml : proxy de confiance ajouté (127.0.0.1) pour l'accès distant HA")
+    return True
+
+
 def run_setup():
     wait_for_ha()
     log("═══ Début de la configuration Domoticium ═══")
@@ -7445,4 +7490,17 @@ if __name__ == "__main__":
     _ensure_alarmo_night_mode()  # idempotent — active le mode nuit une fois par site
     _ensure_alarmo_area_name()  # idempotent — renomme la zone "Alarmo" → "Habitation"
     _ensure_z2m_availability()  # idempotent — patch les sites déjà provisionnés
+
+    # idempotent — patch les sites déjà provisionnés avant l'accès distant HA (Phase 2) ;
+    # ne redémarre HA que la toute première fois où le bloc est réellement ajouté (le
+    # réglage http.trusted_proxies n'est pas pris en compte sans redémarrage complet).
+    if _ensure_ha_trusted_proxy():
+        log("[trusted-proxy] Redémarrage HA Core pour appliquer le nouveau réglage…")
+        try:
+            requests.post(f"{SUP}/homeassistant/restart",
+                          headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}, timeout=60)
+        except Exception as e:
+            warn(f"[trusted-proxy] Erreur restart HA : {e}")
+        wait_for_ha()
+
     run_bridge()
