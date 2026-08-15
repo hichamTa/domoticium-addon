@@ -5032,18 +5032,22 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
     lock = threading.Lock()
 
     def _probe(name: str):
-        # Caméra masquée (§93) : sonder le flux public {name} force toute la chaîne
-        # decode+drawbox+encode (§93/§94) juste pour vérifier une connectivité — trouvé
-        # en conditions réelles le 2026-08-15 (Hicham) : ~2.8s pour extraire une seule
-        # image sur une caméra masquée, contre le timeout de 6s de _go2rtc_probe_online
-        # — sous charge réelle (autre caméra en boucle de reconnexion, tunnel actif),
-        # ce délai est parfois dépassé et la caméra est déclarée à tort hors ligne alors
-        # qu'elle répond parfaitement. Sonder plutôt le flux brut {name}__raw (RTSP pur,
-        # sans transcodage) donne la même information de joignabilité réelle sans payer
-        # ce coût — le masquage lui-même n'a aucun rapport avec "la caméra répond-elle".
+        # ATTENTION : ne JAMAIS sonder {name}__raw directement pour une caméra masquée.
+        # Tenté le 2026-08-15 (v2.9.124) pour éviter le coût de transcodage du flux
+        # public (~2.8s, proche du timeout) — a réintroduit EXACTEMENT la collision
+        # RTSP déjà documentée (§76/77/69, HANDOFF) : cette sonde ouvre sa PROPRE
+        # connexion RTSP vers la caméra physique, qui peut entrer en collision avec la
+        # connexion déjà utilisée par le pipeline de masquage de Frigate — une caméra
+        # qui n'accepte qu'UNE connexion à la fois se déconnecte alors en boucle
+        # ("Connection reset by peer"), confirmé en conditions réelles le 2026-08-15
+        # (Hicham). Retour au flux public {name} : go2rtc réutilise la connexion RTSP
+        # déjà active du pipeline de masquage plutôt que d'en ouvrir une nouvelle,
+        # aucun risque de collision — seul reste le coût de transcodage, compensé par
+        # un timeout plus généreux pour les caméras masquées (au lieu d'inventer un
+        # raccourci qui casse la caméra qu'il est censé vérifier).
         mask_rects = _camera_masks.get(name) or []
-        probe_target = f"{name}__raw" if mask_rects else name
-        online = _go2rtc_probe_online(probe_target)
+        probe_timeout = 12.0 if mask_rects else 6.0
+        online = _go2rtc_probe_online(name, timeout=probe_timeout)
         with lock:
             result[name] = online
 
@@ -5058,7 +5062,11 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=8.0)
+        # >= le plus long des deux timeouts possibles dans _probe (12s pour une caméra
+        # masquée) + marge — sinon un probe masqué qui aurait fini par réussir est
+        # abandonné ici avant d'avoir pu écrire son résultat, et compté à tort "hors
+        # ligne" par le résultat par défaut de probed.get(name, False) chez l'appelant.
+        t.join(timeout=14.0)
     return result
 
 
