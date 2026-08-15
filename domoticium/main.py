@@ -1464,21 +1464,24 @@ def _generate_frigate_yaml() -> str:
         for name, rtsp_url in _cameras.items():
             # `detect`/`record` sont désactivés (aucune détection IA ni enregistrement
             # côté Frigate, l'app n'utilise que go2rtc pour le direct) — mais un input
-            # `roles: [detect]`, même avec detect.enabled=false, faisait tourner en
-            # PERMANENCE un processus ffmpeg de capture (confirmé : `detect.enabled`
-            # ne fait que désactiver l'ANALYSE IA des images, pas la lecture continue
-            # du flux par Frigate lui-même). Ce processus plantait en boucle toutes les
-            # ~40s (trouvé en conditions réelles le 2026-08-15, indépendant du
-            # masquage — testé et confirmé en pointant sur le flux brut, même résultat)
-            # — pure charge et instabilité pour une fonctionnalité jamais utilisée.
-            # Confirmé dans le code source Frigate (camera/camera.py) : le rôle
-            # `detect` n'est PAS obligatoire pour qu'une caméra soit valide — retiré
-            # entièrement. Seul le bloc `onvif:` ci-dessous reste nécessaire (PTZ,
-            # contrôleur natif Frigate/MQTT, §61).
+            # `roles: [detect]`, même avec detect.enabled=false, reste nécessaire :
+            # retiré entièrement le 2026-08-15 en pensant (à tort) que ce pipeline
+            # "detect" inutilisé causait les coupures vidéo — vraie cause trouvée
+            # ailleurs et corrigée (redémarrage forcé de go2rtc, cf. GO2RTC_API_BASE)
+            # sans lien avec ce réglage. Retirer entièrement `ffmpeg.inputs` a cassé
+            # le PTZ (confirmé en conditions réelles) : le contrôleur ONVIF de Frigate
+            # dépend de structures internes (`ptz_metrics`) peuplées par le thread de
+            # capture de la caméra, qui ne démarre jamais sans input ffmpeg. Remis à
+            # l'état confirmé fonctionnel (§61) : un input pointé sur le flux MASQUÉ
+            # {name} (restream interne go2rtc, 127.0.0.1:8554, aucune 2e connexion
+            # physique vers la caméra).
             lines += [
                 f"  {name}:",
                 "    ffmpeg:",
-                "      inputs: []",
+                "      inputs:",
+                f"        - path: rtsp://127.0.0.1:8554/{name}",
+                "          roles:",
+                "            - detect",
                 "    detect:",
                 "      enabled: false",
                 "    record:",
