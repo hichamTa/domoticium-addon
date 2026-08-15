@@ -5021,7 +5021,18 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
     lock = threading.Lock()
 
     def _probe(name: str):
-        online = _go2rtc_probe_online(name)
+        # Caméra masquée (§93) : sonder le flux public {name} force toute la chaîne
+        # decode+drawbox+encode (§93/§94) juste pour vérifier une connectivité — trouvé
+        # en conditions réelles le 2026-08-15 (Hicham) : ~2.8s pour extraire une seule
+        # image sur une caméra masquée, contre le timeout de 6s de _go2rtc_probe_online
+        # — sous charge réelle (autre caméra en boucle de reconnexion, tunnel actif),
+        # ce délai est parfois dépassé et la caméra est déclarée à tort hors ligne alors
+        # qu'elle répond parfaitement. Sonder plutôt le flux brut {name}__raw (RTSP pur,
+        # sans transcodage) donne la même information de joignabilité réelle sans payer
+        # ce coût — le masquage lui-même n'a aucun rapport avec "la caméra répond-elle".
+        mask_rects = _camera_masks.get(name) or []
+        probe_target = f"{name}__raw" if mask_rects else name
+        online = _go2rtc_probe_online(probe_target)
         with lock:
             result[name] = online
 
