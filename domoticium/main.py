@@ -55,6 +55,11 @@ SUPABASE_ANON_KEY   = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmF
 # plus de broker cloud, Vercel appelle ce serveur en HTTPS, authentifié par INGEST_SECRET.
 COMMAND_PORT = 8098
 
+# Proxy local (127.0.0.1 uniquement) retirant le préfixe /cameras avant de relayer vers
+# go2rtc — voir _Go2rtcProxyHandler. L'ingress Cloudflare du tunnel pour /cameras doit
+# pointer ici plutôt que directement sur 1984.
+GO2RTC_PROXY_PORT = 8099
+
 # Mode réseau (PoE) ou USB
 NETWORK_MODE = bool(COORDINATOR_HOST)
 
@@ -120,13 +125,17 @@ FRIGATE_SLUG   = "582436be_frigate"
 # dépôt (sha1(url)[:8] + "_" + slug interne) : changer de dépôt change donc le slug
 # installé, d'où la migration one-shot ci-dessous (_migrate_frigate_repo_once).
 OLD_FRIGATE_SLUG = "ccab4aaf_frigate"
-# go2rtc sert désormais son API sous /cameras (api.base_path, v2.9.123) — nécessaire
-# pour que Cloudflare Tunnel (qui ne retire jamais le préfixe de chemin transmis à
-# l'origine) puisse l'atteindre depuis l'extérieur. Effet de bord trouvé le 2026-08-15 :
-# go2rtc n'accepte alors PLUS ses propres routes SANS ce préfixe, y compris pour nos
-# appels internes directs (127.0.0.1, jamais passés par le tunnel) — d'où ce préfixe
-# obligatoire ici aussi. Toujours utiliser cette constante, jamais une URL 1984 en dur.
-GO2RTC_API_BASE = "http://127.0.0.1:1984/cameras"
+# go2rtc reste nu (pas de base_path) — voir _Go2rtcProxyHandler plus bas : le préfixe
+# /cameras exigé par Cloudflare Tunnel (qui ne retire jamais le préfixe transmis à
+# l'origine) est retiré par un petit proxy local dédié, PAS par go2rtc lui-même.
+# Historique (v2.9.123→129, 2026-08-15) : mettre base_path directement sur go2rtc a bien
+# réglé l'accès externe, mais a aussi rendu sourd le healthcheck INTERNE de go2rtc/Frigate
+# (intégré à l'image Docker Frigate, hors de notre contrôle — ping en dur sur /api/streams
+# SANS préfixe) → 404 systématique → redémarrage forcé de go2rtc toutes les ~30-40s →
+# coupure vidéo en boucle (cause racine des déconnexions caméra signalées ce soir-là,
+# confirmée dans les logs Frigate). D'où ce constant qui reste bare : nos appels internes
+# (127.0.0.1, jamais passés par le tunnel) parlent directement à go2rtc sans préfixe.
+GO2RTC_API_BASE = "http://127.0.0.1:1984"
 MOSQUITTO_SLUG = "core_mosquitto"
 MOSQUITTO_USER = "domoticium"
 
@@ -1382,19 +1391,10 @@ def _generate_frigate_yaml() -> str:
         # implicite plutôt que de continuer à en deviner la raison exacte.
         lines.append("  api:")
         lines.append('    origin: "*"')
-        # base_path: "/cameras" — cause racine trouvée le 2026-08-15 (Hicham a eu raison
-        # de pointer vers la restructuration du tunnel du 13 août) : depuis que le
-        # chemin /cameras existe (§199, ajouté pour laisser la racine du tunnel à Home
-        # Assistant), Cloudflare Tunnel transmet le chemin COMPLET à l'origine
-        # (ex. "/cameras/api/ws") — les tunnels Cloudflare ne réécrivent/ne retirent
-        # jamais le préfixe de chemin. go2rtc, qui n'attend que "/api/ws" à la racine,
-        # répondait donc systématiquement 404 "page not found" à toute requête de
-        # l'app web (masqué pendant 2 jours : personne n'avait retesté les caméras
-        # depuis cette migration jusqu'au test de ce soir). Ce réglage go2rtc natif
-        # (documenté go2rtc.org) fait reconnaître et retirer ce préfixe en interne —
-        # aucun changement nécessaire côté tunnel ou côté app web (camerasUrl garde
-        # son suffixe /cameras, cohérent des deux côtés).
-        lines.append('    base_path: "/cameras"')
+        # PAS de base_path ici — voir GO2RTC_API_BASE et _Go2rtcProxyHandler : le
+        # retrait du préfixe /cameras (exigé par Cloudflare Tunnel côté externe) se fait
+        # dans un proxy local dédié, pas dans go2rtc lui-même (base_path cassait le
+        # healthcheck interne de Frigate, cf. commentaire GO2RTC_API_BASE plus haut).
         # Format ffmpeg personnalisé pour la conversion audio d'écoute (§79-§82) —
         # défini UNE FOIS ici, appliqué à toutes les caméras indifféremment de leur
         # matériel. Ne PAS coller ce réglage aux caractéristiques d'une caméra
@@ -7432,6 +7432,123 @@ def run_command_server():
         warn(f"[cmd-server] Erreur fatale : {e}")
 
 
+_GO2RTC_UPSTREAM_ADDR = ("127.0.0.1", 1984)
+_GO2RTC_PROXY_PREFIX = "/cameras"
+
+
+def _read_http_head(sock: socket.socket) -> bytes:
+    """Lit depuis le socket jusqu'à la fin des en-têtes HTTP (\\r\\n\\r\\n inclus), en
+    gardant tout ce qui a été lu au-delà (début du corps déjà arrivé sur le fil)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return buf
+        buf += chunk
+        if len(buf) > 65536:
+            break
+    return buf
+
+
+def _rewrite_go2rtc_head(head: bytes):
+    """Retire le préfixe /cameras de la ligne de requête avant de relayer vers go2rtc
+    (qui ne connaît que ses routes nues). Force aussi Connection: close sur les requêtes
+    HTTP classiques — une connexion gardée en vie (keep-alive) pourrait servir une 2e
+    requête à un chemin différent que notre relecture ne reverrait jamais (on ne lit que
+    la 1ère ligne de chaque connexion) ; en HTTP simple ça coûte juste une reconnexion TCP
+    locale, négligeable. Exception : les upgrades WebSocket (signalisation WebRTC),
+    qui doivent rester ouverts — on n'y touche pas."""
+    sep = b"\r\n\r\n"
+    idx = head.find(sep)
+    head_part, body_start = (head[:idx], head[idx + 4:]) if idx != -1 else (head, b"")
+    request_lines = head_part.split(b"\r\n")
+    try:
+        method, path, proto = request_lines[0].decode("latin-1").split(" ", 2)
+    except ValueError:
+        return head, False
+    if path.startswith(_GO2RTC_PROXY_PREFIX):
+        path = path[len(_GO2RTC_PROXY_PREFIX):] or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+    request_lines[0] = f"{method} {path} {proto}".encode("latin-1")
+    is_websocket = any(
+        line.lower().startswith(b"upgrade:") and b"websocket" in line.lower()
+        for line in request_lines[1:]
+    )
+    if not is_websocket:
+        request_lines = [line for line in request_lines if not line.lower().startswith(b"connection:")]
+        request_lines.append(b"Connection: close")
+    return b"\r\n".join(request_lines) + sep + body_start, is_websocket
+
+
+def _pipe_bytes(src: socket.socket, dst: socket.socket):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+class _Go2rtcProxyHandler(socketserver.BaseRequestHandler):
+    """Retire le préfixe /cameras (imposé par le tunnel Cloudflare, qui ne réécrit
+    jamais les chemins transmis à l'origine) puis relaie tel quel vers go2rtc
+    (127.0.0.1:1984, nu). Nécessaire car mettre ce préfixe directement dans go2rtc
+    (api.base_path) casse son propre healthcheck interne — cf. GO2RTC_API_BASE."""
+
+    def handle(self):
+        client_sock = self.request
+        upstream = None
+        try:
+            client_sock.settimeout(10)
+            head = _read_http_head(client_sock)
+            if not head:
+                return
+            new_head, _is_websocket = _rewrite_go2rtc_head(head)
+            upstream = socket.create_connection(_GO2RTC_UPSTREAM_ADDR, timeout=10)
+            upstream.sendall(new_head)
+            client_sock.settimeout(None)
+            upstream.settimeout(None)
+            t = threading.Thread(target=_pipe_bytes, args=(client_sock, upstream), daemon=True)
+            t.start()
+            _pipe_bytes(upstream, client_sock)
+            t.join(timeout=5)
+        except OSError:
+            pass
+        except Exception as e:
+            warn(f"[go2rtc-proxy] {e}")
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+
+def run_go2rtc_prefix_proxy():
+    """Proxy local (127.0.0.1 uniquement) — ingress Cloudflare pour /cameras doit
+    pointer ici (127.0.0.1:GO2RTC_PROXY_PORT), pas directement sur go2rtc:1984."""
+    try:
+        server = _ReusableTCPServer(("127.0.0.1", GO2RTC_PROXY_PORT), _Go2rtcProxyHandler)
+        server.daemon_threads = True
+        log(f"[go2rtc-proxy] ✓ Proxy /cameras actif sur 127.0.0.1:{GO2RTC_PROXY_PORT} → 127.0.0.1:1984")
+        server.serve_forever()
+    except Exception as e:
+        warn(f"[go2rtc-proxy] Erreur fatale : {e}")
+
+
 def _turn_refresh_loop():
     """Rafraîchit les identifiants TURN Cloudflare avant leur expiration (48h max) et
     redémarre Frigate pour que go2rtc les recharge. Nouvel essai dans 5 min si le
@@ -7484,6 +7601,8 @@ def run_bridge():
     threading.Thread(target=_flush_state_batch,      daemon=True).start()
     # Watchdog caméras : sonde go2rtc toutes les 60s, deltas envoyés dans le batch
     threading.Thread(target=_run_camera_watchdog,    daemon=True).start()
+    # Proxy /cameras → go2rtc (retire le préfixe imposé par le tunnel Cloudflare)
+    threading.Thread(target=run_go2rtc_prefix_proxy, daemon=True).start()
 
     # Serveur de commandes — bloquant, tourne dans le thread principal
     run_command_server()
