@@ -1375,6 +1375,19 @@ def _generate_frigate_yaml() -> str:
         # implicite plutôt que de continuer à en deviner la raison exacte.
         lines.append("  api:")
         lines.append('    origin: "*"')
+        # base_path: "/cameras" — cause racine trouvée le 2026-08-15 (Hicham a eu raison
+        # de pointer vers la restructuration du tunnel du 13 août) : depuis que le
+        # chemin /cameras existe (§199, ajouté pour laisser la racine du tunnel à Home
+        # Assistant), Cloudflare Tunnel transmet le chemin COMPLET à l'origine
+        # (ex. "/cameras/api/ws") — les tunnels Cloudflare ne réécrivent/ne retirent
+        # jamais le préfixe de chemin. go2rtc, qui n'attend que "/api/ws" à la racine,
+        # répondait donc systématiquement 404 "page not found" à toute requête de
+        # l'app web (masqué pendant 2 jours : personne n'avait retesté les caméras
+        # depuis cette migration jusqu'au test de ce soir). Ce réglage go2rtc natif
+        # (documenté go2rtc.org) fait reconnaître et retirer ce préfixe en interne —
+        # aucun changement nécessaire côté tunnel ou côté app web (camerasUrl garde
+        # son suffixe /cameras, cohérent des deux côtés).
+        lines.append('    base_path: "/cameras"')
         # Format ffmpeg personnalisé pour la conversion audio d'écoute (§79-§82) —
         # défini UNE FOIS ici, appliqué à toutes les caméras indifféremment de leur
         # matériel. Ne PAS coller ce réglage aux caractéristiques d'une caméra
