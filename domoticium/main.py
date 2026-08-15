@@ -1462,11 +1462,26 @@ def _generate_frigate_yaml() -> str:
         lines.append("")
         lines.append("cameras:")
         for name, rtsp_url in _cameras.items():
+            # `detect`/`record` sont désactivés (aucune détection IA ni enregistrement
+            # côté Frigate, l'app n'utilise que go2rtc pour le direct) — mais Frigate
+            # exige quand même un input `roles: [detect]` pour qu'une caméra soit
+            # valide dans son propre schéma, donc il maintient une connexion même
+            # inutilisée. Pointer cet input sur le flux MASQUÉ {name} n'a plus de sens
+            # depuis §93 (rien n'est vu ni enregistré ici, l'obligation de masquage ne
+            # s'applique pas) — trouvé en conditions réelles le 2026-08-15 : ce
+            # deuxième consommateur, simultané à celui du navigateur, du même pipeline
+            # de masquage go2rtc (exec ffmpeg) déstabilisait les deux (plantages en
+            # boucle ~40s côté Frigate, coupures de connexion côté navigateur). Pointer
+            # sur le flux brut {name}__raw pour les caméras masquées à la place — même
+            # restream interne go2rtc (127.0.0.1:8554), zéro coût de transcodage, zéro
+            # second consommateur du pipeline de masquage.
+            mask_rects = _camera_masks.get(name) or []
+            detect_source = f"{name}__raw" if mask_rects else name
             lines += [
                 f"  {name}:",
                 "    ffmpeg:",
                 "      inputs:",
-                f"        - path: rtsp://127.0.0.1:8554/{name}",
+                f"        - path: rtsp://127.0.0.1:8554/{detect_source}",
                 "          roles:",
                 "            - detect",
                 "    detect:",
