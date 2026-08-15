@@ -3409,8 +3409,12 @@ def _go2rtc_probe_online(name: str, timeout: float = 6.0) -> bool:
             params={"src": name},
             timeout=timeout,
         )
-        return r.ok and r.headers.get("Content-Type", "").startswith("image")
-    except Exception:
+        ok = r.ok and r.headers.get("Content-Type", "").startswith("image")
+        if not ok:
+            warn(f"[watchdog-probe] {name}: HTTP {r.status_code} Content-Type={r.headers.get('Content-Type')!r} body[:150]={r.text[:150]!r}")
+        return ok
+    except Exception as e:
+        warn(f"[watchdog-probe] {name}: exception {type(e).__name__}: {e}")
         return False
 
 
