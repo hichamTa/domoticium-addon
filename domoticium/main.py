@@ -120,6 +120,13 @@ FRIGATE_SLUG   = "582436be_frigate"
 # dépôt (sha1(url)[:8] + "_" + slug interne) : changer de dépôt change donc le slug
 # installé, d'où la migration one-shot ci-dessous (_migrate_frigate_repo_once).
 OLD_FRIGATE_SLUG = "ccab4aaf_frigate"
+# go2rtc sert désormais son API sous /cameras (api.base_path, v2.9.123) — nécessaire
+# pour que Cloudflare Tunnel (qui ne retire jamais le préfixe de chemin transmis à
+# l'origine) puisse l'atteindre depuis l'extérieur. Effet de bord trouvé le 2026-08-15 :
+# go2rtc n'accepte alors PLUS ses propres routes SANS ce préfixe, y compris pour nos
+# appels internes directs (127.0.0.1, jamais passés par le tunnel) — d'où ce préfixe
+# obligatoire ici aussi. Toujours utiliser cette constante, jamais une URL 1984 en dur.
+GO2RTC_API_BASE = "http://127.0.0.1:1984/cameras"
 MOSQUITTO_SLUG = "core_mosquitto"
 MOSQUITTO_USER = "domoticium"
 
@@ -3373,7 +3380,7 @@ def _go2rtc_upsert_stream(name: str, rtsp_url: str, timeout: float = 5.0) -> boo
     restart complet de l'add-on Frigate."""
     try:
         r = requests.put(
-            "http://127.0.0.1:1984/api/streams",
+            f"{GO2RTC_API_BASE}/api/streams",
             params={"name": name, "src": rtsp_url},
             timeout=timeout,
         )
@@ -3387,7 +3394,7 @@ def _go2rtc_remove_stream(name: str, timeout: float = 5.0) -> bool:
     """Retire un flux go2rtc à chaud (API DELETE /api/streams)."""
     try:
         r = requests.delete(
-            "http://127.0.0.1:1984/api/streams",
+            f"{GO2RTC_API_BASE}/api/streams",
             params={"src": name},
             timeout=timeout,
         )
@@ -3405,7 +3412,7 @@ def _go2rtc_probe_online(name: str, timeout: float = 6.0) -> bool:
     (le champ producer 'state' n'apparaît que pendant une connexion active)."""
     try:
         r = requests.get(
-            "http://127.0.0.1:1984/api/frame.jpeg",
+            f"{GO2RTC_API_BASE}/api/frame.jpeg",
             params={"src": name},
             timeout=timeout,
         )
@@ -4982,7 +4989,7 @@ def _go2rtc_active_consumers() -> dict[str, bool]:
     ouverte) les flux ayant au moins un consommateur actif (quelqu'un regarde le direct
     en ce moment — HLS/WebRTC). Retourne {stream_name: bool}."""
     try:
-        r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
+        r = requests.get(f"{GO2RTC_API_BASE}/api/streams", timeout=5)
         if not r.ok:
             return {}
         return {name: bool((info or {}).get("consumers")) for name, info in r.json().items()}
@@ -6032,7 +6039,7 @@ def _go2rtc_stream_already_persisted(name: str, rtsp_url: str) -> bool:
     cf. code source internal/streams/stream.go MarshalJSON/producer.go). Best-effort :
     toute erreur renvoie False (traité comme "pas encore synchronisé" par l'appelant)."""
     try:
-        r = requests.get("http://127.0.0.1:1984/api/streams", timeout=5)
+        r = requests.get(f"{GO2RTC_API_BASE}/api/streams", timeout=5)
         if not r.ok:
             return False
         stream = r.json().get(name)
