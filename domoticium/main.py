@@ -3129,6 +3129,54 @@ def _remove_legacy_heartbeat_automation_once():
     open(_LEGACY_HEARTBEAT_AUTO_MARKER, "w").close()
 
 
+_SITE_LOCATION_REPORTED_MARKER = "/data/.site_location_reported"
+
+
+def _report_site_location_once():
+    """Reporte une seule fois à Supabase les coordonnées du logement (lat/lon/
+    altitude), lues depuis la config Home Assistant elle-même (zone "home",
+    quasi toujours déjà réglée dès la première installation) — pour la météo
+    réelle sur l'Accueil (2026-08-18), plutôt que de géocoder l'adresse texte
+    du site. Idempotent via marker, retente à chaque démarrage tant qu'un appel
+    a échoué (même convention que _enable_watchdogs_once)."""
+    if os.path.exists(_SITE_LOCATION_REPORTED_MARKER):
+        return
+    try:
+        r = ha_get("/config")
+        if not r.ok:
+            warn(f"[site-location] GET /config : HTTP {r.status_code}")
+            return
+        cfg = r.json()
+        lat, lon = cfg.get("latitude"), cfg.get("longitude")
+        elevation = cfg.get("elevation")
+        if lat is None or lon is None:
+            warn("[site-location] latitude/longitude absentes de la config HA — zone \"home\" non réglée")
+            return
+    except Exception as e:
+        warn(f"[site-location] lecture config HA : {e}")
+        return
+
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:site_location:{lat}:{lon}:{elevation if elevation is not None else 'null'}"
+        payload = {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_latitude": lat, "p_longitude": lon,
+        }
+        if elevation is not None:
+            payload["p_elevation"] = elevation
+        resp = _supabase_rpc("pi_report_site_location", payload)
+        if resp.status_code >= 300:
+            warn(f"[site-location] pi_report_site_location {resp.status_code}: {resp.text[:120]}")
+            return
+        log(f"[site-location] ✓ coordonnées reportées ({lat}, {lon})")
+    except Exception as e:
+        warn(f"[site-location] envoi Supabase : {e}")
+        return
+
+    open(_SITE_LOCATION_REPORTED_MARKER, "w").close()
+
+
 _WATCHDOG_ENABLED_MARKER = "/data/.watchdog_enabled"
 
 
@@ -7589,6 +7637,7 @@ def run_bridge():
     threading.Thread(target=_remove_legacy_heartbeat_automation_once, daemon=True).start()
     threading.Thread(target=_remove_legacy_rest_commands_once, daemon=True).start()
     threading.Thread(target=_enable_watchdogs_once, daemon=True).start()
+    threading.Thread(target=_report_site_location_once, daemon=True).start()
     threading.Thread(target=_reenable_frigate_watchdog_if_needed, daemon=True).start()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
