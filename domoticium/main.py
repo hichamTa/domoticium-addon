@@ -3919,12 +3919,7 @@ def _matter_remove_node(node_id: int) -> bool:
 # comparée entrée par entrée, pas une estimation). Un type absent d'ici ne casse
 # rien : _extract_matter_device_info() retombe sur "sensor-generic" (lecture
 # seule, jamais un faux actionneur — cf. commentaire plus bas, ancien comportement
-# "switch par défaut" corrigé début août). Cette liste couvre tout ce qui rentre
-# dans nos catégories DÉJÀ modélisées ; les device types Matter correspondant à
-# des catégories qu'on ne modélise pas encore (aspirateur robot, détecteur fumée/
-# CO, électroménager, borne de recharge VE, chauffe-eau, télécommande/bouton
-# scène…) sont volontairement laissés de côté ici — décision produit à prendre
-# avec Hicham avant d'ajouter de nouveaux DeviceType, pas un oubli technique.
+# "switch par défaut" corrigé début août).
 _MATTER_DEVICE_TYPES = {
     0x0100: "light", 0x0101: "light", 0x010C: "light", 0x010D: "light",  # On/Off, Dimmable, Color Temp, Extended Color Light
     0x0103: "switch",                                      # On/Off Light Switch
@@ -3948,6 +3943,39 @@ _MATTER_DEVICE_TYPES = {
     0x0510: "energy-meter",                                 # Electrical Sensor
     0x0511: "energy-meter",                                 # Electrical Utility Meter
     0x0514: "energy-meter",                                 # Electrical Meter
+    # Solaire/batterie domestique — HA modélise ces clusters directement en
+    # sensor, sans traitement spécifique par device type (confirmé source HA
+    # matter/sensor.py, 2026-08-19) ; nos catégories les plus proches restent des
+    # mesures de production/stockage électrique, cf. "energy-meter". Nuance
+    # documentée : un panneau solaire mesure de la PRODUCTION, pas de la
+    # consommation — le calcul d'empreinte carbone du panneau Énergie
+    # (DashboardCanvas) n'a de sens que pour un vrai compteur de consommation,
+    # à garder en tête si un client en installe un.
+    0x0017: "energy-meter",                                 # Solar Power
+    0x0018: "energy-meter",                                 # Battery Storage
+    0x0076: "smoke-co",                                     # Smoke CO Alarm
+    0x0074: "vacuum",                                       # Robotic Vacuum Cleaner (HA "vacuum" domain confirmé,
+                                                             # homeassistant/core matter/vacuum.py)
+    0x050C: "evse",                                         # Energy EVSE (ID vérifié directement dans matter-devices.xml)
+    # Famille électroménager — HA modélise le contrôle marche/arrêt en simple
+    # switch pour CES types précisément (confirmé source HA matter/switch.py,
+    # schéma MatterPowerToggle explicite pour ces 8 device types) ; l'état
+    # opérationnel/mode détaillé (en cours, programme, alarme porte…) arrive
+    # séparément en entité secondaire générique (sensor/select/binary_sensor),
+    # déjà géré par le mécanisme device_entities existant — pas besoin d'un
+    # DeviceType dédié par appareil.
+    0x0075: "switch",                                       # Dishwasher
+    0x007B: "switch",                                       # Oven
+    0x0070: "switch",                                       # Refrigerator
+    0x0073: "switch",                                       # Laundry Washer
+    0x007C: "switch",                                       # Laundry Dryer
+    0x007A: "switch",                                       # Extractor Hood
+    0x0078: "switch",                                       # Cooktop
+    0x0077: "switch",                                       # Cook Surface
+    # Microwave Oven (0x0079) et Temperature Controlled Cabinet (0x0071) : PAS
+    # dans le schéma MatterPowerToggle confirmé côté HA — pas assez de certitude
+    # pour les classer "switch" sans risquer un faux contrôle, retombent sciemment
+    # en sensor-generic jusqu'à vérification avec un vrai appareil.
 }
 
 # Compteurs d'énergie généraux Zigbee pré-configurés (tête de tableau électrique,
@@ -4905,6 +4933,18 @@ def _ha_state_to_normalized(entity_id: str, state: str) -> dict:
         return {"on": state == "locked", "lockState": state}
     if domain == "valve":
         return {"on": state not in ("closed", "unavailable")}
+    # §2026-08-19 — select (fil pilote) : le state HA d'une entité select EST
+    # l'option actuellement choisie (ex: "eco"/"comfort"/"off"), à l'identique du
+    # pattern déjà utilisé pour climate.hvac_mode ci-dessus. On dérive aussi un
+    # "on" indicatif (frost_protection/off = pas en train de chauffer) — utile
+    # pour de futures règles de suggestion, cette catégorie n'étant pas un
+    # actionneur simple ailleurs dans l'app.
+    if domain == "select":
+        return {"pilotWireMode": state, "on": state not in ("off", "frost_protection")}
+    # §2026-08-19 — vacuum : le state HA EST déjà le VacuumActivity normalisé
+    # (cleaning/docked/idle/paused/returning/error), vérifié doc HA officielle.
+    if domain == "vacuum":
+        return {"vacuumState": state}
     return {"on": state == "on"}
 
 
@@ -4951,6 +4991,16 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
             # usages), mieux qu'un state.power vide.
             elif dc in ("power", "apparent_power"): result["power"] = val
             elif dc == "energy": result["energy"] = val
+            # §2026-08-19 — utility-meter (gaz/eau, PAS électrique) : HA n'a pas de
+            # device_class dédié "heat"/chauffage collectif (vérifié doc HA
+            # SensorDeviceClass officielle) — un compteur de calories remonterait
+            # sous "energy" comme n'importe quel appareil électrique, indistinguable
+            # ici ; seuls gas/water ont un device_class propre et sans ambiguïté.
+            elif dc in ("gas", "water"):
+                result["utilityReading"] = val
+                unit = attrs.get("unit_of_measurement")
+                if isinstance(unit, str):
+                    result["utilityUnit"] = unit
             else: result["value"] = val
         return result
 
@@ -4963,6 +5013,15 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
             result["contact"] = (not is_on) if is_on is not None else None
         elif dc == "moisture":
             result["waterLeak"] = is_on  # HA: on = fuite détectée
+        # §2026-08-19 — smoke-co : device_class "gas" (fuite de gaz naturel/méthane,
+        # distincte de "carbon_monoxide") repliée sur le même champ state.co par
+        # simplification volontaire (cf. commentaire types/index.ts) — un vrai
+        # 3e champ dédié serait plus exact mais plus de complexité pour un premier
+        # jet, aucun device de ce type installé chez un client à ce jour.
+        elif dc == "smoke":
+            result["smoke"] = is_on
+        elif dc in ("carbon_monoxide", "gas"):
+            result["co"] = is_on
         return result
 
     if domain == "climate":
@@ -5680,6 +5739,50 @@ def _detect_device_type(
     if "climate" in types or "thermostat" in types: return "thermostat"
     if "lock" in types: return "lock"
     if "fan" in types: return "fan"
+    # "valve" existe comme type Z2M standard mais AUCUN device du catalogue actuel
+    # (4436 réels, audit 2026-08-19) ne l'utilise au niveau top-level — gardé par
+    # sécurité/cohérence avec notre propre DeviceType "valve", coûte rien.
+    if "valve" in types: return "valve"
+    # Vannes d'irrigation/gaz Tuya — jamais de type "valve"/"cover" standard chez
+    # Z2M pour ces modèles (exposes tout en binary/numeric/enum custom), donc
+    # identification par (vendor, model), même principe que les compteurs
+    # d'énergie. Repérés lors de l'audit du 2026-08-19 : GIEX QT06 (1 vanne,
+    # expose "state"), GIEX GX03 (2 vannes indépendantes, "valve_1"/"valve_2" —
+    # seule la 1ère devient l'état principal, la 2e reste visible en entité
+    # secondaire générique comme tout device multi-mesures), QOTO QT-05M
+    # ("valve_state"), ShinaSystem GCM-300Z (vanne de coupure GAZ, pas eau —
+    # même sémantique ouverte/fermée, "gas_valve_state").
+    if vendor and model and (vendor.strip(), model.strip()) in {
+        ("GIEX", "QT06_1"), ("GIEX", "QT06_2"), ("GIEX", "GX03"),
+        ("QOTO", "QT-05M"), ("ShinaSystem", "GCM-300Z"),
+    }:
+        return "valve"
+    # Chauffage fil pilote français (standard 6 fils, Legrand/NodOn confirmés dans
+    # le code source zigbee-herdsman-converters, 2026-08-19) — signal exact et
+    # sans ambiguïté, jamais utilisé pour autre chose.
+    if "pilot_wire_mode" in names: return "heating-relay"
+    # Détecteur fumée/CO/gaz — enjeu sécurité, sémantique dédiée (cf. types/index.ts).
+    # Noms trouvés en conditions réelles à l'audit : "smoke" (Xiaomi JTYJ-GD-01LM/BW,
+    # Slacky-DIY, Aqara JY-GZ-01AQ), "gas" (Aqara JT-BZ-01AQ/A — détecteur de gaz
+    # naturel/méthane, pas CO — replié sur le même champ state.co par simplicité,
+    # cf. commentaire types/index.ts), "carbon_monoxide"/"co" (eWeLink
+    # CK-TLSR8656-SS5-01(7037)).
+    if any(n in ("smoke", "gas", "carbon_monoxide", "co") for n in names): return "smoke-co"
+    # Chargeur de véhicule électrique — un seul device Zigbee réel trouvé à l'audit
+    # (Futurehome Charge), identification par vendor/model comme les autres cas
+    # sans signal exposes générique.
+    if vendor and model and (vendor.strip(), model.strip()) == ("Futurehome", "Charge"):
+        return "evse"
+    # Compteurs d'utilité NON électriques (gaz/eau/chaleur par comptage
+    # d'impulsions) — Develco ZHEMI101 (gaz+eau+chauffage, exposes "gas"/
+    # "water_consumed"/"flow" en plus d'"energy" — un vrai compteur multi-fluide,
+    # classé ici plutôt qu'"energy-meter" car son usage principal chez un client
+    # est le suivi gaz/eau, pas électrique), Tuya TS0601_heat_meter (chauffage
+    # collectif/calories, "cumulative_heat"/"water_consumed").
+    if vendor and model and (vendor.strip(), model.strip()) in {
+        ("Develco", "ZHEMI101"), ("Tuya", "TS0601_heat_meter"),
+    }:
+        return "utility-meter"
     # Présence (radar mmWave) traité comme "motion" — audit complet du catalogue
     # Zigbee2MQTT le 2026-08-19 (4436 devices réels, zigbee-herdsman-converters,
     # pas un échantillon) : 45+ capteurs de présence radar réels et vendus
@@ -6459,6 +6562,13 @@ ALLOWED_SERVICES = {
     "fan":           {"turn_on", "turn_off", "toggle", "set_percentage"},
     "valve":         {"open_valve", "close_valve", "stop_valve", "set_valve_position", "toggle"},
     "humidifier":    {"turn_on", "turn_off", "toggle", "set_humidity"},
+    # Ajouté 2026-08-19 pour le chauffage fil pilote (heating-relay) — le service
+    # générique existe déjà côté web (entityCommand.ts, command "select", construit
+    # pour les entités secondaires §161) mais n'était jamais whitelisté ici pour une
+    # entité PRINCIPALE : un select en entité primaire (pilot_wire_mode) n'existait
+    # pas avant ce type. Service standard HA, un seul nom quel que soit le domaine
+    # d'origine du device.
+    "select":        {"select_option"},
     "media_player":  {"turn_on", "turn_off", "volume_set", "media_play", "media_pause"},
     "homeassistant": {"turn_on", "turn_off", "toggle"},
     "scene":         {"turn_on"},
