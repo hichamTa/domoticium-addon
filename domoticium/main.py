@@ -3974,6 +3974,38 @@ _ENERGY_METER_VENDOR_MODELS = {
     # code source (à confirmer si un client en installe une).
     ("BITUO TECHNIK", "SPM01-U00"), ("BITUO TECHNIK", "SPM01-U02"),
     ("BITUO TECHNIK", "SDM02-U00"), ("BITUO TECHNIK", "SDM02-U02"),
+    ("BITUO TECHNIK", "SPM02-U02"),   # variante manquée à l'ajout initial, trouvée à l'audit
+
+    # ── Ajouts issus de l'audit complet du catalogue Zigbee2MQTT (2026-08-19,
+    # zigbee-herdsman-converters@26.98.0, 4436 devices réels analysés un par un,
+    # pas un échantillon). Uniquement des appareils dont les exposes sont
+    # PUREMENT de la mesure électrique (power/energy/voltage/current et leurs
+    # variantes par phase) — les appareils multi-fonctions ambigus (relais avec
+    # suivi énergie, chauffage fil pilote français avec mesure de puissance,
+    # compteurs de gaz/eau/chaleur par comptage d'impulsions) sont VOLONTAIREMENT
+    # exclus d'ici : les y classer comme "energy-meter" (lecture seule) leur
+    # ferait perdre leur vraie fonction de contrôle — décision produit à prendre
+    # avec Hicham avant de les intégrer sous un type dédié.
+    ("AVATTO", "ZWPM16"), ("AVATTO", "ZWPM16-2"),
+    ("Develco", "EMIZB-132"),
+    ("Frient", "EMIZB-141"), ("Frient", "EMIZB-151"),
+    ("Legrand", "412175"), ("Legrand", "412015"),
+    ("NodOn", "SEM-4-1-00"), ("NodOn", "SEM-4-3-20"),
+    ("Schneider Electric", "A9MEM1570"),   # 3-phase industriel/tertiaire
+    ("ELKO", "EKO01825"),
+    ("ShinaSystem", "PMM-300Z1"),
+    ("Slacky-DIY", "Electricity Meter TLSR8258"), ("Slacky-DIY", "ElectricityMeter-ABC-DIY"),
+    ("Ourtop", "ATMS10013Z3"),
+    # Famille Tuya SPM*/SDM* — même convention de nommage que BITUO TECHNIK
+    # ci-dessus (très probablement le même OEM, vendor Z2M différent selon le lot).
+    ("Tuya", "PJ-MGW1203"), ("Tuya", "SPM01"), ("Tuya", "SPM02"),
+    ("Tuya", "SPM01V2"), ("Tuya", "SPM02V2"), ("Tuya", "2CT"),
+    ("Tuya", "SPM01V2.5"), ("Tuya", "SPM02V2.5"), ("Tuya", "SPM02V3"),
+    ("Tuya", "SDM01"), ("Tuya", "SDM01V1.5"), ("Tuya", "SDM02V1"),
+    ("Tuya", "SPM01V1-GT"), ("Tuya", "SPM02V1-GT"),
+    ("Tuya", "SDM01V1-GT"), ("Tuya", "SDM02V1-GT"),
+    ("Tuya", "TS0601_bidirectional_energy meter"),
+    ("Tuya", "PJ-1203A"), ("Tuya", "PC311-Z-TY"), ("Tuya", "EA4161C-BI"),
 }
 
 
@@ -5627,8 +5659,8 @@ def _detect_device_type(
 ) -> str:
     """Port Python de detectDeviceType() (ex web/src/app/api/webhooks/pi/devices-sync/route.ts,
     renommé depuis) — utilisé uniquement par le chemin direct Supabase, cf. HANDOFF §36."""
-    # Compteurs d'énergie généraux (tête de tableau électrique, cf.
-    # domoticium/energy_meters.py) : identification par (vendor, model) EXACT,
+    # Compteurs d'énergie généraux (tête de tableau électrique) : identification
+    # par (vendor, model) EXACT (_ENERGY_METER_VENDOR_MODELS, défini plus haut),
     # signal beaucoup plus fiable que les exposes — un compteur multi-phase
     # (Bituo/NOUS D4Z/Owon) a des exposes numériques variés (power_a, energy_l1…)
     # sans forme standard reconnaissable, mais vendor/model Z2M sont stables
@@ -5648,10 +5680,27 @@ def _detect_device_type(
     if "climate" in types or "thermostat" in types: return "thermostat"
     if "lock" in types: return "lock"
     if "fan" in types: return "fan"
-    if "occupancy" in names or "motion" in names: return "sensor-motion"
-    if "contact" in names: return "sensor-contact"
-    if "water_leak" in names: return "sensor-water"
+    # Présence (radar mmWave) traité comme "motion" — audit complet du catalogue
+    # Zigbee2MQTT le 2026-08-19 (4436 devices réels, zigbee-herdsman-converters,
+    # pas un échantillon) : 45+ capteurs de présence radar réels et vendus
+    # aujourd'hui (Aqara FP1E/FP2, gamme Tuya ZY-M100/ZG-205x, HOBEIAN, etc.)
+    # exposent "presence" au lieu de "occupancy"/"motion" et tombaient tous en
+    # sensor-generic. Sémantiquement équivalent pour nous (même besoin : quelqu'un
+    # est-il dans la pièce), déjà géré côté normalisation d'état HA
+    # (_ha_attributes_to_normalized traite déjà device_class "presence" comme
+    # "motion" depuis le début — seule la détection du TYPE ici avait un trou).
+    if "occupancy" in names or "motion" in names or "presence" in names: return "sensor-motion"
+    # "contact_alarm_1"/"contact_alarm_2" (EZVIZ CS-T2C, même audit) : variante
+    # non-standard mais un vrai capteur d'ouverture.
+    if "contact" in names or any(n.startswith("contact_alarm") for n in names): return "sensor-contact"
+    # "water_leak_alarm_1"/"water_leak_alarm_2" (ADEO/BlitzWolf/Sunricher, même
+    # audit) : 3 vrais détecteurs de fuite avec un nom non-standard.
+    if any(n == "water_leak" or n.startswith("water_leak_alarm") for n in names): return "sensor-water"
     if "temperature" in names or "humidity" in names: return "sensor-temp"
+    # Serrure Tuya sans expose "lock" standard (easyiot ZB-ZL01, même audit) —
+    # signature `lock_status`/`unlock_door` propre à ce modèle mais sans
+    # ambiguïté possible avec un autre type.
+    if "lock_status" in names or "unlock_door" in names: return "lock"
     # Sirène : signal fiable = HA a déjà créé l'entité native siren.* pour ce
     # device — Z2M le fait pour tout appareil exposant "warning" depuis
     # Koenkk/zigbee2mqtt#31000 (vérifié source 2026-07-28), prioritaire sur
@@ -5679,6 +5728,15 @@ def _detect_device_type(
     # melody+duration+volume est un signal fort et peu ambigu (rarement présent
     # ensemble sur un device qui ne serait pas une sirène).
     if {"melody", "duration", "volume"}.issubset(names): return "siren"
+    # 3 variantes supplémentaires trouvées lors de l'audit complet du catalogue
+    # (2026-08-19, 4436 devices réels) — mêmes principes que ci-dessus (signal
+    # fort et peu ambigu), noms de propriété différents selon le fabricant :
+    # Bosch BSIR-EZ (sirène extérieure solaire), eWeLink NAS-AB03B3/NAS-AB06B3
+    # ("alarm_duration" au lieu de "duration"), SONOFF SNZB-09P ("siren_on"
+    # explicite, signal fort à lui seul).
+    if {"siren_volume", "siren_duration"}.issubset(names): return "siren"
+    if {"melody", "alarm_duration", "volume"}.issubset(names): return "siren"
+    if "siren_on" in names: return "siren"
     # Clavier d'alarme (bug réel trouvé par Hicham, 2026-08-08 : "j'ai un
     # interrupteur dans l'app alors qu'il n'y a aucune action à mener sur HA") —
     # jusqu'ici, aucune signature dédiée : un clavier IAS ACE (action/tamper/
