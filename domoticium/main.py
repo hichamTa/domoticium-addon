@@ -3913,11 +3913,22 @@ def _matter_remove_node(node_id: int) -> bool:
                 pass
 
 
-# Mapping best-effort deviceType Matter (Descriptor.DeviceTypeList) → type Domoticium.
-# Pas exhaustif — les types non reconnus retombent sur "switch" (comme avant).
+# Mapping deviceType Matter (Descriptor.DeviceTypeList) → type Domoticium. Audité
+# le 2026-08-19 contre la liste OFFICIELLE complète des 103 device types de la
+# spec CSA (matter-devices.xml, repo project-chip/connectedhomeip — récupérée et
+# comparée entrée par entrée, pas une estimation). Un type absent d'ici ne casse
+# rien : _extract_matter_device_info() retombe sur "sensor-generic" (lecture
+# seule, jamais un faux actionneur — cf. commentaire plus bas, ancien comportement
+# "switch par défaut" corrigé début août). Cette liste couvre tout ce qui rentre
+# dans nos catégories DÉJÀ modélisées ; les device types Matter correspondant à
+# des catégories qu'on ne modélise pas encore (aspirateur robot, détecteur fumée/
+# CO, électroménager, borne de recharge VE, chauffe-eau, télécommande/bouton
+# scène…) sont volontairement laissés de côté ici — décision produit à prendre
+# avec Hicham avant d'ajouter de nouveaux DeviceType, pas un oubli technique.
 _MATTER_DEVICE_TYPES = {
-    0x0100: "light", 0x0101: "light", 0x010C: "light",   # OnOff/Dimmable/ColorTemp Light
-    0x0103: "switch", 0x010A: "plug",                     # OnOff Light Switch, Plug
+    0x0100: "light", 0x0101: "light", 0x010C: "light", 0x010D: "light",  # On/Off, Dimmable, Color Temp, Extended Color Light
+    0x0103: "switch",                                      # On/Off Light Switch
+    0x010A: "plug", 0x010B: "plug",                        # On/Off, Dimmable Plug-in Unit
     0x0202: "cover",                                       # Window Covering
     0x0301: "thermostat",
     0x000A: "lock",                                        # Door Lock (vérifié CSA Device Library 1.4)
@@ -3926,8 +3937,17 @@ _MATTER_DEVICE_TYPES = {
     0x0015: "sensor-contact",                              # Contact Sensor
     0x0107: "sensor-motion",                                # Occupancy Sensor
     0x0302: "sensor-temp",                                  # Temperature Sensor
+    0x0043: "sensor-water",                                 # Water Leak Detector (absent jusqu'ici — vrai trou : sans ça,
+                                                             # une fuite Matter tombait en sensor-generic, sans alerte dédiée)
     0x002C: "sensor-generic",                               # Air Quality Sensor
-    0x0510: "energy-meter",                                 # Electrical Sensor (spec Matter 1.4, MA-electricalsensor)
+    # Famille "compteur électrique" (0x0510-0x0519) : plusieurs ID voisins existent
+    # dans la spec pour des rôles différents (compteur utilitaire, point de
+    # référence, tarif, disjoncteur…) — seuls ceux qui sont un vrai compteur de
+    # consommation sont mappés ici, le reste (tarif/disjoncteur/protection) n'a
+    # pas d'équivalent Domoticium et retombe sciemment en sensor-generic.
+    0x0510: "energy-meter",                                 # Electrical Sensor
+    0x0511: "energy-meter",                                 # Electrical Utility Meter
+    0x0514: "energy-meter",                                 # Electrical Meter
 }
 
 # Compteurs d'énergie généraux Zigbee pré-configurés (tête de tableau électrique,
