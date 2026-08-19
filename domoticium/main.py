@@ -3927,6 +3927,33 @@ _MATTER_DEVICE_TYPES = {
     0x0107: "sensor-motion",                                # Occupancy Sensor
     0x0302: "sensor-temp",                                  # Temperature Sensor
     0x002C: "sensor-generic",                               # Air Quality Sensor
+    0x0510: "energy-meter",                                 # Electrical Sensor (spec Matter 1.4, MA-electricalsensor)
+}
+
+# Compteurs d'énergie généraux Zigbee pré-configurés (tête de tableau électrique,
+# recherche produit Hicham 2026-08-19, fichier "Compteurs_Energie_Zigbee_Matter") —
+# identifiés par (vendor, model) EXACT tels que rapportés par Zigbee2MQTT
+# (`definition.vendor`/`.model`, valeurs vérifiées dans le code source
+# zigbee-herdsman-converters de chaque device, pas juste la doc). Signal fiable
+# et sans ambiguïté, contrairement aux exposes qui varient beaucoup d'un modèle
+# à l'autre pour ce type d'appareil (mono/triphasé, avec/sans séparation par
+# phase). AUCUN de ces modèles testé en conditions réelles — pas de matériel
+# physique installé chez un client à ce jour, cf. HANDOFF.
+_ENERGY_METER_VENDOR_MODELS = {
+    ("Shelly", "S4EM-002CXCEU"),      # EM Gen4 (mono, 2 pinces)
+    ("Shelly", "S4EM-001PXCEU16"),    # EM Mini Gen4 (mono, 1 pince)
+    ("Sunricher", "SR-ZG9042MP"),     # jusqu'à 200A/phase, mono ou triphasé selon câblage
+    ("LiXee", "ZLinky_TIC"),          # lecture directe du compteur Linky (TIC), pas de pince
+    ("Nous", "D4Z"),                  # triphasé, 3 pinces jusqu'à 120A (Tuya TS0601, décodé nativement par Z2M)
+    ("OWON", "PC321"),                # triphasé, cluster Metering standard 0x0702
+    # Bituo Technik : variantes mono ET 3P+N confirmées en code source Z2M.
+    ("BITUO TECHNIK", "SPM01-U01"), ("BITUO TECHNIK", "SDM01B-U01"),
+    ("BITUO TECHNIK", "SDM01W-U01"), ("BITUO TECHNIK", "SPM02-U01"),
+    # Variantes -U00/-U02 : mêmes familles de modèle chez le même vendeur,
+    # probablement même schéma d'exposes — pas vérifiées individuellement en
+    # code source (à confirmer si un client en installe une).
+    ("BITUO TECHNIK", "SPM01-U00"), ("BITUO TECHNIK", "SPM01-U02"),
+    ("BITUO TECHNIK", "SDM02-U00"), ("BITUO TECHNIK", "SDM02-U02"),
 }
 
 
@@ -4858,7 +4885,20 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
             if dc == "temperature": result["temperature"] = val
             elif dc == "humidity": result["humidity"] = val
             elif dc == "battery": result["battery"] = val
-            elif dc in ("power", "energy"): result["power"] = val
+            # "power" (W, instantané) et "energy" (kWh, cumulatif depuis la mise
+            # en service) sont deux grandeurs différentes, pas interchangeables —
+            # avant, les deux tombaient dans state.power, ce qui rendait
+            # EnergyChart.tsx (qui lit payload.energy) muet pour tout appareil
+            # n'exposant QUE l'énergie cumulative (ex: un compteur général sans
+            # mesure de puissance instantanée séparée).
+            # "apparent_power" (VA) : device_class HA distinct de "power" (W), c'est
+            # ce que le Lixee ZLinky (lecture Linky) expose comme grandeur
+            # instantanée (property Z2M `apparent_power`, PAPP/SINSTS) — pas de vrai
+            # "power" actif sur ce modèle. Approximation raisonnable en contexte
+            # domestique (facteur de puissance proche de 1 pour la plupart des
+            # usages), mieux qu'un state.power vide.
+            elif dc in ("power", "apparent_power"): result["power"] = val
+            elif dc == "energy": result["energy"] = val
             else: result["value"] = val
         return result
 
@@ -5562,10 +5602,24 @@ def _handle_ha_command(payload: bytes):
 
 
 def _detect_device_type(
-    exposes: list[dict], ieee_address: str | None = None, ha_entities: list[dict] | None = None
+    exposes: list[dict], ieee_address: str | None = None, ha_entities: list[dict] | None = None,
+    vendor: str | None = None, model: str | None = None,
 ) -> str:
     """Port Python de detectDeviceType() (ex web/src/app/api/webhooks/pi/devices-sync/route.ts,
     renommé depuis) — utilisé uniquement par le chemin direct Supabase, cf. HANDOFF §36."""
+    # Compteurs d'énergie généraux (tête de tableau électrique, cf.
+    # domoticium/energy_meters.py) : identification par (vendor, model) EXACT,
+    # signal beaucoup plus fiable que les exposes — un compteur multi-phase
+    # (Bituo/NOUS D4Z/Owon) a des exposes numériques variés (power_a, energy_l1…)
+    # sans forme standard reconnaissable, mais vendor/model Z2M sont stables
+    # (`definition.vendor`/`.model`, vérifiés dans zigbee-herdsman-converters).
+    # Vérifié AVANT toute heuristique par exposes : aucun de ces modèles
+    # n'expose "light"/"switch"/"cover" (pure mesure, jamais d'actionneur), donc
+    # aucun risque de conflit avec les checks ci-dessous, mais on ne prend pas
+    # de risque avec l'ordre. Non testé en conditions réelles (aucun matériel
+    # physique installé chez un client à ce jour) — cf. HANDOFF.
+    if vendor and model and (vendor.strip(), model.strip()) in _ENERGY_METER_VENDOR_MODELS:
+        return "energy-meter"
     types = [e.get("type", "") for e in exposes]
     names = [e.get("name", "") for e in exposes]
     if "light" in types: return "light"
@@ -5652,7 +5706,10 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
             if ha_entities is None:
                 result = _ha_ws_call("config/entity_registry/list")
                 ha_entities = result.get("result", []) if result and result.get("success") else []
-            device_type = _detect_device_type(exposes, ieee_address=ieee, ha_entities=ha_entities)
+            device_type = _detect_device_type(
+                exposes, ieee_address=ieee, ha_entities=ha_entities,
+                vendor=definition.get("vendor"), model=definition.get("model"),
+            )
             friendly_name = d.get("friendly_name")
             default_name = friendly_name if (friendly_name and friendly_name != ieee) \
                 else (definition.get("model") or ieee)
