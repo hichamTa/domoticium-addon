@@ -7185,6 +7185,21 @@ _FRIGATE_PTZ_COMMANDS = {
     'zoom_in': 'zoom_in', 'zoom_out': 'zoom_out', 'stop': 'stop',
 }
 
+# Durée d'un "cran" de déplacement — bouge à durée FIXE plutôt que de dépendre
+# du délai réseau entre le clic (mousedown → move) et le relâchement (mouseup →
+# stop) côté navigateur. C'est exactement ce qui rendait le déplacement variable
+# par clic (signalé par Hicham en conditions réelles, 2026-08-19, caméra PTZ
+# physique) : move et stop étaient deux appels réseau indépendants (navigateur →
+# API web avec auth/DB → addon → MQTT → Frigate → ONVIF), sans aucune garantie
+# de délai fixe entre les deux — la distance parcourue dépendait entièrement de
+# la latence réseau du moment. Un seul appel /camera/ptz gère maintenant tout le
+# cycle move→attente→stop côté serveur (cf. _handle_camera_ptz_route),
+# _CommandHandler tourne en thread par requête (ThreadingTCPServer) donc ce
+# sleep ne bloque aucune autre commande en cours. Valeur de départ raisonnable,
+# jamais calibrée sur une vraie caméra motorisée (aucune disponible en session
+# de dev) — à ajuster ici si le cran est trop grand/petit une fois testé.
+_PTZ_STEP_SECONDS = 0.2
+
 
 class _CommandHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -7487,7 +7502,15 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         frigate/<camera>/ptz, cf. _generate_frigate_yaml/_FRIGATE_PTZ_COMMANDS) — Frigate
         maintient déjà cette implémentation, pas de raison de la dupliquer. Publication
         MQTT fire-and-forget : Frigate ne renvoie pas d'accusé de réception sur ce
-        topic, donc "ok" ici confirme l'envoi, pas l'exécution réelle par la caméra."""
+        topic, donc "ok" ici confirme l'envoi, pas l'exécution réelle par la caméra.
+
+        Un "cran" de déplacement (direction ≠ "stop") fait tout le cycle
+        move→attente(_PTZ_STEP_SECONDS)→stop DANS cette requête, plutôt que de
+        compter sur un futur appel "stop" séparé envoyé par le navigateur au
+        relâchement du clic — c'est ce second appel, à latence réseau variable,
+        qui causait un déplacement différent à chaque clic (cf. commentaire
+        _PTZ_STEP_SECONDS). "stop" explicite reste géré à part (ex: bouton
+        d'arrêt d'urgence futur), sans le délai."""
         stream_name = data.get("streamName")
         direction = data.get("direction")
         if not stream_name or not direction:
@@ -7499,8 +7522,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             return self._ok({"ok": False, "detail": f"Direction inconnue : {direction}"})
         if not _local_client:
             return self._ok({"ok": False, "detail": "Mosquitto local non connecté"})
+        if command == "stop":
+            _local_client.publish(f"frigate/{stream_name}/ptz", "stop", qos=1)
+            return self._ok({"ok": True, "detail": "stop"})
         _local_client.publish(f"frigate/{stream_name}/ptz", command, qos=1)
-        self._ok({"ok": True, "detail": "ok"})
+        time.sleep(_PTZ_STEP_SECONDS)
+        _local_client.publish(f"frigate/{stream_name}/ptz", "stop", qos=1)
+        self._ok({"ok": True, "detail": "step"})
 
     def _handle_sync_now(self, data):
         """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
