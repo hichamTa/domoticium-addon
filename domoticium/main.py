@@ -3208,18 +3208,24 @@ def _remove_legacy_heartbeat_automation_once():
     open(_LEGACY_HEARTBEAT_AUTO_MARKER, "w").close()
 
 
-_SITE_LOCATION_REPORTED_MARKER = "/data/.site_location_reported"
+_SITE_LOCATION_MARKER = "/data/.site_location_reported"
 
 
-def _report_site_location_once():
-    """Reporte une seule fois à Supabase les coordonnées du logement (lat/lon/
-    altitude), lues depuis la config Home Assistant elle-même (zone "home",
-    quasi toujours déjà réglée dès la première installation) — pour la météo
-    réelle sur l'Accueil (2026-08-18), plutôt que de géocoder l'adresse texte
-    du site. Idempotent via marker, retente à chaque démarrage tant qu'un appel
-    a échoué (même convention que _enable_watchdogs_once)."""
-    if os.path.exists(_SITE_LOCATION_REPORTED_MARKER):
-        return
+def _sync_site_location():
+    """Reporte à Supabase les coordonnées du logement (lat/lon/altitude), lues
+    depuis la config Home Assistant elle-même (zone "home") — pour la météo
+    réelle sur l'Accueil (2026-08-18) et tout ce qui en dépend depuis
+    (suggestions UV/gel/vacances scolaires, 2026-08-27).
+
+    Auto-guéri (2026-08-27) : compare aux dernières coordonnées reportées
+    (stockées dans le marker, plus un simple booléen) et ne renvoie l'appel
+    Supabase QUE si elles ont changé. Avant, le marker ne voulait dire que
+    "déjà fait une fois" — une adresse mal réglée au premier démarrage (ou
+    changée depuis, ex. déménagement) restait fausse pour toujours, MÊME
+    après correction dans HA, puisque plus aucun redémarrage ne redéclenchait
+    l'envoi. Bug réel trouvé le 2026-08-27 : le site de test avait des
+    coordonnées à Amsterdam au lieu de la France, corrigées dans HA par
+    Hicham mais jamais remontées à Supabase pour cette raison."""
     try:
         r = ha_get("/config")
         if not r.ok:
@@ -3234,6 +3240,16 @@ def _report_site_location_once():
     except Exception as e:
         warn(f"[site-location] lecture config HA : {e}")
         return
+
+    last = None
+    if os.path.exists(_SITE_LOCATION_MARKER):
+        try:
+            with open(_SITE_LOCATION_MARKER) as f:
+                last = json.load(f)
+        except Exception:
+            last = None
+    if last and last.get("lat") == lat and last.get("lon") == lon:
+        return  # déjà à jour côté Supabase, rien à renvoyer
 
     try:
         ts = int(time.time())
@@ -3253,7 +3269,11 @@ def _report_site_location_once():
         warn(f"[site-location] envoi Supabase : {e}")
         return
 
-    open(_SITE_LOCATION_REPORTED_MARKER, "w").close()
+    try:
+        with open(_SITE_LOCATION_MARKER, "w") as f:
+            json.dump({"lat": lat, "lon": lon}, f)
+    except Exception as e:
+        warn(f"[site-location] écriture marker : {e}")
 
 
 _WATCHDOG_ENABLED_MARKER = "/data/.watchdog_enabled"
@@ -8003,7 +8023,7 @@ def run_bridge():
     threading.Thread(target=_remove_legacy_heartbeat_automation_once, daemon=True).start()
     threading.Thread(target=_remove_legacy_rest_commands_once, daemon=True).start()
     threading.Thread(target=_enable_watchdogs_once, daemon=True).start()
-    threading.Thread(target=_report_site_location_once, daemon=True).start()
+    threading.Thread(target=_sync_site_location, daemon=True).start()
     threading.Thread(target=_reenable_frigate_watchdog_if_needed, daemon=True).start()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
