@@ -2843,6 +2843,13 @@ _INTERNAL_AUTOMATION_OBJECT_IDS = {
     _KEYPAD_FEEDBACK_OBJECT_ID,
     "domoticium_heartbeat",       # legacy, cf. _remove_legacy_heartbeat_automation_once
     "domoticium_camera_status",   # legacy, cf. plus bas
+    "domoticium_alarm_action",    # legacy — v1 des actions matérielles Alarmo (cf.
+                                   # commentaire "Actions matérielles sur évènement
+                                   # alarme" plus bas), remplacée depuis par le vrai
+                                   # mécanisme natif Alarmo (WS alarmo/automations) mais
+                                   # jamais supprimée des sites déjà provisionnés avec
+                                   # l'ancienne version — trouvée en vérifiant contre le
+                                   # vrai HA du site de test (2026-08-26), pas supposée.
 }
 
 
