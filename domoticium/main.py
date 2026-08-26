@@ -2829,6 +2829,78 @@ def _ensure_alarmo_keypad_control(devices_list):
     log(f"[alarmo] ✓ Armement/désarmement clavier câblé sur '{friendly_name}' ↔ {panel_entity_id}")
 
 
+# ── Import d'automatisations HA → app (2026-08-27) ───────────────────────────
+# Hicham : "il faudrait pouvoir synchroniser Home Assistant et l'application
+# web tout comme les scènes et les équipements" — jusqu'ici la sync des
+# automatisations n'allait que dans un sens (site → HA). Construit à partir
+# des constantes déjà déclarées ci-dessus (jamais une chaîne en dur) pour
+# qu'un futur renommage ne puisse jamais faire fuiter une automatisation
+# interne (câblage bouton SOS / armement clavier / retour LED) vers le
+# client — ces 3-là ne doivent JAMAIS être visibles sur le site.
+_INTERNAL_AUTOMATION_OBJECT_IDS = {
+    _SOS_AUTOMATION_OBJECT_ID,
+    _KEYPAD_ARM_OBJECT_ID,
+    _KEYPAD_FEEDBACK_OBJECT_ID,
+    "domoticium_heartbeat",       # legacy, cf. _remove_legacy_heartbeat_automation_once
+    "domoticium_camera_status",   # legacy, cf. plus bas
+}
+
+
+def handle_list_ha_automations() -> dict:
+    """Énumère les automatisations HA (GET /states filtré sur automation.*, il
+    n'existe pas d'endpoint REST "lister toutes les configs" côté HA — seul
+    /config/automation/config/{id} est unitaire) et lit la config complète de
+    chacune, hors automatisations internes Domoticium. Best-effort par
+    automatisation (un config illisible ne doit pas faire échouer tout le
+    reste) — le web décide ensuite (classifyHaAutomation) si elle rentre dans
+    le modèle simple du site ou doit rester en lecture seule.
+
+    `ok: False` signale un échec de lecture des états eux-mêmes (HA hors
+    ligne, etc.) — le web ne doit JAMAIS purger ses lignes "importées de HA"
+    sur une réponse dégradée, une liste vide ne veut pas dire "tout supprimé
+    dans HA"."""
+    try:
+        r = ha_get("/states")
+        if not r.ok:
+            return {"ok": False, "automations": []}
+        states = r.json()
+    except Exception as e:
+        warn(f"[automations-ha] lecture /states: {e}")
+        return {"ok": False, "automations": []}
+
+    automations = []
+    for s in states:
+        entity_id = s.get("entity_id", "")
+        if not entity_id.startswith("automation."):
+            continue
+        attrs = s.get("attributes") or {}
+        object_id = attrs.get("id")
+        if object_id in _INTERNAL_AUTOMATION_OBJECT_IDS:
+            continue
+
+        config = None
+        if object_id:
+            try:
+                cr = ha_get(f"/config/automation/config/{object_id}")
+                if cr.ok:
+                    config = cr.json()
+            except Exception as e:
+                warn(f"[automations-ha] lecture config {object_id}: {e}")
+                # best-effort : on la remonte quand même sans config détaillée,
+                # le web la classera en lecture seule faute de trigger/action.
+
+        automations.append({
+            "ha_object_id": object_id,
+            "entity_id": entity_id,
+            "alias": attrs.get("friendly_name", entity_id),
+            "enabled": s.get("state") == "on",
+            "config": config,
+            "last_triggered": attrs.get("last_triggered"),
+        })
+
+    return {"ok": True, "automations": automations}
+
+
 # Actions matérielles sur évènement alarme (sirène/lumières...) — demande
 # Hicham (2026-08-05, "je veux tout" après explication des 3 features Alarmo
 # manquantes ; 2026-08-09, comparaison directe avec le panneau natif Alarmo
@@ -6582,6 +6654,11 @@ ALLOWED_SERVICES = {
         "alarm_arm_home", "alarm_arm_away", "alarm_arm_night",
         "alarm_arm_vacation", "alarm_disarm", "alarm_trigger",
     },
+    # Ajouté 2026-08-27 pour le toggle activer/désactiver des automatisations
+    # importées depuis HA (import bidirectionnel, cf. handle_list_ha_automations
+    # plus haut) — absent jusqu'ici, un appel automation.turn_on/turn_off était
+    # rejeté en 403.
+    "automation":    {"turn_on", "turn_off", "toggle"},
 }
 
 
@@ -7663,6 +7740,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_alarmo_general_config_route()
         elif route == "/alarmo/sensor-groups":
             self._handle_alarmo_sensor_groups_route()
+        elif route == "/automations/ha":
+            self._handle_ha_automations_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -7679,6 +7758,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_alarmo_get_sensors())
         except Exception as e:
             warn(f"[alarmo-sensors] {e}")
+            self._reject(500, str(e))
+
+    def _handle_ha_automations_route(self):
+        try:
+            self._ok(handle_list_ha_automations())
+        except Exception as e:
+            warn(f"[automations-ha] {e}")
             self._reject(500, str(e))
 
     def _handle_alarmo_panel_route(self):
