@@ -5109,6 +5109,12 @@ def _ha_attributes_to_normalized(entity_id: str, attrs: dict, merged: dict) -> d
                 unit = attrs.get("unit_of_measurement")
                 if isinstance(unit, str):
                     result["utilityUnit"] = unit
+            # HA n'a pas de device_class standard "people_count" — repli sur le
+            # nom d'entité (même principe que les autres cas déjà tolérés ici,
+            # ex. utility-meter), le seul signal disponible pour ce capteur
+            # (2026-08-27, ShinaSystem CSM-300ZB, cf. people-counter).
+            elif "people" in entity_id:
+                result["peopleCount"] = val
             else: result["value"] = val
         return result
 
@@ -5264,6 +5270,16 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
         modes = attrs.get("available_modes")
         if isinstance(modes, list) and modes:
             result["humidifierModes"] = modes
+
+    elif domain == "select":
+        # Aujourd'hui, seul le fil pilote (heating-relay) utilise une entité
+        # select.* en position PRIMAIRE — à revoir si un futur DeviceType fait
+        # de même (l'entité select générique en position SECONDAIRE, §161, ne
+        # passe jamais par cette fonction : elle n'a pas de "capacités" propres,
+        # juste ses options lues directement au moment de la commande).
+        options = attrs.get("options")
+        if isinstance(options, list) and options:
+            result["pilotWireModes"] = options
 
     elif domain == "lock":
         # §163 — LockEntityFeature.OPEN = bit 1 du bitmask HA standard
@@ -5907,6 +5923,12 @@ def _detect_device_type(
     # "water_leak_alarm_1"/"water_leak_alarm_2" (ADEO/BlitzWolf/Sunricher, même
     # audit) : 3 vrais détecteurs de fuite avec un nom non-standard.
     if any(n == "water_leak" or n.startswith("water_leak_alarm") for n in names): return "sensor-water"
+    # Capteur de comptage de personnes (ShinaSystem CSM-300ZB/CSM-300ZB_V2,
+    # audit 2026-08-19) — expose top-level "people" (numérique), sémantique
+    # différente de sensor-motion (présent/absent binaire). Vérifié dans le
+    # catalogue réel (zigbee-herdsman-converters) : exposes = battery,
+    # battery_voltage, enum "status" (idle/in/out), numeric "people".
+    if "people" in names: return "people-counter"
     if "temperature" in names or "humidity" in names: return "sensor-temp"
     # Serrure Tuya sans expose "lock" standard (easyiot ZB-ZL01, même audit) —
     # signature `lock_status`/`unlock_door` propre à ce modèle mais sans
