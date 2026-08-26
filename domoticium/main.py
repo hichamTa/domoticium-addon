@@ -3253,13 +3253,22 @@ def _sync_site_location():
 
     try:
         ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:site_location:{lat}:{lon}:{elevation if elevation is not None else 'null'}"
+        # p_latitude/p_longitude/p_elevation envoyés en TEXTE (pas en JSON
+        # numérique) — migration 0091 : Postgres reformatait différemment un
+        # double precision en texte (`::text`) par rapport au f-string Python
+        # au-delà d'une certaine précision, faisant diverger la signature
+        # ("signature invalide", trouvé 2026-08-27). En envoyant nous-mêmes la
+        # représentation texte, elle est garantie identique des deux côtés :
+        # Postgres signe la chaîne reçue telle quelle, jamais reconstruite.
+        lat_s, lon_s = str(lat), str(lon)
+        elev_s = str(elevation) if elevation is not None else None
+        message = f"{SITE_PREFIX}:{ts}:site_location:{lat_s}:{lon_s}:{elev_s if elev_s is not None else 'null'}"
         payload = {
             "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_latitude": lat, "p_longitude": lon,
+            "p_latitude": lat_s, "p_longitude": lon_s,
         }
-        if elevation is not None:
-            payload["p_elevation"] = elevation
+        if elev_s is not None:
+            payload["p_elevation"] = elev_s
         resp = _supabase_rpc("pi_report_site_location", payload)
         if resp.status_code >= 300:
             warn(f"[site-location] pi_report_site_location {resp.status_code}: {resp.text[:120]}")
