@@ -2908,6 +2908,36 @@ def handle_list_ha_automations() -> dict:
     return {"ok": True, "automations": automations}
 
 
+def handle_get_device_triggers(ieee_address: str | None, matter_node_id: int | None) -> dict:
+    """Liste les "device triggers" HA d'une télécommande/bouton de scène (Zigbee
+    ou Matter) — pas d'entité à lire, ce mécanisme est la source de vérité pour
+    savoir QUELLES actions (single/double/hold…) ce modèle précis sait produire.
+    Piège connu, à faire savoir côté web : HA n'enregistre un device trigger
+    qu'APRÈS au moins une pression réelle sur le bouton — un appareil tout juste
+    appairé renverra une liste vide tant qu'il n'a jamais été pressé une fois."""
+    ha_device_id = _get_ha_device_id(ieee_address=ieee_address, matter_node_id=matter_node_id)
+    if not ha_device_id:
+        return {"ok": True, "device_found": False, "triggers": []}
+
+    result = _ha_ws_call("device_automation/trigger/list", device_id=ha_device_id)
+    if not result or not result.get("success"):
+        warn(f"[device-triggers] device_automation/trigger/list a échoué pour {ha_device_id}: {result}")
+        return {"ok": False, "device_found": True, "triggers": []}
+
+    raw = result.get("result", [])
+    triggers = [
+        {
+            "domain": t.get("domain"),
+            "type": t.get("type"),
+            "subtype": t.get("subtype"),
+            "device_id": t.get("device_id"),
+        }
+        for t in raw
+        if isinstance(t, dict) and t.get("domain") and t.get("type")
+    ]
+    return {"ok": True, "device_found": True, "triggers": triggers}
+
+
 # Actions matérielles sur évènement alarme (sirène/lumières...) — demande
 # Hicham (2026-08-05, "je veux tout" après explication des 3 features Alarmo
 # manquantes ; 2026-08-09, comparaison directe avec le panneau natif Alarmo
@@ -4043,6 +4073,12 @@ _MATTER_DEVICE_TYPES = {
     0x0043: "sensor-water",                                 # Water Leak Detector (absent jusqu'ici — vrai trou : sans ça,
                                                              # une fuite Matter tombait en sensor-generic, sans alerte dédiée)
     0x002C: "sensor-generic",                               # Air Quality Sensor
+    # Télécommande/bouton de scène (2026-08-27) — Generic Switch, Dimmer Switch,
+    # Color Dimmer Switch (déjà repérés lors de l'audit CSA du 2026-08-19,
+    # jamais mappés jusqu'ici). Pas d'état à afficher (device_trigger côté HA,
+    # cf. handle_get_device_triggers) — juste besoin d'être reconnus pour
+    # apparaître comme source de déclencheur d'automatisation.
+    0x000F: "remote", 0x0104: "remote", 0x0105: "remote",
     # Famille "compteur électrique" (0x0510-0x0519) : plusieurs ID voisins existent
     # dans la spec pour des rôles différents (compteur utilitaire, point de
     # référence, tarif, disjoncteur…) — seuls ceux qui sont un vrai compteur de
@@ -5929,6 +5965,13 @@ def _detect_device_type(
     # catalogue réel (zigbee-herdsman-converters) : exposes = battery,
     # battery_voltage, enum "status" (idle/in/out), numeric "people".
     if "people" in names: return "people-counter"
+    # Télécommande/bouton de scène (2026-08-27, audit 2026-08-19 : 284 devices
+    # réels rien que dans le catalogue, très répandu) — expose top-level
+    # "action" (enum single/double/hold…) sans aucun autre signal actionnable
+    # (déjà éliminé par les checks light/switch/cover/climate/lock/fan/valve
+    # au-dessus). Pas d'état à afficher, cf. commentaire DeviceType "remote"
+    # côté web — juste reconnu pour servir de source de déclencheur.
+    if "action" in names: return "remote"
     if "temperature" in names or "humidity" in names: return "sensor-temp"
     # Serrure Tuya sans expose "lock" standard (easyiot ZB-ZL01, même audit) —
     # signature `lock_status`/`unlock_door` propre à ce modèle mais sans
@@ -7800,6 +7843,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_alarmo_sensor_groups_route()
         elif route == "/automations/ha":
             self._handle_ha_automations_route()
+        elif route == "/devices/triggers":
+            self._handle_device_triggers_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -7823,6 +7868,25 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_list_ha_automations())
         except Exception as e:
             warn(f"[automations-ha] {e}")
+            self._reject(500, str(e))
+
+    def _handle_device_triggers_route(self):
+        """Boutons de télécommande/scène (2026-08-27) — HA modélise leurs pressions
+        comme des "MQTT device triggers" (mécanisme par défaut de Zigbee2MQTT, PAS
+        une entité consultable), vérifié dans la doc officielle Z2M avant de coder :
+        les entités "event" équivalentes sont explicitement expérimentales côté Z2M,
+        l'ancien "action sensor" est déprécié — le device trigger natif est la seule
+        voie stable. ieee_address (Zigbee) ou matter_node_id (Matter) en query string
+        — le web connaît déjà ces identifiants, pas besoin d'un nouvel aller-retour."""
+        try:
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = urllib.parse.parse_qs(query)
+            ieee_address = (params.get("ieee_address") or [None])[0]
+            matter_node_raw = (params.get("matter_node_id") or [None])[0]
+            matter_node_id = int(matter_node_raw) if matter_node_raw is not None else None
+            self._ok(handle_get_device_triggers(ieee_address, matter_node_id))
+        except Exception as e:
+            warn(f"[device-triggers] {e}")
             self._reject(500, str(e))
 
     def _handle_alarmo_panel_route(self):
