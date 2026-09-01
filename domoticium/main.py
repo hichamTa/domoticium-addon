@@ -4814,6 +4814,17 @@ def _backfill_ha_entity_links():
             # (2026-08-09) : sans ça, l'ordre de retour de la liste HA déciderait
             # au hasard, à chaque cycle, quelle entité fait autorité pour ce device.
             "entityCategory": e.get("entity_category"),
+            # device_class/unit (2026-09-01) — jamais transmis jusqu'ici pour les
+            # devices Zigbee/Matter (device_entities.unit/device_class restaient
+            # NULL en base), contrairement à _backfill_camera_entity_links() qui
+            # les lit déjà pour les caméras avec exactement ce même repli
+            # device_class/original_device_class. Ce backfill tourne toutes les
+            # 5 min sur TOUTES les entités (pas seulement les nouvelles) : le
+            # simple redémarrage/mise à jour de l'add-on suffit à rattraper les
+            # entités déjà en base (upsert_device_entity ne réécrit jamais une
+            # valeur déjà non-NULL par une valeur NULL, cf. COALESCE côté SQL).
+            "deviceClass": e.get("device_class") or e.get("original_device_class"),
+            "unit": e.get("unit_of_measurement") or e.get("original_unit_of_measurement"),
         }
         if m:
             payload["ieeeAddress"] = m.group(0)
@@ -5651,6 +5662,18 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
             # _backfill_ha_entity_links, même fix appliqué aux deux chemins).
             if entry:
                 payload["entityCategory"] = entry.get("entity_category")
+                # device_class/unit — même lecture que _backfill_camera_entity_links()
+                # (device_class/original_device_class), qui fonctionne déjà pour les
+                # entités secondaires de caméra. Jusqu'ici jamais transmis pour les
+                # devices Zigbee/Matter : device_entities.unit/device_class restaient
+                # NULL en base pour toute nouvelle entité, quel que soit le protocole
+                # — l'app web n'affichait donc aucune unité (W/V/A/kWh/ppm/...) sur ces
+                # cartes, contrairement à la page Zigbee2MQTT de HA qui les lit
+                # directement depuis l'attribut d'état (Hicham, 2026-09-01, capture
+                # HA à l'appui : "sur Home Assistant [...] j'arrive à avoir les
+                # unités et pas sur le site").
+                payload["deviceClass"] = entry.get("device_class") or entry.get("original_device_class")
+                payload["unit"] = entry.get("unit_of_measurement") or entry.get("original_unit_of_measurement")
             # Nom lisible dès la liaison — ne pas attendre le 1er changement d'état
             # (name = override utilisateur, original_name = nom par défaut ; les deux
             # peuvent être absents de l'event live entity_registry_updated, vu en test
