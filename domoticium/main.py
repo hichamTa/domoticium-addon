@@ -35,6 +35,17 @@ APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
 FORCE_SETUP             = cfg.get("force_setup", False)
 INGEST_SECRET           = cfg.get("ingest_secret", "")
+# (2026-09-01) Intervalle max de reporting (secondes) appliqué aux attributs
+# "sensibles pile" (batterie/tension pile/température/humidité/éclairement/CO2/
+# PM2.5) des devices Zigbee À PILE de CE site — cf. _boost_device_reporting. 0 (par
+# défaut) = comportement usine préservé (souvent 1h à ~18h selon l'attribut, pensé
+# pour l'autonomie). Réglable PAR SITE via cette option add-on (HA Supervisor,
+# onglet Configuration) plutôt qu'un simple interrupteur global tout-ou-rien —
+# Hicham : "on peut regler le time ?", suite à la question du compromis
+# autonomie/rapidité posée pour les devices à pile (cf. HANDOFF). Les devices
+# SECTEUR ne sont jamais concernés par ce réglage (toujours boostés à 30s, aucune
+# préoccupation de pile).
+BATTERY_REPORTING_SECONDS = int(cfg.get("battery_reporting_seconds", 0) or 0)
 
 # Appels directs Pi → Supabase (heartbeat, sync Zigbee/Matter, états devices,
 # statut caméra — cf. HANDOFF §36/§37) : seul chemin, plus de repli Vercel. URL et
@@ -4451,18 +4462,6 @@ _reporting_configure_results: dict[tuple, dict] = {}
 # republier à chaque cycle de synchro (toutes les 5 min).
 _boosted_ieees: set[str] = set()
 
-# (2026-09-01) Garde-fou EXPLICITE : reporting "temps réel" (heartbeat 30s) sur les
-# attributs battery_sensitive (batterie/tension pile/température/humidité/
-# éclairement/CO2/PM2.5) d'un device À PILE — désactivé par défaut, sciemment. Les
-# defaults usine Zigbee2MQTT pour ces attributs sont volontairement longs (1h à
-# ~18h pour la batterie) pour préserver l'autonomie ; les raccourcir à 30s sur TOUS
-# les devices à pile de TOUS les sites userait les piles plus vite chez le client,
-# une conséquence physique (remplacement sur site) qu'on ne peut pas décider en
-# silence même si Hicham a demandé "tous les attributs" — cf. HANDOFF, question
-# posée. Les devices SECTEUR ne sont jamais concernés par ce drapeau (toujours
-# boostés en entier, cf. is_mains dans _boost_device_reporting).
-_BOOST_BATTERY_SENSITIVE_REPORTING = False
-
 # Attribut Z2M (property exposée) → cluster/attribut ZCL réel + seuil de variation
 # officiel + "sensible pile" (True = l'intervalle par défaut du convertisseur est
 # volontairement long pour économiser une pile — cf. HANDOFF, ne JAMAIS raccourcir
@@ -4492,17 +4491,17 @@ _REPORTING_ATTRS = {
 
 
 def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
-                             include_battery_sensitive: bool = False) -> dict:
-    """Reconfigure explicitement un intervalle de reporting court (heartbeat max
-    30s) pour les mesures d'un device Zigbee, via
-    zigbee2mqtt/bridge/request/device/reporting/configure — l'API Z2M officielle et
-    DISTINCTE de bridge/request/device/configure (utilisée par /zigbee/reconfigure) :
-    cette dernière ne fait que ré-exécuter la fonction configure() du convertisseur
-    du device (qui pour les prises IKEA E22xx ne configure QUE acPowerDivisor,
-    vérifié dans le code source — jamais les mesures elles-mêmes). ATTEND la vraie
-    réponse Z2M (ok/error) par attribut au lieu de publier en aveugle. Le seuil de
-    changement (reportable_change) réutilise tel quel les valeurs par défaut du
-    convertisseur officiel — seul l'intervalle max est raccourci.
+                             battery_reporting_seconds: int | None = None) -> dict:
+    """Reconfigure explicitement un intervalle de reporting court pour les mesures
+    d'un device Zigbee, via zigbee2mqtt/bridge/request/device/reporting/configure —
+    l'API Z2M officielle et DISTINCTE de bridge/request/device/configure (utilisée
+    par /zigbee/reconfigure) : cette dernière ne fait que ré-exécuter la fonction
+    configure() du convertisseur du device (qui pour les prises IKEA E22xx ne
+    configure QUE acPowerDivisor, vérifié dans le code source — jamais les mesures
+    elles-mêmes). ATTEND la vraie réponse Z2M (ok/error) par attribut au lieu de
+    publier en aveugle. Le seuil de changement (reportable_change) réutilise tel
+    quel les valeurs par défaut du convertisseur officiel — seul l'intervalle max
+    est raccourci.
 
     (2026-09-01) Généralisé de "mesures électriques uniquement" à TOUS les attributs
     numériques standards après une 2e demande explicite d'Hicham : "pourquoi tu
@@ -4511,23 +4510,24 @@ def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
     j'ai bien dit la valeur de tout les attributs". Les attributs marqués
     "battery_sensitive" dans _REPORTING_ATTRS (batterie %, tension de pile,
     température, humidité, éclairement, CO2, PM2.5 — tout ce qui existe aussi bien
-    sur un device secteur qu'un device à pile) ne sont boostés QUE si
-    include_battery_sensitive=True OU si power_source indique un device secteur
-    ("Mains"/"DC") — raccourcir le heartbeat d'un capteur À PILE de son défaut usine
-    (souvent 1h, jusqu'à ~18h pour la batterie) à 30s multiplierait sa consommation
-    radio et userait sa pile bien plus vite, un vrai compromis matériel/physique
-    (remplacement chez le client) qu'on ne peut pas décider silencieusement pour
-    TOUS les clients sans confirmation — cf. HANDOFF pour la question posée à Hicham
-    et sa réponse. Les mesures électriques (power/current/voltage/energy) restent
-    TOUJOURS boostées sans condition : elles n'existent structurellement que sur des
-    devices secteur (prise/interrupteur à mesure de conso)."""
+    sur un device secteur qu'un device à pile) sont boostés à 30s SANS CONDITION sur
+    un device secteur ; sur un device À PILE, ils utilisent `battery_reporting_seconds`
+    (par défaut BATTERY_REPORTING_SECONDS, l'option add-on réglable par site — 0 =
+    comportement usine préservé, souvent 1h à ~18h) au lieu d'un simple
+    tout-ou-rien : Hicham, "on peut regler le time ?", en réponse au compromis
+    autonomie/rapidité signalé pour ces devices — cf. HANDOFF. Les mesures
+    électriques (power/current/voltage/energy) restent TOUJOURS boostées à 30s sans
+    condition : elles n'existent structurellement que sur des devices secteur
+    (prise/interrupteur à mesure de conso)."""
     if not _local_client:
         return {"error": "Mosquitto local non connecté"}
 
+    if battery_reporting_seconds is None:
+        battery_reporting_seconds = BATTERY_REPORTING_SECONDS
     is_mains = bool(power_source) and ("mains" in power_source.lower() or "dc" in power_source.lower())
     expose_by_prop = {e.get("property"): e for e in exposes if isinstance(e, dict) and e.get("property")}
 
-    targets = []  # (label_pour_résultat, cluster, attr, change)
+    targets = []  # (label_pour_résultat, cluster, attr, change, max_interval)
     for prop, (cluster, attr, change, battery_sensitive) in _REPORTING_ATTRS.items():
         lookup_prop = "voltage" if prop == "voltage_battery" else prop
         expose = expose_by_prop.get(lookup_prop)
@@ -4537,14 +4537,18 @@ def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
             continue  # "voltage" en mV → tension de pile, traité par "voltage_battery"
         if prop == "voltage_battery" and (expose.get("unit") or "").strip().lower() != "mv":
             continue
-        if battery_sensitive and not (is_mains or include_battery_sensitive):
-            continue
-        targets.append((prop, cluster, attr, change))
+        if not battery_sensitive or is_mains:
+            max_interval = 30
+        elif battery_reporting_seconds > 0:
+            max_interval = battery_reporting_seconds
+        else:
+            continue  # device à pile, réglage désactivé (0) → comportement usine préservé
+        targets.append((prop, cluster, attr, change, max_interval))
     if not targets:
         return {}
 
     results = {}
-    for prop, cluster, attr, change in targets:
+    for prop, cluster, attr, change, max_interval in targets:
         key = (ieee, cluster, attr)
         ev = threading.Event()
         with _reporting_configure_lock:
@@ -4554,7 +4558,7 @@ def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
             "zigbee2mqtt/bridge/request/device/reporting/configure",
             json.dumps({
                 "id": ieee, "endpoint": 1, "cluster": cluster, "attribute": attr,
-                "minimum_report_interval": 1, "maximum_report_interval": 30,
+                "minimum_report_interval": 1, "maximum_report_interval": max_interval,
                 "reportable_change": change,
             }),
             qos=1,
@@ -6262,7 +6266,7 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
                     power_source = d.get("power_source")
                     threading.Thread(
                         target=_boost_device_reporting,
-                        args=(ieee, exposes, power_source, _BOOST_BATTERY_SENSITIVE_REPORTING),
+                        args=(ieee, exposes, power_source, BATTERY_REPORTING_SECONDS),
                         daemon=True,
                     ).start()
 
@@ -7833,10 +7837,11 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         module-level, doc complète là-bas) — appelée aussi AUTOMATIQUEMENT à chaque
         synchro Zigbee pour tout device sur tout site (cf. _sync_zigbee_devices_direct),
         cette route reste utile pour re-déclencher manuellement un device précis sans
-        attendre le prochain cycle de synchro (jusqu'à 5 min). `includeBatterySensitive`
-        (optionnel, défaut False) permet de forcer le boost des attributs pile pour CE
-        device précis même si le drapeau global _BOOST_BATTERY_SENSITIVE_REPORTING est
-        désactivé — pratique pour tester sur un seul device avant d'activer partout."""
+        attendre le prochain cycle de synchro (jusqu'à 5 min). `batteryReportingSeconds`
+        (optionnel, entier, secondes) permet de forcer un intervalle pour CE device
+        précis même si l'option add-on BATTERY_REPORTING_SECONDS est à 0 (désactivée)
+        — pratique pour tester sur un seul device à pile avant de régler l'option
+        globalement pour le site."""
         ieee = data.get("ieee_address")
         if not ieee:
             return self._reject(400, "ieee_address manquant")
@@ -7847,9 +7852,10 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         if not entry:
             return self._reject(404, "device introuvable dans le cache Z2M (bridge/devices)")
         exposes = (entry.get("definition") or {}).get("exposes") or []
-        include_battery_sensitive = bool(data.get("includeBatterySensitive", _BOOST_BATTERY_SENSITIVE_REPORTING))
+        battery_seconds = data.get("batteryReportingSeconds")
+        battery_seconds = int(battery_seconds) if battery_seconds is not None else None
 
-        results = _boost_device_reporting(ieee, exposes, entry.get("power_source"), include_battery_sensitive)
+        results = _boost_device_reporting(ieee, exposes, entry.get("power_source"), battery_seconds)
         if "error" in results:
             return self._reject(503, results["error"])
         if not results:
