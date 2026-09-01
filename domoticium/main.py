@@ -4795,10 +4795,25 @@ def _backfill_ha_entity_links():
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         return
+    # device_class/unit (2026-09-01) — Hicham, capture HA à l'appui : "sur Home
+    # Assistant [...] j'arrive à avoir les unités et pas sur le site [...] que ce
+    # soit du matter ou du zigbee". 1er jet : lu sur l'entrée entity_registry
+    # elle-même (device_class/original_device_class, même pattern déjà éprouvé
+    # côté caméras) — marchait pour Matter, mais PAS pour Zigbee2MQTT (plateforme
+    # "mqtt") : vérifié en conditions réelles sur le vrai HA du site de test
+    # (WebSocket direct) qu'une entrée entity_registry `platform: mqtt` ne porte
+    # JAMAIS ces champs, ni même unit_of_measurement — uniquement présents sur
+    # l'ÉTAT (attributs), pas le registre, pour cette plateforme précise. Un seul
+    # get_states ici (même pattern que handle_alarmo_get_sensors), pas un appel
+    # par entité — ce backfill tourne déjà sur TOUTES les entités du site.
+    states_result = _ha_ws_call("get_states")
+    states = states_result.get("result", []) if states_result and states_result.get("success") else []
+    states_by_entity = {s.get("entity_id"): s for s in states}
     for e in result.get("result", []):
         entity_id = e.get("entity_id", "")
         unique_id = e.get("unique_id") or ""
         m = _IEEE_RE.search(unique_id)
+        attrs = (states_by_entity.get(entity_id) or {}).get("attributes") or {}
         payload = {
             "siteSecret": INGEST_SECRET,
             "siteId": SITE_PREFIX,
@@ -4814,17 +4829,11 @@ def _backfill_ha_entity_links():
             # (2026-08-09) : sans ça, l'ordre de retour de la liste HA déciderait
             # au hasard, à chaque cycle, quelle entité fait autorité pour ce device.
             "entityCategory": e.get("entity_category"),
-            # device_class/unit (2026-09-01) — jamais transmis jusqu'ici pour les
-            # devices Zigbee/Matter (device_entities.unit/device_class restaient
-            # NULL en base), contrairement à _backfill_camera_entity_links() qui
-            # les lit déjà pour les caméras avec exactement ce même repli
-            # device_class/original_device_class. Ce backfill tourne toutes les
-            # 5 min sur TOUTES les entités (pas seulement les nouvelles) : le
-            # simple redémarrage/mise à jour de l'add-on suffit à rattraper les
-            # entités déjà en base (upsert_device_entity ne réécrit jamais une
-            # valeur déjà non-NULL par une valeur NULL, cf. COALESCE côté SQL).
-            "deviceClass": e.get("device_class") or e.get("original_device_class"),
-            "unit": e.get("unit_of_measurement") or e.get("original_unit_of_measurement"),
+            # État en priorité (seule source fiable pour mqtt/Zigbee2MQTT),
+            # registre en repli (utile pour un éventuel override utilisateur côté
+            # Matter/natif — jamais présent côté mqtt de toute façon, cf. ci-dessus).
+            "deviceClass": attrs.get("device_class") or e.get("device_class") or e.get("original_device_class"),
+            "unit": attrs.get("unit_of_measurement") or e.get("unit_of_measurement") or e.get("original_unit_of_measurement"),
         }
         if m:
             payload["ieeeAddress"] = m.group(0)
@@ -5662,18 +5671,21 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
             # _backfill_ha_entity_links, même fix appliqué aux deux chemins).
             if entry:
                 payload["entityCategory"] = entry.get("entity_category")
-                # device_class/unit — même lecture que _backfill_camera_entity_links()
-                # (device_class/original_device_class), qui fonctionne déjà pour les
-                # entités secondaires de caméra. Jusqu'ici jamais transmis pour les
-                # devices Zigbee/Matter : device_entities.unit/device_class restaient
-                # NULL en base pour toute nouvelle entité, quel que soit le protocole
-                # — l'app web n'affichait donc aucune unité (W/V/A/kWh/ppm/...) sur ces
-                # cartes, contrairement à la page Zigbee2MQTT de HA qui les lit
-                # directement depuis l'attribut d'état (Hicham, 2026-09-01, capture
-                # HA à l'appui : "sur Home Assistant [...] j'arrive à avoir les
-                # unités et pas sur le site").
-                payload["deviceClass"] = entry.get("device_class") or entry.get("original_device_class")
-                payload["unit"] = entry.get("unit_of_measurement") or entry.get("original_unit_of_measurement")
+            # device_class/unit (2026-09-01) — Hicham, capture HA à l'appui : "sur
+            # Home Assistant [...] j'arrive à avoir les unités et pas sur le site
+            # [...] que ce soit du matter ou du zigbee". 1er jet (au-dessus, sur
+            # `entry` = config/entity_registry/list) : marchait pour les entités
+            # Matter, PAS pour Zigbee2MQTT (plateforme "mqtt") — vérifié en
+            # conditions réelles sur le vrai HA du site de test (WebSocket direct,
+            # pas supposé) : ni device_class ni (original_)unit_of_measurement ne
+            # sont JAMAIS présents sur une entrée entity_registry `platform: mqtt`,
+            # ces champs ne vivent que sur l'ÉTAT (attrs), pas le registre, pour
+            # cette plateforme. Repli sur l'état réel de l'entité — présent pour
+            # les deux protocoles (confirmé aussi sur les entités Matter).
+            state = ha_get(f"/states/{entity_id}")
+            attrs = state.json().get("attributes", {}) if state.ok else {}
+            payload["deviceClass"] = attrs.get("device_class") or (entry.get("device_class") or entry.get("original_device_class") if entry else None)
+            payload["unit"] = attrs.get("unit_of_measurement") or (entry.get("unit_of_measurement") or entry.get("original_unit_of_measurement") if entry else None)
             # Nom lisible dès la liaison — ne pas attendre le 1er changement d'état
             # (name = override utilisateur, original_name = nom par défaut ; les deux
             # peuvent être absents de l'event live entity_registry_updated, vu en test
