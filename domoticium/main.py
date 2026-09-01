@@ -4444,56 +4444,102 @@ _reporting_configure_lock = threading.Lock()
 _reporting_configure_events: dict[tuple, threading.Event] = {}
 _reporting_configure_results: dict[tuple, dict] = {}
 
-# ieee_address déjà "boostés" (reporting électrique reconfiguré, cf.
-# _boost_electrical_reporting) DEPUIS LE DÉMARRAGE de ce process — mémoire simple en
-# RAM, pas persistée : au pire un device est reconfiguré une 2e fois après un
-# redémarrage de l'add-on, ce qui est sans risque (idempotent côté Z2M, se contente
-# de renvoyer "ok"). Évite de republier à chaque cycle de synchro (toutes les 5 min).
+# ieee_address déjà "boostés" (reporting reconfiguré, cf. _boost_device_reporting)
+# DEPUIS LE DÉMARRAGE de ce process — mémoire simple en RAM, pas persistée : au pire
+# un device est reconfiguré une 2e fois après un redémarrage de l'add-on, ce qui est
+# sans risque (idempotent côté Z2M, se contente de renvoyer "ok"). Évite de
+# republier à chaque cycle de synchro (toutes les 5 min).
 _boosted_ieees: set[str] = set()
 
-# Mesures électriques Z2M (property exposée) → cluster/attribut ZCL réel.
-# Vérifié dans le code source de zigbee-herdsman-converters (src/lib/modernExtend.ts,
-# fonction genericMeter — utilisée via l'extend m.electricityMeter() par la quasi-
-# totalité des prises à mesure de consommation, IKEA E22xx compris) avant d'écrire
-# cette route, pas deviné : haElectricalMeasurement.activePower/rmsCurrent/rmsVoltage
-# pour puissance/courant/tension, seMetering.currentSummDelivered pour l'énergie.
-_ELECTRICAL_REPORTING_ATTRS = {
-    "power":   ("haElectricalMeasurement", "activePower",         5),
-    "current": ("haElectricalMeasurement", "rmsCurrent",          0.05),
-    "voltage": ("haElectricalMeasurement", "rmsVoltage",          5),
-    "energy":  ("seMetering",              "currentSummDelivered", 0.1),
+# (2026-09-01) Garde-fou EXPLICITE : reporting "temps réel" (heartbeat 30s) sur les
+# attributs battery_sensitive (batterie/tension pile/température/humidité/
+# éclairement/CO2/PM2.5) d'un device À PILE — désactivé par défaut, sciemment. Les
+# defaults usine Zigbee2MQTT pour ces attributs sont volontairement longs (1h à
+# ~18h pour la batterie) pour préserver l'autonomie ; les raccourcir à 30s sur TOUS
+# les devices à pile de TOUS les sites userait les piles plus vite chez le client,
+# une conséquence physique (remplacement sur site) qu'on ne peut pas décider en
+# silence même si Hicham a demandé "tous les attributs" — cf. HANDOFF, question
+# posée. Les devices SECTEUR ne sont jamais concernés par ce drapeau (toujours
+# boostés en entier, cf. is_mains dans _boost_device_reporting).
+_BOOST_BATTERY_SENSITIVE_REPORTING = False
+
+# Attribut Z2M (property exposée) → cluster/attribut ZCL réel + seuil de variation
+# officiel + "sensible pile" (True = l'intervalle par défaut du convertisseur est
+# volontairement long pour économiser une pile — cf. HANDOFF, ne JAMAIS raccourcir
+# sans confirmation explicite d'Hicham device par device selon power_source).
+# Tout vérifié dans le code source zigbee-herdsman-converters (src/lib/modernExtend.ts)
+# avant d'écrire cette table, rien deviné :
+# - genericMeter()/electricityMeter() : power/current/voltage(AC)/energy — jamais
+#   sur un device à pile (une mesure de conso électrique suppose le secteur).
+# - battery() : batteryPercentageRemaining/batteryVoltage — défaut Z2M 1h/MAX(~18h).
+# - numeric() (temperature/humidity/illuminance/co2/pm25) : défaut Z2M 10s/1h.
+# "voltage" est AMBIGU (tension secteur À  volts, ou tension de pile en millivolts,
+# même nom de property côté Z2M) — désambiguïsé par l'unité réelle de l'expose
+# (V → secteur, mV → pile), jamais par le nom seul.
+_REPORTING_ATTRS = {
+    "power":       ("haElectricalMeasurement", "activePower",          5,        False),
+    "current":     ("haElectricalMeasurement", "rmsCurrent",           0.05,     False),
+    "voltage":     ("haElectricalMeasurement", "rmsVoltage",           5,        False),
+    "energy":      ("seMetering",               "currentSummDelivered", 0.1,     False),
+    "temperature": ("msTemperatureMeasurement", "measuredValue",       100,      True),
+    "humidity":    ("msRelativeHumidity",        "measuredValue",       100,      True),
+    "illuminance": ("msIlluminanceMeasurement",  "measuredValue",       5,        True),
+    "co2":         ("msCO2",                     "measuredValue",       0.00005,  True),
+    "pm25":        ("pm25Measurement",           "measuredValue",       1,        True),
+    "battery":     ("genPowerCfg",               "batteryPercentageRemaining", 10, True),
+    "voltage_battery": ("genPowerCfg",           "batteryVoltage",       10,      True),
 }
 
 
-def _boost_electrical_reporting(ieee: str, exposed_props: set) -> dict:
+def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
+                             include_battery_sensitive: bool = False) -> dict:
     """Reconfigure explicitement un intervalle de reporting court (heartbeat max
-    30s) pour les mesures électriques (power/current/voltage/energy) d'un device
-    Zigbee, via zigbee2mqtt/bridge/request/device/reporting/configure — l'API Z2M
-    officielle et DISTINCTE de bridge/request/device/configure (utilisée par
-    /zigbee/reconfigure) : cette dernière ne fait que ré-exécuter la fonction
-    configure() du convertisseur du device (qui pour les prises IKEA E22xx ne
-    configure QUE acPowerDivisor, vérifié dans le code source — jamais les mesures
-    elles-mêmes, ce qui explique pourquoi le fix du 2026-09-01 v2.9.145 n'avait
-    apporté qu'une amélioration ponctuelle et non durable). ATTEND la vraie réponse
-    Z2M (ok/error) par attribut au lieu de publier en aveugle. Le seuil de
+    30s) pour les mesures d'un device Zigbee, via
+    zigbee2mqtt/bridge/request/device/reporting/configure — l'API Z2M officielle et
+    DISTINCTE de bridge/request/device/configure (utilisée par /zigbee/reconfigure) :
+    cette dernière ne fait que ré-exécuter la fonction configure() du convertisseur
+    du device (qui pour les prises IKEA E22xx ne configure QUE acPowerDivisor,
+    vérifié dans le code source — jamais les mesures elles-mêmes). ATTEND la vraie
+    réponse Z2M (ok/error) par attribut au lieu de publier en aveugle. Le seuil de
     changement (reportable_change) réutilise tel quel les valeurs par défaut du
-    convertisseur officiel (déjà éprouvées) — seul l'intervalle max est raccourci,
-    c'est le vrai levier pour garantir un rafraîchissement périodique même quand la
-    valeur ne varie pas assez pour franchir ce seuil.
-    (2026-09-01) Extrait de _handle_zigbee_boost_reporting (route HTTP à la demande)
-    pour être aussi appelé automatiquement à chaque synchro Zigbee
-    (cf. _sync_zigbee_devices_direct) — Hicham : "je te rappelle que l'app web ainsi
-    que l'addon ont pour but d'être proposés aux clients", pas un correctif à la main
-    réservé au site de test. S'applique donc à TOUT device, sur TOUT site, qui expose
-    une mesure électrique — pas seulement les 2 prises IKEA d'origine."""
+    convertisseur officiel — seul l'intervalle max est raccourci.
+
+    (2026-09-01) Généralisé de "mesures électriques uniquement" à TOUS les attributs
+    numériques standards après une 2e demande explicite d'Hicham : "pourquoi tu
+    reste focus seulement sur le domaine de l'energie [...] il faudrait que toute
+    valeurs de tout les attribut disponible [...] soit mis a jour en temps reel [...]
+    j'ai bien dit la valeur de tout les attributs". Les attributs marqués
+    "battery_sensitive" dans _REPORTING_ATTRS (batterie %, tension de pile,
+    température, humidité, éclairement, CO2, PM2.5 — tout ce qui existe aussi bien
+    sur un device secteur qu'un device à pile) ne sont boostés QUE si
+    include_battery_sensitive=True OU si power_source indique un device secteur
+    ("Mains"/"DC") — raccourcir le heartbeat d'un capteur À PILE de son défaut usine
+    (souvent 1h, jusqu'à ~18h pour la batterie) à 30s multiplierait sa consommation
+    radio et userait sa pile bien plus vite, un vrai compromis matériel/physique
+    (remplacement chez le client) qu'on ne peut pas décider silencieusement pour
+    TOUS les clients sans confirmation — cf. HANDOFF pour la question posée à Hicham
+    et sa réponse. Les mesures électriques (power/current/voltage/energy) restent
+    TOUJOURS boostées sans condition : elles n'existent structurellement que sur des
+    devices secteur (prise/interrupteur à mesure de conso)."""
     if not _local_client:
         return {"error": "Mosquitto local non connecté"}
 
-    targets = [
-        (prop, cluster, attr, change)
-        for prop, (cluster, attr, change) in _ELECTRICAL_REPORTING_ATTRS.items()
-        if prop in exposed_props
-    ]
+    is_mains = bool(power_source) and ("mains" in power_source.lower() or "dc" in power_source.lower())
+    expose_by_prop = {e.get("property"): e for e in exposes if isinstance(e, dict) and e.get("property")}
+
+    targets = []  # (label_pour_résultat, cluster, attr, change)
+    for prop, (cluster, attr, change, battery_sensitive) in _REPORTING_ATTRS.items():
+        lookup_prop = "voltage" if prop == "voltage_battery" else prop
+        expose = expose_by_prop.get(lookup_prop)
+        if not expose:
+            continue
+        if prop == "voltage" and (expose.get("unit") or "").strip().lower() != "v":
+            continue  # "voltage" en mV → tension de pile, traité par "voltage_battery"
+        if prop == "voltage_battery" and (expose.get("unit") or "").strip().lower() != "mv":
+            continue
+        if battery_sensitive and not (is_mains or include_battery_sensitive):
+            continue
+        targets.append((prop, cluster, attr, change))
     if not targets:
         return {}
 
@@ -6200,21 +6246,23 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
                 "model": definition.get("model") or "", "features": exposes,
             })
 
-            # (2026-09-01) Reporting électrique "temps réel" appliqué AUTOMATIQUEMENT à
-            # tout device Zigbee exposant une mesure électrique, sur CE site comme sur
-            # tout autre — pas un correctif manuel réservé au site de test (Hicham :
-            # "l'app web ainsi que l'addon ont pour but d'être proposés aux clients").
-            # Une seule fois par ieee depuis le démarrage du process (_boosted_ieees) —
-            # cf. _boost_electrical_reporting pour le détail du fix. En thread séparé :
-            # jusqu'à 4 attentes de 8s chacune, ne doit jamais ralentir cette synchro
-            # (qui tourne aussi au démarrage et toutes les 5 min, cf. plus bas).
+            # (2026-09-01) Reporting "temps réel" appliqué AUTOMATIQUEMENT à tout
+            # device Zigbee exposant une mesure standard (électrique, environnement,
+            # batterie), sur CE site comme sur tout autre — pas un correctif manuel
+            # réservé au site de test (Hicham : "l'app web ainsi que l'addon ont pour
+            # but d'être proposés aux clients"). Une seule fois par ieee depuis le
+            # démarrage du process (_boosted_ieees) — cf. _boost_device_reporting pour
+            # le détail (dont le garde-fou "pile" sur les attributs battery_sensitive).
+            # En thread séparé : jusqu'à 11 attentes de 8s chacune dans le pire cas, ne
+            # doit jamais ralentir cette synchro (démarrage + toutes les 5 min).
             if ieee not in _boosted_ieees:
                 exposed_props = {e.get("property") for e in exposes if isinstance(e, dict)}
-                if exposed_props & set(_ELECTRICAL_REPORTING_ATTRS.keys()):
+                if exposed_props & set(_REPORTING_ATTRS.keys()):
                     _boosted_ieees.add(ieee)
+                    power_source = d.get("power_source")
                     threading.Thread(
-                        target=_boost_electrical_reporting,
-                        args=(ieee, exposed_props),
+                        target=_boost_device_reporting,
+                        args=(ieee, exposes, power_source, _BOOST_BATTERY_SENSITIVE_REPORTING),
                         daemon=True,
                     ).start()
 
@@ -7781,11 +7829,14 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         self._ok()
 
     def _handle_zigbee_boost_reporting(self, data):
-        """Route HTTP à la demande pour _boost_electrical_reporting (cf. définition
+        """Route HTTP à la demande pour _boost_device_reporting (cf. définition
         module-level, doc complète là-bas) — appelée aussi AUTOMATIQUEMENT à chaque
         synchro Zigbee pour tout device sur tout site (cf. _sync_zigbee_devices_direct),
         cette route reste utile pour re-déclencher manuellement un device précis sans
-        attendre le prochain cycle de synchro (jusqu'à 5 min)."""
+        attendre le prochain cycle de synchro (jusqu'à 5 min). `includeBatterySensitive`
+        (optionnel, défaut False) permet de forcer le boost des attributs pile pour CE
+        device précis même si le drapeau global _BOOST_BATTERY_SENSITIVE_REPORTING est
+        désactivé — pratique pour tester sur un seul device avant d'activer partout."""
         ieee = data.get("ieee_address")
         if not ieee:
             return self._reject(400, "ieee_address manquant")
@@ -7796,13 +7847,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         if not entry:
             return self._reject(404, "device introuvable dans le cache Z2M (bridge/devices)")
         exposes = (entry.get("definition") or {}).get("exposes") or []
-        exposed_props = {e.get("property") for e in exposes if isinstance(e, dict)}
+        include_battery_sensitive = bool(data.get("includeBatterySensitive", _BOOST_BATTERY_SENSITIVE_REPORTING))
 
-        results = _boost_electrical_reporting(ieee, exposed_props)
+        results = _boost_device_reporting(ieee, exposes, entry.get("power_source"), include_battery_sensitive)
         if "error" in results:
             return self._reject(503, results["error"])
         if not results:
-            return self._reject(400, "ce device n'expose aucune mesure électrique (power/current/voltage/energy)")
+            return self._reject(400, "ce device n'expose aucun attribut boostable (électrique, ou pile sans confirmation)")
         _boosted_ieees.add(ieee)
         self._ok({"ieee_address": ieee, "results": results})
 
