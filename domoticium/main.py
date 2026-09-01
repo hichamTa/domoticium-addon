@@ -7536,6 +7536,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/zigbee/permit-join":   self._handle_permit_join,
                 "/zigbee/remove-device": self._handle_remove_device,
                 "/zigbee/set-attribute": self._handle_set_attribute,
+                "/zigbee/reconfigure":   self._handle_zigbee_reconfigure,
                 "/ha-command":           self._handle_ha_command_route,
                 "/camera/configure":     self._handle_camera_configure_route,
                 "/camera/mask":          self._handle_camera_mask_route,
@@ -7626,6 +7627,32 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         _local_client.publish(
             "zigbee2mqtt/bridge/request/device/remove",
             json.dumps({"id": ieee, "force": True}),
+            qos=1,
+        )
+        self._ok()
+
+    def _handle_zigbee_reconfigure(self, data):
+        """Force Zigbee2MQTT à ré-appliquer le binding + la configuration de
+        reporting d'un device (bridge/request/device/configure) — démarche
+        officielle Z2M recommandée en cas de rapports lents/absents sur
+        certains attributs (ex: puissance/énergie d'une prise), pas une
+        action destructive : ne retire rien, ne re-jumelle rien, juste un
+        rafraîchissement de la configuration déjà en place.
+        (2026-09-01) Ajouté pour diagnostiquer un cas réel signalé par
+        Hicham : les attributs power/energy/voltage/current de plusieurs
+        prises IKEA E22xx du site de test ne se rafraîchissaient qu'après
+        plusieurs dizaines de minutes (jusqu'à ~3h pour l'énergie), largement
+        au-delà de ce qu'un reporting Zigbee correctement configuré devrait
+        produire — confirmé en observant le trafic MQTT réel (0 événement en
+        90s d'écoute directe), pas supposé."""
+        ieee = data.get("ieee_address")
+        if not ieee:
+            return self._reject(400, "ieee_address manquant")
+        if not _local_client:
+            return self._reject(503, "Mosquitto local non connecté")
+        _local_client.publish(
+            "zigbee2mqtt/bridge/request/device/configure",
+            json.dumps({"id": ieee}),
             qos=1,
         )
         self._ok()
