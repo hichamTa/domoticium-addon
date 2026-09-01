@@ -4443,6 +4443,85 @@ _last_z2m_devices_list: list = []
 _reporting_configure_lock = threading.Lock()
 _reporting_configure_events: dict[tuple, threading.Event] = {}
 _reporting_configure_results: dict[tuple, dict] = {}
+
+# ieee_address déjà "boostés" (reporting électrique reconfiguré, cf.
+# _boost_electrical_reporting) DEPUIS LE DÉMARRAGE de ce process — mémoire simple en
+# RAM, pas persistée : au pire un device est reconfiguré une 2e fois après un
+# redémarrage de l'add-on, ce qui est sans risque (idempotent côté Z2M, se contente
+# de renvoyer "ok"). Évite de republier à chaque cycle de synchro (toutes les 5 min).
+_boosted_ieees: set[str] = set()
+
+# Mesures électriques Z2M (property exposée) → cluster/attribut ZCL réel.
+# Vérifié dans le code source de zigbee-herdsman-converters (src/lib/modernExtend.ts,
+# fonction genericMeter — utilisée via l'extend m.electricityMeter() par la quasi-
+# totalité des prises à mesure de consommation, IKEA E22xx compris) avant d'écrire
+# cette route, pas deviné : haElectricalMeasurement.activePower/rmsCurrent/rmsVoltage
+# pour puissance/courant/tension, seMetering.currentSummDelivered pour l'énergie.
+_ELECTRICAL_REPORTING_ATTRS = {
+    "power":   ("haElectricalMeasurement", "activePower",         5),
+    "current": ("haElectricalMeasurement", "rmsCurrent",          0.05),
+    "voltage": ("haElectricalMeasurement", "rmsVoltage",          5),
+    "energy":  ("seMetering",              "currentSummDelivered", 0.1),
+}
+
+
+def _boost_electrical_reporting(ieee: str, exposed_props: set) -> dict:
+    """Reconfigure explicitement un intervalle de reporting court (heartbeat max
+    30s) pour les mesures électriques (power/current/voltage/energy) d'un device
+    Zigbee, via zigbee2mqtt/bridge/request/device/reporting/configure — l'API Z2M
+    officielle et DISTINCTE de bridge/request/device/configure (utilisée par
+    /zigbee/reconfigure) : cette dernière ne fait que ré-exécuter la fonction
+    configure() du convertisseur du device (qui pour les prises IKEA E22xx ne
+    configure QUE acPowerDivisor, vérifié dans le code source — jamais les mesures
+    elles-mêmes, ce qui explique pourquoi le fix du 2026-09-01 v2.9.145 n'avait
+    apporté qu'une amélioration ponctuelle et non durable). ATTEND la vraie réponse
+    Z2M (ok/error) par attribut au lieu de publier en aveugle. Le seuil de
+    changement (reportable_change) réutilise tel quel les valeurs par défaut du
+    convertisseur officiel (déjà éprouvées) — seul l'intervalle max est raccourci,
+    c'est le vrai levier pour garantir un rafraîchissement périodique même quand la
+    valeur ne varie pas assez pour franchir ce seuil.
+    (2026-09-01) Extrait de _handle_zigbee_boost_reporting (route HTTP à la demande)
+    pour être aussi appelé automatiquement à chaque synchro Zigbee
+    (cf. _sync_zigbee_devices_direct) — Hicham : "je te rappelle que l'app web ainsi
+    que l'addon ont pour but d'être proposés aux clients", pas un correctif à la main
+    réservé au site de test. S'applique donc à TOUT device, sur TOUT site, qui expose
+    une mesure électrique — pas seulement les 2 prises IKEA d'origine."""
+    if not _local_client:
+        return {"error": "Mosquitto local non connecté"}
+
+    targets = [
+        (prop, cluster, attr, change)
+        for prop, (cluster, attr, change) in _ELECTRICAL_REPORTING_ATTRS.items()
+        if prop in exposed_props
+    ]
+    if not targets:
+        return {}
+
+    results = {}
+    for prop, cluster, attr, change in targets:
+        key = (ieee, cluster, attr)
+        ev = threading.Event()
+        with _reporting_configure_lock:
+            _reporting_configure_events[key] = ev
+            _reporting_configure_results.pop(key, None)
+        _local_client.publish(
+            "zigbee2mqtt/bridge/request/device/reporting/configure",
+            json.dumps({
+                "id": ieee, "endpoint": 1, "cluster": cluster, "attribute": attr,
+                "minimum_report_interval": 1, "maximum_report_interval": 30,
+                "reportable_change": change,
+            }),
+            qos=1,
+        )
+        got = ev.wait(timeout=8)
+        with _reporting_configure_lock:
+            resp = _reporting_configure_results.pop(key, None)
+            _reporting_configure_events.pop(key, None)
+        if not got or not resp:
+            results[prop] = {"status": "timeout"}
+        else:
+            results[prop] = {"status": resp.get("status"), "error": resp.get("error")}
+    return results
 # friendly_name → online, messages availability arrivés AVANT que le cache ci-dessus
 # ne soit peuplé (ex: juste après un redémarrage addon — Mosquitto souscrit
 # quasi instantanément, alors que le 1er cycle de sync qui peuple le cache ci-dessus
@@ -6121,6 +6200,24 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
                 "model": definition.get("model") or "", "features": exposes,
             })
 
+            # (2026-09-01) Reporting électrique "temps réel" appliqué AUTOMATIQUEMENT à
+            # tout device Zigbee exposant une mesure électrique, sur CE site comme sur
+            # tout autre — pas un correctif manuel réservé au site de test (Hicham :
+            # "l'app web ainsi que l'addon ont pour but d'être proposés aux clients").
+            # Une seule fois par ieee depuis le démarrage du process (_boosted_ieees) —
+            # cf. _boost_electrical_reporting pour le détail du fix. En thread séparé :
+            # jusqu'à 4 attentes de 8s chacune, ne doit jamais ralentir cette synchro
+            # (qui tourne aussi au démarrage et toutes les 5 min, cf. plus bas).
+            if ieee not in _boosted_ieees:
+                exposed_props = {e.get("property") for e in exposes if isinstance(e, dict)}
+                if exposed_props & set(_ELECTRICAL_REPORTING_ATTRS.keys()):
+                    _boosted_ieees.add(ieee)
+                    threading.Thread(
+                        target=_boost_electrical_reporting,
+                        args=(ieee, exposed_props),
+                        daemon=True,
+                    ).start()
+
         # Reconstruit entièrement à chaque synchro plutôt qu'un merge — gère
         # naturellement les renommages/suppressions sans entrée périmée.
         _z2m_friendly_to_ieee = friendly_to_ieee
@@ -7683,37 +7780,12 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         )
         self._ok()
 
-    # Mesures électriques Z2M (property exposée) → cluster/attribut ZCL réel.
-    # Vérifié dans le code source de zigbee-herdsman-converters (src/lib/modernExtend.ts,
-    # fonction genericMeter — utilisée via l'extend m.electricityMeter() par la quasi-
-    # totalité des prises à mesure de consommation, IKEA E22xx compris) avant d'écrire
-    # cette route, pas deviné : haElectricalMeasurement.activePower/rmsCurrent/rmsVoltage
-    # pour puissance/courant/tension, seMetering.currentSummDelivered pour l'énergie.
-    _ELECTRICAL_REPORTING_ATTRS = {
-        "power":   ("haElectricalMeasurement", "activePower",         5),
-        "current": ("haElectricalMeasurement", "rmsCurrent",          0.05),
-        "voltage": ("haElectricalMeasurement", "rmsVoltage",          5),
-        "energy":  ("seMetering",              "currentSummDelivered", 0.1),
-    }
-
     def _handle_zigbee_boost_reporting(self, data):
-        """Configure explicitement un intervalle de reporting court (heartbeat max
-        30s) pour les mesures électriques (power/current/voltage/energy) d'un device
-        Zigbee, via zigbee2mqtt/bridge/request/device/reporting/configure — l'API
-        Z2M officielle et DISTINCTE de bridge/request/device/configure (utilisée par
-        /zigbee/reconfigure) : cette dernière ne fait que ré-exécuter la fonction
-        configure() du convertisseur du device, qui pour les prises IKEA E22xx ne
-        configure QUE acPowerDivisor (vérifié dans le code source), jamais les
-        attributs de mesure eux-mêmes — ce qui explique, avec le recul, pourquoi le
-        fix du 2026-09-01 (v2.9.145) n'avait apporté qu'une amélioration ponctuelle et
-        non durable (reconfirmé par une écoute de 6 min : 0 évènement sur 4 attributs
-        pour "prise chambre", 1 seul pour "prise salon" — pas la "quasi temps réel"
-        demandée par Hicham). Contrairement à device/configure, cette route ATTEND la
-        vraie réponse Z2M (ok/error) par attribut au lieu de publier en aveugle.
-        Le seuil de changement (reportable_change) réutilise tel quel les valeurs par
-        défaut du convertisseur officiel (déjà éprouvées) — seul l'intervalle max est
-        raccourci, c'est le vrai levier pour garantir un rafraîchissement périodique
-        même quand la valeur ne varie pas assez pour franchir ce seuil."""
+        """Route HTTP à la demande pour _boost_electrical_reporting (cf. définition
+        module-level, doc complète là-bas) — appelée aussi AUTOMATIQUEMENT à chaque
+        synchro Zigbee pour tout device sur tout site (cf. _sync_zigbee_devices_direct),
+        cette route reste utile pour re-déclencher manuellement un device précis sans
+        attendre le prochain cycle de synchro (jusqu'à 5 min)."""
         ieee = data.get("ieee_address")
         if not ieee:
             return self._reject(400, "ieee_address manquant")
@@ -7726,39 +7798,12 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         exposes = (entry.get("definition") or {}).get("exposes") or []
         exposed_props = {e.get("property") for e in exposes if isinstance(e, dict)}
 
-        targets = [
-            (prop, cluster, attr, change)
-            for prop, (cluster, attr, change) in self._ELECTRICAL_REPORTING_ATTRS.items()
-            if prop in exposed_props
-        ]
-        if not targets:
+        results = _boost_electrical_reporting(ieee, exposed_props)
+        if "error" in results:
+            return self._reject(503, results["error"])
+        if not results:
             return self._reject(400, "ce device n'expose aucune mesure électrique (power/current/voltage/energy)")
-
-        results = {}
-        for prop, cluster, attr, change in targets:
-            key = (ieee, cluster, attr)
-            ev = threading.Event()
-            with _reporting_configure_lock:
-                _reporting_configure_events[key] = ev
-                _reporting_configure_results.pop(key, None)
-            _local_client.publish(
-                "zigbee2mqtt/bridge/request/device/reporting/configure",
-                json.dumps({
-                    "id": ieee, "endpoint": 1, "cluster": cluster, "attribute": attr,
-                    "minimum_report_interval": 1, "maximum_report_interval": 30,
-                    "reportable_change": change,
-                }),
-                qos=1,
-            )
-            got = ev.wait(timeout=8)
-            with _reporting_configure_lock:
-                resp = _reporting_configure_results.pop(key, None)
-                _reporting_configure_events.pop(key, None)
-            if not got or not resp:
-                results[prop] = {"status": "timeout"}
-            else:
-                results[prop] = {"status": resp.get("status"), "error": resp.get("error")}
-
+        _boosted_ieees.add(ieee)
         self._ok({"ieee_address": ieee, "results": results})
 
     def _handle_set_attribute(self, data):
