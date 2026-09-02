@@ -2969,6 +2969,25 @@ def handle_list_calendars() -> dict:
     return {"ok": True, "calendars": calendars}
 
 
+def handle_list_areas() -> dict:
+    """(2026-09-02) Liste les areas (pièces) HA — pour l'action d'automatisation
+    "Pièce entière" (bloc Actions de l'éditeur avancé, demande Hicham : "cibler
+    une pièce entière"). Réutilise _get_ha_areas() (déjà utilisé en interne pour
+    l'assignation automatique device→pièce, cf. _sync_zigbee_devices_direct) —
+    reflet direct du registre HA, jamais recalculé depuis nos propres `rooms` :
+    une pièce sans aucun device assigné n'a pas encore d'area HA correspondante,
+    et une pièce renommée directement dans HA reste exacte ici sans synchro."""
+    areas = _get_ha_areas()
+    return {
+        "ok": True,
+        "areas": [
+            {"area_id": a.get("area_id"), "name": a.get("name") or a.get("area_id")}
+            for a in areas
+            if isinstance(a, dict) and a.get("area_id")
+        ],
+    }
+
+
 # Actions matérielles sur évènement alarme (sirène/lumières...) — demande
 # Hicham (2026-08-05, "je veux tout" après explication des 3 features Alarmo
 # manquantes ; 2026-08-09, comparaison directe avec le panneau natif Alarmo
@@ -5966,12 +5985,17 @@ def _handle_ha_command(payload: bytes):
             # automations/route.ts l'envoie bien — toute automatisation avec condition
             # perdait cette condition dès sa création/mise à jour. Trouvé en construisant
             # _republish_automation() (migration Matter, 2026-08-01), corrigé au passage.
+            #
+            # (2026-09-02, bloc Actions) "mode" était figé en dur à "single" ici — le
+            # réglage de mode d'exécution (unique/redémarrer/file/parallèle) ajouté côté
+            # web n'aurait donc jamais atteint HA, quelle que soit la valeur envoyée.
+            # Repris depuis data (repli "single", comportement historique préservé).
             auto_cfg = {
                 "alias":     data.get("alias", object_id),
                 "trigger":   data.get("trigger", []),
                 "condition": data.get("condition", []),
                 "action":    data.get("action", []),
-                "mode":      "single",
+                "mode":      data.get("mode", "single"),
             }
             r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
             if r.ok:
@@ -8135,6 +8159,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_device_triggers_route()
         elif route == "/automations/calendars":
             self._handle_calendars_route()
+        elif route == "/automations/areas":
+            self._handle_areas_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -8184,6 +8210,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_list_calendars())
         except Exception as e:
             warn(f"[calendars] {e}")
+            self._reject(500, str(e))
+
+    def _handle_areas_route(self):
+        try:
+            self._ok(handle_list_areas())
+        except Exception as e:
+            warn(f"[areas] {e}")
             self._reject(500, str(e))
 
     def _handle_alarmo_panel_route(self):
