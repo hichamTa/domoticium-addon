@@ -2949,6 +2949,26 @@ def handle_get_device_triggers(ieee_address: str | None, matter_node_id: int | N
     return {"ok": True, "device_found": True, "triggers": triggers}
 
 
+def handle_list_calendars() -> dict:
+    """(2026-09-02) Liste les entités `calendar.*` déjà connues de HA — pour le
+    déclencheur d'automatisation "Calendrier" (bloc Déclencheurs de l'éditeur
+    avancé, demande Hicham). Aucune intégration calendrier n'est installée par
+    l'addon lui-même (Google Agenda/CalDAV/local — au client de la connecter
+    dans HA s'il le souhaite) ; cette route se contente de refléter ce qui
+    existe déjà, avec une liste vide si rien n'est configuré (même repli que
+    handle_get_device_triggers pour une télécommande jamais pressée)."""
+    r = ha_get("/states")
+    if not r.ok:
+        warn(f"[calendars] /states {r.status_code}: {r.text[:150]}")
+        return {"ok": False, "calendars": []}
+    calendars = [
+        {"entity_id": s.get("entity_id"), "name": (s.get("attributes") or {}).get("friendly_name") or s.get("entity_id")}
+        for s in r.json()
+        if isinstance(s, dict) and str(s.get("entity_id", "")).startswith("calendar.")
+    ]
+    return {"ok": True, "calendars": calendars}
+
+
 # Actions matérielles sur évènement alarme (sirène/lumières...) — demande
 # Hicham (2026-08-05, "je veux tout" après explication des 3 features Alarmo
 # manquantes ; 2026-08-09, comparaison directe avec le panneau natif Alarmo
@@ -8113,6 +8133,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_ha_automations_route()
         elif route == "/devices/triggers":
             self._handle_device_triggers_route()
+        elif route == "/automations/calendars":
+            self._handle_calendars_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -8155,6 +8177,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_get_device_triggers(ieee_address, matter_node_id))
         except Exception as e:
             warn(f"[device-triggers] {e}")
+            self._reject(500, str(e))
+
+    def _handle_calendars_route(self):
+        try:
+            self._ok(handle_list_calendars())
+        except Exception as e:
+            warn(f"[calendars] {e}")
             self._reject(500, str(e))
 
     def _handle_alarmo_panel_route(self):
