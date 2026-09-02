@@ -6347,6 +6347,13 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
                 "ieee_address": ieee, "name": default_name, "z2m_name": friendly_name,
                 "type": device_type, "vendor": definition.get("vendor") or "",
                 "model": definition.get("model") or "", "features": exposes,
+                # (2026-09-03) power_source Zigbee natif (cluster PowerSource, ex:
+                # "Mains (single phase)"/"Battery"/"Emergency mains constantly
+                # powered" pour un device secteur AVEC batterie de secours) — déjà lu
+                # juste en dessous pour _boost_device_reporting, transmis ici en plus
+                # pour le badge secteur/pile de l'app (purement informatif, jamais
+                # utilisé pour online/alerts).
+                "power_source": d.get("power_source") or "",
             })
 
             # (2026-09-01) Reporting "temps réel" appliqué AUTOMATIQUEMENT à tout
