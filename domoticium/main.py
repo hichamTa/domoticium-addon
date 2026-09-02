@@ -4873,6 +4873,53 @@ def _sync_areas_batch(rooms: list, devices: list, all_devices: list) -> list:
     return room_updates
 
 
+def _reconcile_device_states():
+    """(2026-09-02) Filet de réconciliation périodique pour `online` — bug réel
+    signalé par Hicham : "Ampoule couloir"/"Alarme entrée" hors ligne dans HA mais
+    toujours `online=true` côté app. Cause : `run_ha_ws_bridge()` (état événementiel,
+    seul chemin qui met à jour `online`) ne relaie QUE les `state_changed` reçus —
+    or HA ne republie JAMAIS un état "unavailable"/"unknown" en boucle une fois
+    émis. Une entité déjà hors ligne au démarrage de HA, ou tombée hors ligne
+    pendant une coupure de l'add-on (redémarrage, réseau), n'émet plus aucun
+    nouvel événement à relayer : `online` reste figé à sa dernière valeur
+    (`true`) indéfiniment, sans qu'aucun futur `state_changed` ne vienne le
+    corriger puisque rien ne change plus côté HA non plus.
+
+    Repousse SEULEMENT les entités actuellement unavailable/unknown (jamais un
+    état normal — pousser un état inchangé rafraîchirait artificiellement son
+    `last_seen`, qui sert par ailleurs à diagnostiquer la fraîcheur RÉELLE du
+    reporting Zigbee, cf. mesures de latence électrique HANDOFF 2026-09-01 ;
+    aucun risque ici puisqu'une entité déjà unavailable n'a justement plus de
+    valeur dont la fraîcheur compte). Même chemin qu'un vrai événement
+    (_relay_ha_state) — auto-réparateur à chaque cycle de sync (5 min), jamais
+    de logique dupliquée avec le bridge événementiel."""
+    r = ha_get("/states")
+    if not r.ok:
+        warn(f"[reconcile] /states {r.status_code}: {r.text[:150]}")
+        return
+    try:
+        states = r.json()
+    except Exception as e:
+        warn(f"[reconcile] réponse /states invalide: {e}")
+        return
+
+    n = 0
+    for s in states:
+        if not isinstance(s, dict):
+            continue
+        state_val = s.get("state", "")
+        if state_val not in ("unavailable", "unknown"):
+            continue
+        entity_id = s.get("entity_id", "")
+        domain = entity_id.split(".")[0] if "." in entity_id else ""
+        if domain not in RELAY_DOMAINS:
+            continue
+        _relay_ha_state(entity_id, state_val, s.get("attributes") or {})
+        n += 1
+    if n:
+        log(f"[reconcile] {n} entité(s) unavailable/unknown repoussée(s) (filet périodique)")
+
+
 def _sync_all_to_ha():
     """Récupère l'état complet depuis l'app et l'applique à HA (idempotent, une session WS)."""
     global _last_ha_status_publish, _last_z2m_devices_request
@@ -4949,6 +4996,7 @@ def _sync_all_to_ha():
 
     _backfill_ha_entity_links()
     _backfill_camera_entity_links()
+    _reconcile_device_states()
 
     log("[sync] ✓ Terminé")
 
@@ -5143,21 +5191,52 @@ def call_heartbeat_api():
     _heartbeat_direct()
 
 
+# Domaines HA à persister (filtre pour réduire le trafic — tout ce que l'app affiche).
+# Module-level (pas local à run_ha_ws_bridge) — réutilisé par _reconcile_device_states()
+# (2026-09-02) pour la réconciliation périodique ci-dessous, même filtre.
+RELAY_DOMAINS = {
+    "light", "switch", "cover", "lock", "fan", "valve", "humidifier", "climate",
+    "sensor", "binary_sensor", "input_boolean", "media_player", "camera",
+    "alarm_control_panel", "scene", "automation",
+    # select/number : entités secondaires de config (ex: mélodie/volume/durée
+    # d'une sirène de clavier) — jusqu'ici exclues du relai, donc jamais
+    # rafraîchies dans device_entities (état/attributs toujours vides), bug
+    # trouvé en conditions réelles (Hicham, 2026-08-10 : "Duration" affichait
+    # NaN, "Volume"/"Melody" restaient vides malgré des vraies valeurs côté HA).
+    "select", "number",
+}
+
+
+def _relay_ha_state(entity_id: str, state_val: str, attributes: dict):
+    """Pousse un état HA (entity_id/state/attributes) vers Supabase — même chemin
+    que ce que déclenche un `state_changed` réel (WS bridge) : alarm_control_panel
+    en appel direct (peu fréquent, pas besoin du batch), le reste accumulé dans
+    _state_batch (_flush_state_batch() l'envoie toutes les 2.5s, dédupliqué par
+    entity_id). Factorisé (2026-09-02) pour être appelable aussi depuis
+    _reconcile_device_states() — la réconciliation périodique doit produire
+    EXACTEMENT le même effet qu'un vrai événement, pas une logique parallèle."""
+    domain = entity_id.split(".")[0] if "." in entity_id else ""
+    if domain not in RELAY_DOMAINS or not INGEST_SECRET:
+        return
+    if domain == "alarm_control_panel":
+        threading.Thread(
+            target=_report_alarm_state_direct,
+            args=(entity_id, state_val, attributes),
+            daemon=True,
+        ).start()
+        return
+    with _state_batch_lock:
+        _state_batch[entity_id] = (state_val, attributes)
+
+
 def run_ha_ws_bridge():
     """Thread permanent : écoute HA WebSocket → persiste état + registre vers Supabase (ingest).
-    Seul canal d'état — remplace entièrement EMQX et les automations HA State Stream."""
-    # Domaines HA à persister (filtre pour réduire le trafic — tout ce que l'app affiche)
-    RELAY_DOMAINS = {
-        "light", "switch", "cover", "lock", "fan", "valve", "humidifier", "climate",
-        "sensor", "binary_sensor", "input_boolean", "media_player", "camera",
-        "alarm_control_panel", "scene", "automation",
-        # select/number : entités secondaires de config (ex: mélodie/volume/durée
-        # d'une sirène de clavier) — jusqu'ici exclues du relai, donc jamais
-        # rafraîchies dans device_entities (état/attributs toujours vides), bug
-        # trouvé en conditions réelles (Hicham, 2026-08-10 : "Duration" affichait
-        # NaN, "Volume"/"Melody" restaient vides malgré des vraies valeurs côté HA).
-        "select", "number",
-    }
+    Seul canal d'état événementiel — remplace entièrement EMQX et les automations HA
+    State Stream. Complété par _reconcile_device_states() (sync périodique, cf. plus
+    bas) pour les cas où AUCUN state_changed ne survient (ex: une entité déjà
+    "unavailable" au démarrage de l'add-on, ou depuis avant que l'add-on ne tourne —
+    HA ne republie jamais "unavailable" en boucle, donc rien ne corrige un online=true
+    resté stale sans ce filet)."""
     while True:
         ws_send, ws_recv, ws_close = _ha_ws_connect(long_lived=True)
         if not ws_send:
@@ -5181,34 +5260,10 @@ def run_ha_ws_bridge():
 
                 if event_type == "state_changed":
                     entity_id = data.get("entity_id", "")
-                    domain = entity_id.split(".")[0] if "." in entity_id else ""
-                    if domain not in RELAY_DOMAINS:
-                        continue
                     new_state = data.get("new_state")
                     if not new_state:
                         continue
-
-                    state_val = new_state.get("state", "")
-                    attributes = new_state.get("attributes", {})
-
-                    if domain == "alarm_control_panel":
-                        # Pas un "device" (pas de room/ieee) — table sites.alarm_*
-                        # dédiée, jamais dans le batch générique ci-dessous. Peu
-                        # fréquent (armements/déclenchements) → appel direct plutôt
-                        # que batché, pas besoin d'attendre 2.5s pour ce cas.
-                        if INGEST_SECRET:
-                            threading.Thread(
-                                target=_report_alarm_state_direct,
-                                args=(entity_id, state_val, attributes),
-                                daemon=True,
-                            ).start()
-                        continue
-
-                    # Accumule dans le batch — _flush_state_batch() envoie toutes les 2.5s.
-                    # La déduplication par entity_id conserve uniquement le dernier état.
-                    if INGEST_SECRET:
-                        with _state_batch_lock:
-                            _state_batch[entity_id] = (state_val, attributes)
+                    _relay_ha_state(entity_id, new_state.get("state", ""), new_state.get("attributes", {}))
 
                 elif event_type == "entity_registry_updated":
                     action = data.get("action")
