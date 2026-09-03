@@ -6028,8 +6028,21 @@ def _handle_ha_command(payload: bytes):
                 warn(f"[ha/command] Erreur script {object_id} : {r.status_code} {r.text[:200]}")
 
         elif cmd_type == "script_delete":
+            # (2026-09-03) VRAI BUG trouvé en vérifiant en conditions réelles (web) :
+            # un reload appelé IMMÉDIATEMENT après le DELETE course avec l'écriture
+            # disque de HA pour sa config store (Store.async_delay_save, écriture
+            # différée) — le reload peut relire le fichier AVANT que la suppression
+            # y soit effectivement écrite, et RECONSTRUIT le script "supprimé" à
+            # partir du contenu encore présent sur disque. Reproduit à répétition en
+            # testant depuis l'extérieur (DELETE + reload immédiat = résurrection
+            # systématique ; DELETE + quelques secondes d'attente, sans reload =
+            # suppression qui tient). Un client cliquant "Supprimer" sur une scène
+            # aurait donc pu se retrouver avec un script fantôme toujours actif côté
+            # HA, invisible dans l'app (plus de ligne DB), jamais nettoyé. Fix : petit
+            # délai avant le reload, le temps que l'écriture différée de HA se termine.
             r = requests.delete(f"{API}/config/script/config/{object_id}", headers=HDRS, timeout=10)
             if r.ok:
+                time.sleep(2)
                 ha_post("/services/script/reload", {})
                 log(f"[ha/command] Script HA supprimé : {object_id}")
             else:
@@ -6060,8 +6073,14 @@ def _handle_ha_command(payload: bytes):
                 warn(f"[ha/command] Erreur automation {object_id} : {r.status_code} {r.text[:200]}")
 
         elif cmd_type == "automation_delete":
+            # (2026-09-03) Même course reload/écriture disque que script_delete
+            # ci-dessus — cf. son commentaire pour le détail complet. Reproduit
+            # explicitement pour automation_delete aussi (pas seulement script_delete) :
+            # une automatisation supprimée depuis l'app pouvait rester ARMÉE côté HA
+            # (déclencheurs + actions toujours actifs), invisible dans l'app.
             r = requests.delete(f"{API}/config/automation/config/{object_id}", headers=HDRS, timeout=10)
             if r.ok:
+                time.sleep(2)
                 ha_post("/services/automation/reload", {})
                 log(f"[ha/command] Automation HA supprimée : {object_id}")
             else:
