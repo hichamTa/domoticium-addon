@@ -2969,6 +2969,39 @@ def handle_list_calendars() -> dict:
     return {"ok": True, "calendars": calendars}
 
 
+def handle_list_counters() -> dict:
+    """(2026-09-03) Liste les entités `counter.*` déjà connues de HA — pour
+    référencer un compteur existant (créé par le client dans HA, Réglages →
+    Assistants) dans une automatisation depuis l'app. Même principe que
+    handle_list_calendars ci-dessous : aucun compteur n'est créé par l'addon
+    lui-même, simple reflet de ce qui existe déjà côté HA."""
+    r = ha_get("/states")
+    if not r.ok:
+        warn(f"[counters] /states {r.status_code}: {r.text[:150]}")
+        return {"ok": False, "counters": []}
+    counters = [
+        {"entity_id": s.get("entity_id"), "name": (s.get("attributes") or {}).get("friendly_name") or s.get("entity_id")}
+        for s in r.json()
+        if isinstance(s, dict) and str(s.get("entity_id", "")).startswith("counter.")
+    ]
+    return {"ok": True, "counters": counters}
+
+
+def handle_list_timers() -> dict:
+    """(2026-09-03) Liste les entités `timer.*` déjà connues de HA — même
+    principe que handle_list_counters ci-dessus."""
+    r = ha_get("/states")
+    if not r.ok:
+        warn(f"[timers] /states {r.status_code}: {r.text[:150]}")
+        return {"ok": False, "timers": []}
+    timers = [
+        {"entity_id": s.get("entity_id"), "name": (s.get("attributes") or {}).get("friendly_name") or s.get("entity_id")}
+        for s in r.json()
+        if isinstance(s, dict) and str(s.get("entity_id", "")).startswith("timer.")
+    ]
+    return {"ok": True, "timers": timers}
+
+
 def handle_list_areas() -> dict:
     """(2026-09-02) Liste les areas (pièces) HA — pour l'action d'automatisation
     "Pièce entière" (bloc Actions de l'éditeur avancé, demande Hicham : "cibler
@@ -8242,6 +8275,10 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_calendars_route()
         elif route == "/automations/areas":
             self._handle_areas_route()
+        elif route == "/automations/counters":
+            self._handle_counters_route()
+        elif route == "/automations/timers":
+            self._handle_timers_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -8298,6 +8335,20 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_list_areas())
         except Exception as e:
             warn(f"[areas] {e}")
+            self._reject(500, str(e))
+
+    def _handle_counters_route(self):
+        try:
+            self._ok(handle_list_counters())
+        except Exception as e:
+            warn(f"[counters] {e}")
+            self._reject(500, str(e))
+
+    def _handle_timers_route(self):
+        try:
+            self._ok(handle_list_timers())
+        except Exception as e:
+            warn(f"[timers] {e}")
             self._reject(500, str(e))
 
     def _handle_alarmo_panel_route(self):
