@@ -6290,12 +6290,28 @@ def _detect_device_type(
     # catalogue réel (zigbee-herdsman-converters) : exposes = battery,
     # battery_voltage, enum "status" (idle/in/out), numeric "people".
     if "people" in names: return "people-counter"
+    # (2026-09-04) VRAI BUG trouvé par Hicham (télécommande STYRBAR figée en
+    # "sensor-generic", jamais reclassée malgré un recalcul correct à chaque
+    # sync — cf. migration 0107 pour le fix côté upsert_zigbee_device) : en
+    # creusant pourquoi le clavier d'alarme n'avait pas le même problème,
+    # trouvé un 2e bug latent, masqué jusqu'ici UNIQUEMENT parce que le type
+    # n'était jamais rafraîchi. Un clavier IAS ACE (cf. plus bas, "keypad")
+    # expose LUI AUSSI un champ top-level nommé "action" (mêmes valeurs
+    # disarm/arm_all_zones/... rangées DANS cet expose "action", pas un champ
+    # à part) — le check générique ci-dessous aurait donc TOUJOURS classé un
+    # clavier comme "remote" avant d'atteindre la règle "keypad" plus bas.
+    # Cf. _exposes_match_ias_ace_keypad : elle cherche elle-même
+    # expose.get("name") == "action", exactement la même signature. Le check
+    # spécifique clavier doit donc être évalué EN PREMIER, jamais après.
+    if _exposes_match_ias_ace_keypad(exposes, {"disarm", "arm_all_zones"}):
+        return "keypad"
     # Télécommande/bouton de scène (2026-08-27, audit 2026-08-19 : 284 devices
     # réels rien que dans le catalogue, très répandu) — expose top-level
     # "action" (enum single/double/hold…) sans aucun autre signal actionnable
     # (déjà éliminé par les checks light/switch/cover/climate/lock/fan/valve
-    # au-dessus). Pas d'état à afficher, cf. commentaire DeviceType "remote"
-    # côté web — juste reconnu pour servir de source de déclencheur.
+    # au-dessus, ET désormais par le check clavier juste au-dessus). Pas
+    # d'état à afficher, cf. commentaire DeviceType "remote" côté web — juste
+    # reconnu pour servir de source de déclencheur.
     if "action" in names: return "remote"
     if "temperature" in names or "humidity" in names: return "sensor-temp"
     # Serrure Tuya sans expose "lock" standard (easyiot ZB-ZL01, même audit) —
@@ -6338,18 +6354,10 @@ def _detect_device_type(
     if {"siren_volume", "siren_duration"}.issubset(names): return "siren"
     if {"melody", "alarm_duration", "volume"}.issubset(names): return "siren"
     if "siren_on" in names: return "siren"
-    # Clavier d'alarme (bug réel trouvé par Hicham, 2026-08-08 : "j'ai un
-    # interrupteur dans l'app alors qu'il n'y a aucune action à mener sur HA") —
-    # jusqu'ici, aucune signature dédiée : un clavier IAS ACE (action/tamper/
-    # battery_low, aucun expose light/switch/cover/etc.) tombait systématiquement
-    # dans le repli "switch" ci-dessous, lui donnant à tort un bouton marche/arrêt
-    # dans l'app alors qu'aucun service switch.* n'existe réellement pour lui côté
-    # HA. Même signature IAS ACE générique que _find_ias_ace_keypad (cluster
-    # standard, indépendant de la marque) — {"disarm", "arm_all_zones"} suffit à
-    # identifier un clavier compatible, mêmes actions minimales que le câblage
-    # arm/disarm existant.
-    if _exposes_match_ias_ace_keypad(exposes, {"disarm", "arm_all_zones"}):
-        return "keypad"
+    # Clavier d'alarme — détection déplacée plus haut (2026-09-04, cf. son
+    # commentaire juste après le check "people"), doit être évaluée AVANT la
+    # règle générique "action" -> "remote" puisqu'un clavier IAS ACE expose
+    # lui aussi un champ nommé "action".
     # Repli sûr (bug de fond, pas juste le clavier — question directe d'Hicham,
     # 2026-08-08 : "est-ce que ça fera la même chose pour un autre type qui ne
     # saurait pas se classer ?"). Réponse : oui, avant ce fix — "switch" était le
