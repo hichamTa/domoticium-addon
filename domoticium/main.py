@@ -3221,6 +3221,95 @@ def _mqtt_config_entry_exists() -> bool:
         return False
 
 
+def _shelly_submit(flow_id, payload, label):
+    """Soumet une étape du flow de config Shelly — même mécanique que _mqtt_submit."""
+    r = requests.post(f"{API}/config/config_entries/flow/{flow_id}",
+                       headers=HDRS, json=payload, timeout=15)
+    if not r.ok:
+        warn(f"[wifi-shelly] {label} erreur {r.status_code}: {r.text[:400]}")
+        return False, {}
+    result = _unwrap(r.json())
+    log(f"[wifi-shelly] {label} → type={result.get('type','?')} step={result.get('step_id','?')}")
+    return True, result
+
+
+def _build_shelly_host_payload(schema: list, host: str) -> dict:
+    """Construit le payload du flow HA 'shelly' à partir du schéma retourné — le
+    champ s'appelle 'host' d'après la doc officielle, mais on reste générique
+    (même précaution que _build_mqtt_broker_payload) pour ne pas dépendre d'un
+    nom de champ figé côté HA."""
+    schema_names = {f.get("name", "") for f in schema}
+    payload = {}
+    for k in ("host", "ip_address", "ip"):
+        if k in schema_names:
+            payload[k] = host
+            break
+    return payload
+
+
+def handle_wifi_shelly_discovered() -> list:
+    """Liste les appareils Shelly déjà détectés par la découverte zeroconf native
+    de HA — aucun scan actif nécessaire côté addon, HA crée automatiquement un
+    flow de config 'shelly' en arrière-plan dès qu'il voit l'appareil sur le
+    réseau local. Lu via WebSocket (config_entries/flow/progress) : le endpoint
+    REST /api/config/config_entries/flow ne supporte QUE POST (créer un flow),
+    pas de listing — vérifié dans le code source HA (config/config_entries.py,
+    2026-09)."""
+    result = _ha_ws_call("config_entries/flow/progress")
+    flows = ((result or {}).get("result")) or []
+    discovered = []
+    for f in flows:
+        if f.get("handler") != "shelly":
+            continue
+        ctx = f.get("context") or {}
+        name = (ctx.get("title_placeholders") or {}).get("name") or ctx.get("unique_id") or "Appareil Shelly"
+        discovered.append({"flowId": f.get("flow_id"), "name": name})
+    return discovered
+
+
+def handle_wifi_shelly_add(flow_id, host) -> dict:
+    """Confirme un appareil Shelly déjà découvert (flow_id fourni) OU démarre un
+    appairage manuel par adresse IP (host fourni) — les 2 chemins du config flow
+    HA 'shelly'. Gen2+ : aucune saisie supplémentaire nécessaire au-delà de
+    l'hôte. Gen1 : peut échouer si le CoIoT unicast n'est pas configuré côté
+    appareil lui-même (réglage à faire une fois dans l'app Shelly, hors de
+    portée de ce flow)."""
+    flow = None
+    if not flow_id:
+        start_resp = ha_post("/config/config_entries/flow", {"handler": "shelly"})
+        if not start_resp.ok:
+            return {"ok": False, "error": f"HA {start_resp.status_code}: {start_resp.text[:200]}"}
+        flow = _unwrap(start_resp.json())
+        if flow.get("type") == "create_entry":
+            return {"ok": True, "title": flow.get("title")}
+        flow_id = flow.get("flow_id")
+        if not flow_id:
+            return {"ok": False, "error": f"Pas de flow_id : {start_resp.text[:200]}"}
+        if flow.get("type") == "form":
+            payload = _build_shelly_host_payload(flow.get("data_schema", []), host or "")
+            ok, flow = _shelly_submit(flow_id, payload, "form step=user")
+            if not ok:
+                return {"ok": False, "error": "Échec de soumission du formulaire"}
+    else:
+        ok, flow = _shelly_submit(flow_id, {}, "confirm")
+        if not ok:
+            return {"ok": False, "error": "Échec de confirmation"}
+
+    flow_type = flow.get("type", "?")
+    if flow_type == "create_entry":
+        return {"ok": True, "title": flow.get("title")}
+    if flow_type == "abort":
+        return {"ok": False, "error": f"Refusé par HA ({flow.get('reason') or '?'})"}
+    if flow_type == "form":
+        return {
+            "ok": False,
+            "error": f"Étape supplémentaire requise ({flow.get('step_id')}) — non gérée",
+            "needsInput": flow.get("step_id"),
+            "errors": flow.get("errors"),
+        }
+    return {"ok": False, "error": f"Réponse HA inattendue : {flow}"}
+
+
 def configure_mqtt(force: bool = False):
     log("── MQTT (Mosquitto local) ───────────────────")
 
@@ -4318,6 +4407,145 @@ def _sync_matter_devices_direct(devices_payload) -> bool:
         return False
 
 
+# Domaines d'intégration HA natifs pris en charge sous l'onglet "Autre" de l'app
+# (équipements Wi-Fi, hors Zigbee/Matter) — Shelly pour commencer (2026-09-06,
+# cf. HANDOFF.md), extensible si Tasmota/autres sont ajoutés plus tard.
+_WIFI_INTEGRATION_DOMAINS = {"shelly"}
+
+# Priorité de domaine pour choisir l'entité "principale" d'un device physique
+# multi-entités (ex: prise Shelly avec un relais + un capteur de puissance) — un
+# actionneur prime sur un capteur, même logique éditoriale que Zigbee/Matter.
+_WIFI_DOMAIN_PRIORITY = ["light", "switch", "cover", "binary_sensor", "sensor"]
+
+_WIFI_BINARY_SENSOR_TYPE = {
+    "door": "sensor-contact", "window": "sensor-contact", "opening": "sensor-contact",
+    "motion": "sensor-motion", "occupancy": "sensor-motion",
+    "moisture": "sensor-water",
+}
+
+
+def _wifi_device_identifier(device_entry: dict):
+    """Extrait l'identifiant physique stable (ex: adresse MAC) d'un device HA
+    appartenant à un des domaines Wi-Fi pris en charge, depuis ses "identifiers"
+    (device_registry) — même rôle que l'adresse IEEE pour Zigbee, mais lu depuis
+    le device_registry plutôt que le unique_id d'une entité (Shelly n'a pas
+    d'équivalent MQTT retained bridge/devices dont on pourrait tirer la liste)."""
+    for domain, ident in device_entry.get("identifiers", []):
+        if domain in _WIFI_INTEGRATION_DOMAINS:
+            return ident
+    return None
+
+
+def _detect_wifi_device_type(domain: str, device_class):
+    """Déduit le DeviceType Domoticium depuis le domaine/device_class HA de
+    l'entité principale — construit à partir de la doc officielle HA (recherche
+    2026-09, cf. HANDOFF.md), PAS ENCORE VÉRIFIÉ SUR DU MATÉRIEL RÉEL faute de
+    Shelly physique disponible au moment de l'écriture. À revalider dès qu'un
+    vrai appareil est disponible (cf. arch-device-type-frozen-at-insert.md :
+    type se rafraîchit à chaque sync, donc une correction ultérieure se
+    propagera automatiquement, pas besoin de migration de rattrapage)."""
+    if domain == "light":
+        return "light"
+    if domain == "switch":
+        # Shelly ne distingue pas "prise" vs "interrupteur mural" au niveau du
+        # domaine HA (les deux sont des relais "switch") — "switch" est le
+        # DeviceType le plus neutre des deux, cf. DEVICE_TYPE_OPTIONS (web).
+        return "switch"
+    if domain == "cover":
+        return "cover"
+    if domain == "sensor" and device_class == "temperature":
+        return "sensor-temp"
+    if domain == "binary_sensor":
+        return _WIFI_BINARY_SENSOR_TYPE.get(device_class or "")
+    return None
+
+
+def _post_wifi_sync(devices_payload: list) -> bool:
+    """pi_sync_wifi_devices via Supabase direct — True si réussi."""
+    try:
+        ts = int(time.time())
+        id_sorted = ",".join(sorted(str(d["wifi_id"]) for d in devices_payload))
+        message = f"{SITE_PREFIX}:{ts}:wifi_sync:{id_sorted}"
+        r = _supabase_rpc("pi_sync_wifi_devices", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_devices": devices_payload,
+        }, timeout=30)
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_sync_wifi_devices {r.status_code}: {r.text[:200]}")
+            return False
+        log(f"[supabase] pi_sync_wifi_devices — {len(devices_payload)} devices, réponse: {r.text[:120]}")
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_sync_wifi_devices: {e}")
+        return False
+
+
+def _sync_wifi_devices_to_app():
+    """Réconciliation périodique des équipements Wi-Fi natifs HA (Shelly pour
+    commencer, cf. _WIFI_INTEGRATION_DOMAINS) → Supabase — même principe que
+    _sync_matter_devices_to_app(), mais la source est le device_registry HA
+    (pas de liste dédiée façon matter-server get_nodes() ou bridge/devices Z2M).
+    Groupe les entités par device_id HA, choisit une entité principale par
+    priorité de domaine, upsert via pi_sync_wifi_devices (clé wifi_id)."""
+    dev_result = _ha_ws_call("config/device_registry/list")
+    if not dev_result or not dev_result.get("success"):
+        return
+    ent_result = _ha_ws_call("config/entity_registry/list")
+    if not ent_result or not ent_result.get("success"):
+        return
+    states_result = _ha_ws_call("get_states")
+    states = states_result.get("result", []) if states_result and states_result.get("success") else []
+    states_by_entity = {s.get("entity_id"): s for s in states}
+
+    wifi_devices = {}
+    for d in dev_result.get("result", []):
+        wifi_id = _wifi_device_identifier(d)
+        if wifi_id:
+            wifi_devices[d.get("id")] = {
+                "wifi_id": wifi_id,
+                "name": d.get("name_by_user") or d.get("name") or "Appareil Wi-Fi",
+                "vendor": d.get("manufacturer") or "",
+                "model": d.get("model") or "",
+            }
+
+    entities_by_device: dict = {}
+    for e in ent_result.get("result", []):
+        did = e.get("device_id")
+        if did in wifi_devices:
+            entities_by_device.setdefault(did, []).append(e)
+
+    def _sort_key(e):
+        domain = e.get("entity_id", "").split(".")[0]
+        return _WIFI_DOMAIN_PRIORITY.index(domain) if domain in _WIFI_DOMAIN_PRIORITY else len(_WIFI_DOMAIN_PRIORITY)
+
+    devices_payload = []
+    for device_id, info in wifi_devices.items():
+        entities = [e for e in entities_by_device.get(device_id, [])
+                    if e.get("entity_category") not in ("diagnostic", "config")]
+        if not entities:
+            continue
+        entities.sort(key=_sort_key)
+        primary = entities[0]
+        primary_id = primary.get("entity_id", "")
+        domain = primary_id.split(".")[0] if "." in primary_id else ""
+        state = states_by_entity.get(primary_id) or {}
+        attrs = state.get("attributes") or {}
+        device_class = attrs.get("device_class") or primary.get("device_class") or primary.get("original_device_class")
+        device_type = _detect_wifi_device_type(domain, device_class) or "sensor-generic"
+
+        devices_payload.append({
+            "wifi_id": info["wifi_id"],
+            "ha_entity_id": primary_id,
+            "name": info["name"],
+            "type": device_type,
+            "vendor": info["vendor"],
+            "model": info["model"],
+            "online": state.get("state") != "unavailable",
+        })
+
+    _post_wifi_sync(devices_payload)
+
+
 def _sync_matter_devices_to_app():
     """Réconciliation périodique Matter → Supabase (analogue à bridge/devices Zigbee).
     Envoie la liste COMPLÈTE des nodes commissionnés — `pi_sync_matter_devices`
@@ -5022,6 +5250,10 @@ def _sync_all_to_ha():
     # auto-réparatrice si l'enregistrement post-commissioning a échoué ou a été manqué.
     _sync_matter_devices_to_app()
 
+    # Réconciliation équipements Wi-Fi natifs HA (onglet "Autre" — Shelly pour
+    # commencer, cf. HANDOFF.md 2026-09-06).
+    _sync_wifi_devices_to_app()
+
     # Réconciliation caméras — rattrape un ajout/suppression manqué par l'addon si le Pi
     # était hors-ligne au moment de l'action côté app (sinon une caméra supprimée dans
     # l'app pendant une coupure réseau resterait fantôme sur le Pi indéfiniment).
@@ -5054,6 +5286,17 @@ def _backfill_ha_entity_links():
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         return
+    # device_id HA → wifi_id (identifiant physique stable, ex: adresse MAC Shelly,
+    # cf. migration 0108) — même rôle que _IEEE_RE / _matter_node_id_from_unique_id
+    # ci-dessous, mais l'identifiant n'est pas dans unique_id : il faut passer par
+    # device_registry pour lire les "identifiers" ([domaine, valeur]) du device HA.
+    wifi_ids_by_device_id = {}
+    dev_result = _ha_ws_call("config/device_registry/list")
+    if dev_result and dev_result.get("success"):
+        for d in dev_result.get("result", []):
+            wid = _wifi_device_identifier(d)
+            if wid:
+                wifi_ids_by_device_id[d.get("id")] = wid
     # device_class/unit (2026-09-01) — Hicham, capture HA à l'appui : "sur Home
     # Assistant [...] j'arrive à avoir les unités et pas sur le site [...] que ce
     # soit du matter ou du zigbee". 1er jet : lu sur l'entrée entity_registry
@@ -5098,9 +5341,13 @@ def _backfill_ha_entity_links():
             payload["ieeeAddress"] = m.group(0)
         else:
             node_id = _matter_node_id_from_unique_id(unique_id)
-            if node_id is None:
-                continue
-            payload["matterNodeId"] = node_id
+            if node_id is not None:
+                payload["matterNodeId"] = node_id
+            else:
+                wifi_id = wifi_ids_by_device_id.get(e.get("device_id"))
+                if wifi_id is None:
+                    continue
+                payload["wifiId"] = wifi_id
         try:
             requests.post(f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
         except Exception as ex:
@@ -7893,6 +8140,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/alarmo/sensor-group":  self._handle_alarmo_sensor_group_route,
                 "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
                 "/matter/merge/reject":  self._handle_matter_merge_reject_route,
+                "/wifi/shelly/add":      self._handle_wifi_shelly_add_route,
             }
             handler = handlers.get(route)
             if not handler:
@@ -8287,6 +8535,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_counters_route()
         elif route == "/automations/timers":
             self._handle_timers_route()
+        elif route == "/wifi/shelly/discovered":
+            self._handle_wifi_shelly_discovered_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -8297,6 +8547,28 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         except Exception as e:
             warn(f"[camera-scan] {e}")
             self._reject(500, str(e))
+
+    def _handle_wifi_shelly_discovered_route(self):
+        try:
+            self._ok({"discovered": handle_wifi_shelly_discovered()})
+        except Exception as e:
+            warn(f"[wifi-shelly-discovered] {e}")
+            self._reject(500, str(e))
+
+    def _handle_wifi_shelly_add_route(self, data):
+        flow_id = data.get("flowId")
+        host = data.get("host")
+        if not flow_id and not host:
+            return self._reject(400, "flowId ou host requis")
+        try:
+            result = handle_wifi_shelly_add(flow_id, host)
+        except Exception as e:
+            warn(f"[wifi-shelly-add] {e}")
+            return self._reject(500, str(e))
+        if result.get("ok"):
+            self._ok(result)
+        else:
+            self._reject(502, result.get("error") or "Échec de l'ajout")
 
     def _handle_alarmo_sensors_route(self):
         try:
