@@ -6618,12 +6618,21 @@ def handle_local_devices() -> dict:
     areas = areas_result.get("result", []) if areas_result and areas_result.get("success") else []
     area_names = {a.get("area_id"): a.get("name") for a in areas}
 
-    rooms: dict[str, list] = {}
+    # Clé de regroupement = area_id HA brut (stable), pas le nom affiché — un
+    # nom peut se renommer, l'id HA non. "Sans pièce" (aucune area_id) regroupé
+    # sous la clé None, cohérent : local.ts (web/) a besoin d'un identifiant de
+    # pièce stable pour construire Room[] (roomId), pas juste un libellé.
+    rooms: dict[str | None, list] = {}
     for dev in _build_local_devices():
-        room_name = area_names.get(dev.get("areaId")) or "Sans pièce"
-        rooms.setdefault(room_name, []).append(dev)
+        area_id = dev.get("areaId")
+        rooms.setdefault(area_id, []).append(dev)
 
-    return {"rooms": [{"name": name, "devices": devs} for name, devs in rooms.items()]}
+    return {
+        "rooms": [
+            {"id": area_id, "name": area_names.get(area_id) or "Sans pièce", "devices": devs}
+            for area_id, devs in rooms.items()
+        ]
+    }
 
 
 def _get_ha_device_id(entity_id=None, ieee_address=None, matter_node_id=None):
