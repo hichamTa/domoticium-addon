@@ -6579,14 +6579,31 @@ def _build_local_devices() -> list[dict]:
             domain = eid.split(".")[0] if "." in eid else ""
             st = states_by_entity.get(eid) or {}
             attrs = st.get("attributes") or {}
+            writable = domain in _WRITABLE_DOMAINS
+            # "primaryEntity" ici = cette entité SECONDAIRE a, à titre individuel,
+            # un domaine qui matche le domaine attendu du type du device (flag
+            # cosmétique du chemin cloud, PORT de v_primary dans upsert_device_entity
+            # — rare en pratique, gardé pour fidélité). Ne PAS confondre avec le
+            # choix de l'entité PRINCIPALE du device (primary_id, plus haut).
+            primary_entity_flag = _EXPECTED_PRIMARY_DOMAIN.get(device_type) == domain
             secondary_entities.append({
                 "haEntityId": eid,
                 "domain": domain,
                 "friendlyName": e.get("name") or attrs.get("friendly_name") or e.get("original_name"),
                 "deviceClass": attrs.get("device_class") or e.get("device_class") or e.get("original_device_class"),
                 "unit": attrs.get("unit_of_measurement") or e.get("unit_of_measurement") or e.get("original_unit_of_measurement"),
-                "writable": domain in _WRITABLE_DOMAINS,
-                "state": _ha_entity_to_normalized_patch(eid, st.get("state"), attrs),
+                # Valeur brute HA (ex: "584"), PAS le patch normalisé (Device.state
+                # l'est, DeviceEntity.state ne l'est PAS — vérifié contre
+                # web/src/types/index.ts : "state?: string // valeur brute HA" — et
+                # web/src/lib/deviceEntities.ts, qui compare entity.state === "on",
+                # Number(entity.state)... jamais entity.state.on. Corrigé avant
+                # d'écrire local.ts plutôt qu'après coup.
+                "state": st.get("state"),
+                "primaryEntity": primary_entity_flag,
+                "writable": writable,
+                "visibleClient": True,
+                "shownOnCard": primary_entity_flag or writable,
+                "entityCategory": e.get("entity_category"),
             })
 
         devices_out.append({
