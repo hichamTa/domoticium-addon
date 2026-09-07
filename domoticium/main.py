@@ -1317,7 +1317,7 @@ def install_local_web_addon():
             log("✓ Dépôt Accès local ajouté")
             time.sleep(5)
         else:
-            warn(f"Dépôt Accès local : {r.status_code} — on continue")
+            warn(f"Dépôt Accès local : {r.status_code} {r.text[:200]} — on continue")
     else:
         r = sup_post("/store/reload", timeout=60)
         log(f"[local-web] Rafraîchissement du store → {r.status_code}")
