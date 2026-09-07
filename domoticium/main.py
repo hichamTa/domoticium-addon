@@ -6354,92 +6354,274 @@ def _get_ha_areas():
     return []
 
 
-_LOCAL_APP_INTERESTING_DOMAINS = {"light", "switch", "cover", "climate", "lock", "fan", "sensor", "binary_sensor", "alarm_control_panel"}
 _LOCAL_APP_NOISE_DOMAINS = {"update", "button", "event"}
 
+# Domaine HA "principal" attendu pour chaque DeviceType — PORT délibéré de
+# EXPECTED_DOMAIN (web/src/app/api/ingest/registry/route.ts), qui décide déjà
+# ce lien côté cloud (Zigbee2MQTT/Matter créent plusieurs entités par device
+# physique partageant la même adresse IEEE/node_id — sans ce filtre, n'importe
+# laquelle pourrait usurper le lien "entité principale"). Copie, pas un
+# import : aucun runtime JS partagé entre l'addon Python et web/ — même risque
+# de divergence déjà assumé et documenté pour _detect_device_type() (port de
+# detectDeviceType()). À tenir synchronisé à la main si EXPECTED_DOMAIN change
+# côté TS — cf. HANDOFF.md, étape 3 du chantier "vraie intégration locale".
+_EXPECTED_PRIMARY_DOMAIN = {
+    "light": "light", "switch": "switch", "plug": "switch", "cover": "cover",
+    "lock": "lock", "fan": "fan", "valve": "valve", "humidifier": "humidifier",
+    "thermostat": "climate", "sensor-motion": "binary_sensor",
+    "sensor-contact": "binary_sensor", "sensor-water": "binary_sensor",
+    "sensor-temp": "sensor",
+}
 
-def handle_local_devices() -> dict:
-    """Squelette du chantier "accès local" (2026-09-06, cf. HANDOFF.md) — liste
-    les équipements groupés par pièce, calculée DIRECTEMENT depuis HA (aucun
-    passage par Supabase). Volontairement simple pour l'instant : pas de
-    `_detect_device_type()`, juste domaine HA + device_class brut — première
-    preuve de bout en bout que le chemin 100% local fonctionne (app locale →
-    cette route → WebSocket HA), pas encore la classification fine déjà
-    utilisée côté sync cloud. À enrichir bloc par bloc au fur et à mesure du
-    chantier, pas figé comme le sont les routes /wifi/* ou /zigbee/*."""
-    areas_result = _ha_ws_call("config/area_registry/list")
-    areas = areas_result.get("result", []) if areas_result and areas_result.get("success") else []
-    area_names = {a.get("area_id"): a.get("name") for a in areas}
+# Domaines HA pilotables — PORT de v_writable (RPC Postgres upsert_device_entity)
+# — décide si une entité SECONDAIRE (multi-mesures/réglages d'un même device
+# physique) s'affiche comme pilotable ou en lecture seule. Même avertissement
+# de synchronisation manuelle que _EXPECTED_PRIMARY_DOMAIN ci-dessus.
+_WRITABLE_DOMAINS = {
+    "light", "switch", "cover", "climate", "lock", "fan",
+    "input_boolean", "input_number", "input_select", "select", "number",
+}
 
-    devices_result = _ha_ws_call("config/device_registry/list")
-    devices = devices_result.get("result", []) if devices_result and devices_result.get("success") else []
-    device_area = {d.get("id"): d.get("area_id") for d in devices}
 
-    # Device VIRTUEL créé par l'intégration MQTT pour exposer les contrôles du
-    # pont Zigbee2MQTT lui-même (permit join, restart, log level, version...) —
-    # pas un équipement du logement. La plupart de ses entités sont déjà
-    # filtrées par entity_category (diagnostic/config) ou domaine (button),
-    # SAUF le switch "Permit join" (entity_category vide côté Z2M) — trouvé en
-    # conditions réelles (Hicham, capture du dashboard local). Exclu par
-    # DEVICE plutôt qu'entité par entité : attrape aussi tout futur contrôle
-    # de pont que Z2M ajouterait avec la même absence de catégorie, pas
-    # seulement "Permit join" (vérifié contre les vraies données du site de
-    # test : 8 entités partagent ce device_id, manufacturer="Zigbee2MQTT",
-    # model="Bridge" — identité stable, pas un nom affiché renommable).
-    _noise_device_ids = {
-        d.get("id") for d in devices
-        if d.get("manufacturer") == "Zigbee2MQTT" and d.get("model") == "Bridge"
-    }
+def _build_local_devices() -> list[dict]:
+    """Construit la liste des équipements CLASSÉS (vrai DeviceType, entité
+    principale + entités secondaires, état normalisé) depuis les données
+    HA/Zigbee2MQTT/Matter locales — chantier "accès local", étape 3
+    (2026-09-07, cf. HANDOFF.md). Remplace le squelette v1 de
+    handle_local_devices() (domaine HA brut, pas de vrai type) posé le
+    2026-09-06 comme 1re preuve de bout en bout.
 
-    entities_result = _ha_ws_call("config/entity_registry/list")
-    entities = entities_result.get("result", []) if entities_result and entities_result.get("success") else []
+    Réutilise EXACTEMENT les mêmes fonctions déjà utilisées pour la synchro
+    cloud plutôt que d'en réécrire une 2e copie divergente :
+    _detect_device_type() (Zigbee), _extract_matter_device_info() (Matter),
+    _detect_wifi_device_type() (Wi-Fi natif HA), _ha_entity_to_normalized_patch()
+    (état), _ha_attributes_to_capabilities() (capacités/limites) — mêmes
+    fonctions Python, appelées directement, donc IMPOSSIBLE de diverger avec
+    le chemin cloud pour un même device (contrairement à
+    _EXPECTED_PRIMARY_DOMAIN/_WRITABLE_DOMAINS ci-dessus, qui SONT une 2e
+    copie faute d'équivalent Python déjà existant côté cloud — cette
+    logique-là vit dans web/src/app/api/ingest/registry/route.ts, en TypeScript,
+    donc pas directement appelable depuis l'addon).
 
+    Le panneau d'alarme (alarm_control_panel.*) est délibérément HORS de cette
+    liste — dans l'architecture réelle (cf. types.ts, InitialState), l'alarme
+    n'est PAS un Device : état/commandes passent par un chemin séparé
+    (SiteStatusUpdate/sendAlarmCommand), pas encore construit pour le mode
+    local — prochain morceau du chantier, pas celui-ci."""
+    dev_result = _ha_ws_call("config/device_registry/list")
+    devices_ha = dev_result.get("result", []) if dev_result and dev_result.get("success") else []
+    ent_result = _ha_ws_call("config/entity_registry/list")
+    entities = ent_result.get("result", []) if ent_result and ent_result.get("success") else []
     states_result = _ha_ws_call("get_states")
     states = states_result.get("result", []) if states_result and states_result.get("success") else []
     states_by_entity = {s.get("entity_id"): s for s in states}
 
-    # Entités internes HA/Supervisor (CPU/mémoire/version de chaque module,
-    # sauvegardes...) — identifiées par leur VRAI attribut technique (platform),
-    # pas par une liste de noms devinés à la main (fragile, jamais complète en
-    # pratique — trouvé en conditions réelles, Hicham : capture montrant
-    # "Sans pièce" pollué malgré le 1er filtre par domaine/entity_category).
-    _NOISE_PLATFORMS = {"hassio", "backup"}
+    # Device VIRTUEL créé par l'intégration MQTT pour exposer les contrôles du
+    # pont Zigbee2MQTT lui-même (permit join, restart, log level...) — pas un
+    # équipement du logement (cf. v2.9.164, filtre déjà vérifié en conditions
+    # réelles). Exclu explicitement AVANT toute tentative de classification —
+    # ses entités contiennent l'adresse IEEE du COORDINATEUR dans leur
+    # unique_id (ex: "bridge_0x449fdafffe78a7d5_permit_join_zigbee2mqtt"), qui
+    # matcherait sinon _IEEE_RE comme un faux device Zigbee.
+    _noise_device_ids = {
+        d.get("id") for d in devices_ha
+        if d.get("manufacturer") == "Zigbee2MQTT" and d.get("model") == "Bridge"
+    }
+
+    # ── Identité (DeviceType/vendor/model) par protocole ────────────────────
+
+    # Zigbee : ieee_address -> identité, depuis le cache MQTT bridge/devices
+    # (_last_z2m_devices_list, déjà tenu à jour en continu par on_local_message)
+    # — aucun nouvel appel réseau, contrairement à un premier réflexe qui
+    # aurait interrogé Z2M à la demande.
+    zigbee_by_ieee: dict[str, dict] = {}
+    for d in _last_z2m_devices_list:
+        if d.get("type") == "Coordinator":
+            continue
+        ieee = d.get("ieee_address")
+        if not ieee:
+            continue
+        definition = d.get("definition") or {}
+        exposes = definition.get("exposes") or []
+        zigbee_by_ieee[ieee] = {
+            "type": _detect_device_type(
+                exposes, ieee_address=ieee, ha_entities=entities,
+                vendor=definition.get("vendor"), model=definition.get("model"),
+            ),
+            "vendor": definition.get("vendor") or "",
+            "model": definition.get("model") or "",
+        }
+
+    # Matter : node_id -> identité, depuis matter-server (get_nodes).
+    matter_by_node: dict[int, dict] = {}
+    for node in _matter_get_nodes():
+        node_id, vendor, product, device_type = _extract_matter_device_info(node)
+        if node_id is not None:
+            matter_by_node[node_id] = {"type": device_type, "vendor": vendor, "model": product}
+
+    # Wi-Fi natif HA (Shelly...) : device_id HA -> wifi_id + vendor/model, déjà
+    # présents tels quels dans device_registry (pas de "exposes" séparé comme
+    # Z2M — cf. _wifi_device_identifier).
+    wifi_by_device_id: dict[str, dict] = {}
+    for d in devices_ha:
+        wifi_id = _wifi_device_identifier(d)
+        if wifi_id:
+            wifi_by_device_id[d.get("id")] = {
+                "wifi_id": wifi_id,
+                "vendor": d.get("manufacturer") or "",
+                "model": d.get("model") or "",
+            }
+
+    entities_by_device_id: dict[str, list] = {}
+    for e in entities:
+        did = e.get("device_id")
+        if did:
+            entities_by_device_id.setdefault(did, []).append(e)
+
+    devices_out: list[dict] = []
+
+    for dev in devices_ha:
+        device_id = dev.get("id")
+        if not device_id or device_id in _noise_device_ids:
+            continue
+        entities_here = entities_by_device_id.get(device_id, [])
+        if not entities_here:
+            continue
+
+        # Entités utilisables : jamais diagnostic/config, jamais un domaine de
+        # bruit pur (update/button/event) — même filtre que le chemin cloud
+        # (NOISE_DOMAINS côté web, _sync_wifi_devices_to_app côté addon).
+        usable = [
+            e for e in entities_here
+            if e.get("entity_category") not in ("diagnostic", "config")
+            and (e.get("entity_id", "").split(".", 1)[0] if "." in e.get("entity_id", "") else "") not in _LOCAL_APP_NOISE_DOMAINS
+        ]
+        if not usable:
+            continue
+
+        # Identité du device HA : Zigbee (unique_id -> ieee) puis Matter
+        # (unique_id -> node_id) puis Wi-Fi (identifiers du device_registry) —
+        # un device HA n'appartient jamais qu'à un seul de ces 3 protocoles.
+        ieee = None
+        matter_node_id = None
+        identity = None
+        for e in entities_here:
+            m = _IEEE_RE.search(e.get("unique_id") or "")
+            if m:
+                ieee = m.group(0)
+                identity = zigbee_by_ieee.get(ieee)
+                break
+            node_id = _matter_node_id_from_unique_id(e.get("unique_id"))
+            if node_id is not None:
+                matter_node_id = node_id
+                identity = matter_by_node.get(node_id)
+                break
+        wifi_info = wifi_by_device_id.get(device_id)
+
+        if wifi_info and identity is None:
+            # Choix de l'entité principale par PRIORITÉ de domaine (pas par
+            # DeviceType attendu — le type n'est justement connu qu'APRÈS ce
+            # choix côté Wi-Fi) — même algorithme, même ordre que
+            # _sync_wifi_devices_to_app(), copié à l'identique plutôt que
+            # factorisé pour l'instant (2 call sites seulement).
+            usable_sorted = sorted(
+                usable,
+                key=lambda e: (
+                    _WIFI_DOMAIN_PRIORITY.index(e["entity_id"].split(".")[0])
+                    if e["entity_id"].split(".")[0] in _WIFI_DOMAIN_PRIORITY
+                    else len(_WIFI_DOMAIN_PRIORITY)
+                ),
+            )
+            primary = usable_sorted[0]
+            primary_domain = primary["entity_id"].split(".")[0]
+            primary_state0 = states_by_entity.get(primary["entity_id"]) or {}
+            primary_attrs0 = primary_state0.get("attributes") or {}
+            device_class = primary_attrs0.get("device_class") or primary.get("device_class") or primary.get("original_device_class")
+            device_type = _detect_wifi_device_type(primary_domain, device_class) or "sensor-generic"
+            vendor, model = wifi_info["vendor"], wifi_info["model"]
+        elif identity:
+            device_type = identity["type"]
+            vendor, model = identity["vendor"], identity["model"]
+            expected_domain = _EXPECTED_PRIMARY_DOMAIN.get(device_type)
+            primary = next(
+                (e for e in usable
+                 if (e.get("entity_id", "").split(".")[0] if "." in e.get("entity_id", "") else "") == expected_domain
+                 and not e.get("entity_category")),
+                usable[0],  # repli : aucune entité ne matche le domaine attendu du type -> 1re utilisable plutôt que perdre le device
+            )
+        else:
+            # Device HA reconnu par aucun des 3 protocoles pris en charge —
+            # ignoré plutôt que mal classé (même repli sûr que
+            # _extract_matter_device_info pour un type inconnu : jamais un
+            # faux actionneur par défaut, ni un faux type Zigbee/Wi-Fi).
+            continue
+
+        primary_id = primary.get("entity_id", "")
+        primary_state = states_by_entity.get(primary_id) or {}
+        primary_attrs = primary_state.get("attributes") or {}
+        online = primary_state.get("state") not in (None, "unavailable")
+        # Même repli que le squelette v1 : friendly_name de l'ÉTAT avant le nom
+        # du registre (beaucoup d'entités platform "mqtt" n'ont ni name ni
+        # original_name) — nom du DEVICE HA (name_by_user/name) en priorité
+        # absolue ici, plus fiable qu'un nom d'entité isolée pour un device
+        # multi-entités.
+        name = (
+            dev.get("name_by_user") or dev.get("name")
+            or primary.get("name") or primary_attrs.get("friendly_name")
+            or primary.get("original_name") or primary_id
+        )
+
+        secondary_entities = []
+        for e in usable:
+            eid = e.get("entity_id", "")
+            if eid == primary_id:
+                continue
+            domain = eid.split(".")[0] if "." in eid else ""
+            st = states_by_entity.get(eid) or {}
+            attrs = st.get("attributes") or {}
+            secondary_entities.append({
+                "haEntityId": eid,
+                "domain": domain,
+                "friendlyName": e.get("name") or attrs.get("friendly_name") or e.get("original_name"),
+                "deviceClass": attrs.get("device_class") or e.get("device_class") or e.get("original_device_class"),
+                "unit": attrs.get("unit_of_measurement") or e.get("unit_of_measurement") or e.get("original_unit_of_measurement"),
+                "writable": domain in _WRITABLE_DOMAINS,
+                "state": _ha_entity_to_normalized_patch(eid, st.get("state"), attrs),
+            })
+
+        devices_out.append({
+            "id": primary_id,  # pas d'UUID Supabase en local — l'entity_id HA principal identifie le device de façon stable
+            "haEntityId": primary_id,
+            "name": name,
+            "type": device_type,
+            "vendor": vendor,
+            "model": model,
+            "ieeeAddress": ieee,
+            "matterNodeId": matter_node_id,
+            "wifiId": wifi_info.get("wifi_id") if wifi_info else None,
+            "online": online,
+            "lastSeen": primary_state.get("last_changed"),
+            "areaId": dev.get("area_id"),
+            "capabilities": _ha_attributes_to_capabilities(primary_id, primary_attrs),
+            "state": _ha_entity_to_normalized_patch(primary_id, primary_state.get("state"), primary_attrs),
+            "entities": secondary_entities,
+        })
+
+    return devices_out
+
+
+def handle_local_devices() -> dict:
+    """Route locale /local/devices — équipements RÉELLEMENT classés (voir
+    _build_local_devices()), groupés par pièce. Chantier "accès local", étape
+    3 (2026-09-07, cf. HANDOFF.md) — remplace le squelette v1 du 2026-09-06."""
+    areas_result = _ha_ws_call("config/area_registry/list")
+    areas = areas_result.get("result", []) if areas_result and areas_result.get("success") else []
+    area_names = {a.get("area_id"): a.get("name") for a in areas}
 
     rooms: dict[str, list] = {}
-    for e in entities:
-        entity_id = e.get("entity_id", "")
-        domain = entity_id.split(".")[0] if "." in entity_id else ""
-        if domain not in _LOCAL_APP_INTERESTING_DOMAINS or domain in _LOCAL_APP_NOISE_DOMAINS:
-            continue
-        if e.get("entity_category") in ("diagnostic", "config"):
-            continue
-        if e.get("platform") in _NOISE_PLATFORMS:
-            continue
-        if e.get("device_id") in _noise_device_ids:
-            continue
-
-        state = states_by_entity.get(entity_id) or {}
-        area_id = e.get("area_id") or device_area.get(e.get("device_id"))
-        room_name = area_names.get(area_id) or "Sans pièce"
-
-        # Beaucoup d'entités MQTT/Zigbee (platform: "mqtt") n'ont NI name NI
-        # original_name dans le registre — leur seul nom lisible vit dans
-        # l'attribut friendly_name de l'ÉTAT, jamais le registre (même piège
-        # déjà documenté pour _backfill_ha_entity_links(), pas appliqué ici la
-        # 1re fois — corrigé). Reste un repli technique en dernier recours pour
-        # les équipements dont même friendly_name n'est qu'une adresse brute
-        # (ex: une ampoule Zigbee sans nom HA — son "joli nom" client n'existe
-        # que côté Supabase, jamais dans HA lui-même : hors de portée du 100%
-        # local tant qu'aucun cache local des noms personnalisés n'existe).
-        attrs = state.get("attributes") or {}
-        name = e.get("name") or attrs.get("friendly_name") or e.get("original_name") or entity_id
-
-        rooms.setdefault(room_name, []).append({
-            "entityId": entity_id,
-            "name": name,
-            "domain": domain,
-            "state": state.get("state"),
-        })
+    for dev in _build_local_devices():
+        room_name = area_names.get(dev.get("areaId")) or "Sans pièce"
+        rooms.setdefault(room_name, []).append(dev)
 
     return {"rooms": [{"name": name, "devices": devs} for name, devs in rooms.items()]}
 
