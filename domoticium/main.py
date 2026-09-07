@@ -6247,6 +6247,57 @@ def _get_ha_areas():
     return []
 
 
+_LOCAL_APP_INTERESTING_DOMAINS = {"light", "switch", "cover", "climate", "lock", "fan", "sensor", "binary_sensor"}
+_LOCAL_APP_NOISE_DOMAINS = {"update", "button", "event"}
+
+
+def handle_local_devices() -> dict:
+    """Squelette du chantier "accès local" (2026-09-06, cf. HANDOFF.md) — liste
+    les équipements groupés par pièce, calculée DIRECTEMENT depuis HA (aucun
+    passage par Supabase). Volontairement simple pour l'instant : pas de
+    `_detect_device_type()`, juste domaine HA + device_class brut — première
+    preuve de bout en bout que le chemin 100% local fonctionne (app locale →
+    cette route → WebSocket HA), pas encore la classification fine déjà
+    utilisée côté sync cloud. À enrichir bloc par bloc au fur et à mesure du
+    chantier, pas figé comme le sont les routes /wifi/* ou /zigbee/*."""
+    areas_result = _ha_ws_call("config/area_registry/list")
+    areas = areas_result.get("result", []) if areas_result and areas_result.get("success") else []
+    area_names = {a.get("area_id"): a.get("name") for a in areas}
+
+    devices_result = _ha_ws_call("config/device_registry/list")
+    devices = devices_result.get("result", []) if devices_result and devices_result.get("success") else []
+    device_area = {d.get("id"): d.get("area_id") for d in devices}
+
+    entities_result = _ha_ws_call("config/entity_registry/list")
+    entities = entities_result.get("result", []) if entities_result and entities_result.get("success") else []
+
+    states_result = _ha_ws_call("get_states")
+    states = states_result.get("result", []) if states_result and states_result.get("success") else []
+    states_by_entity = {s.get("entity_id"): s for s in states}
+
+    rooms: dict[str, list] = {}
+    for e in entities:
+        entity_id = e.get("entity_id", "")
+        domain = entity_id.split(".")[0] if "." in entity_id else ""
+        if domain not in _LOCAL_APP_INTERESTING_DOMAINS or domain in _LOCAL_APP_NOISE_DOMAINS:
+            continue
+        if e.get("entity_category") in ("diagnostic", "config"):
+            continue
+
+        state = states_by_entity.get(entity_id) or {}
+        area_id = e.get("area_id") or device_area.get(e.get("device_id"))
+        room_name = area_names.get(area_id) or "Sans pièce"
+
+        rooms.setdefault(room_name, []).append({
+            "entityId": entity_id,
+            "name": e.get("name") or e.get("original_name") or entity_id,
+            "domain": domain,
+            "state": state.get("state"),
+        })
+
+    return {"rooms": [{"name": name, "devices": devs} for name, devs in rooms.items()]}
+
+
 def _get_ha_device_id(entity_id=None, ieee_address=None, matter_node_id=None):
     """Retourne le device_id HA depuis entity_id, ieee_address (Zigbee) ou
     matter_node_id (WebSocket) — matter_node_id est le repli nécessaire pour un
@@ -8537,6 +8588,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_timers_route()
         elif route == "/wifi/shelly/discovered":
             self._handle_wifi_shelly_discovered_route()
+        elif route == "/local/devices":
+            self._handle_local_devices_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -8546,6 +8599,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok({"cameras": cameras})
         except Exception as e:
             warn(f"[camera-scan] {e}")
+            self._reject(500, str(e))
+
+    def _handle_local_devices_route(self):
+        try:
+            self._ok(handle_local_devices())
+        except Exception as e:
+            warn(f"[local-devices] {e}")
             self._reject(500, str(e))
 
     def _handle_wifi_shelly_discovered_route(self):
