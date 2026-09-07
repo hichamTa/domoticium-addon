@@ -6354,7 +6354,7 @@ def _get_ha_areas():
     return []
 
 
-_LOCAL_APP_INTERESTING_DOMAINS = {"light", "switch", "cover", "climate", "lock", "fan", "sensor", "binary_sensor"}
+_LOCAL_APP_INTERESTING_DOMAINS = {"light", "switch", "cover", "climate", "lock", "fan", "sensor", "binary_sensor", "alarm_control_panel"}
 _LOCAL_APP_NOISE_DOMAINS = {"update", "button", "event"}
 
 
