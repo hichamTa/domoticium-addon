@@ -6382,6 +6382,13 @@ def handle_local_devices() -> dict:
     states = states_result.get("result", []) if states_result and states_result.get("success") else []
     states_by_entity = {s.get("entity_id"): s for s in states}
 
+    # Entités internes HA/Supervisor (CPU/mémoire/version de chaque module,
+    # sauvegardes...) — identifiées par leur VRAI attribut technique (platform),
+    # pas par une liste de noms devinés à la main (fragile, jamais complète en
+    # pratique — trouvé en conditions réelles, Hicham : capture montrant
+    # "Sans pièce" pollué malgré le 1er filtre par domaine/entity_category).
+    _NOISE_PLATFORMS = {"hassio", "backup"}
+
     rooms: dict[str, list] = {}
     for e in entities:
         entity_id = e.get("entity_id", "")
@@ -6390,14 +6397,28 @@ def handle_local_devices() -> dict:
             continue
         if e.get("entity_category") in ("diagnostic", "config"):
             continue
+        if e.get("platform") in _NOISE_PLATFORMS:
+            continue
 
         state = states_by_entity.get(entity_id) or {}
         area_id = e.get("area_id") or device_area.get(e.get("device_id"))
         room_name = area_names.get(area_id) or "Sans pièce"
 
+        # Beaucoup d'entités MQTT/Zigbee (platform: "mqtt") n'ont NI name NI
+        # original_name dans le registre — leur seul nom lisible vit dans
+        # l'attribut friendly_name de l'ÉTAT, jamais le registre (même piège
+        # déjà documenté pour _backfill_ha_entity_links(), pas appliqué ici la
+        # 1re fois — corrigé). Reste un repli technique en dernier recours pour
+        # les équipements dont même friendly_name n'est qu'une adresse brute
+        # (ex: une ampoule Zigbee sans nom HA — son "joli nom" client n'existe
+        # que côté Supabase, jamais dans HA lui-même : hors de portée du 100%
+        # local tant qu'aucun cache local des noms personnalisés n'existe).
+        attrs = state.get("attributes") or {}
+        name = e.get("name") or attrs.get("friendly_name") or e.get("original_name") or entity_id
+
         rooms.setdefault(room_name, []).append({
             "entityId": entity_id,
-            "name": e.get("name") or e.get("original_name") or entity_id,
+            "name": name,
             "domain": domain,
             "state": state.get("state"),
         })
