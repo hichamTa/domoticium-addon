@@ -150,6 +150,18 @@ GO2RTC_API_BASE = "http://127.0.0.1:1984"
 MOSQUITTO_SLUG = "core_mosquitto"
 MOSQUITTO_USER = "domoticium"
 
+# ── Add-on "Domoticium — Accès local" (chantier 2026-09-06, cf. HANDOFF.md côté
+# web) — 2e add-on séparé (dépôt GitHub dédié, jamais fusionné avec celui-ci
+# pour ne courir aucun risque sur l'addon en production) installé et mis à
+# jour automatiquement par CET addon, exactement comme Frigate ci-dessus.
+# LOCAL_WEB_SLUG est un repli codé en dur (deviné à partir de la formule
+# observée pour Frigate) — TOUJOURS écrasé par _resolve_local_web_slug() une
+# fois le dépôt indexé par le Supervisor, jamais utilisé tel quel en prod
+# (même prudence que pour FRIGATE_SLUG, cf. commentaire au-dessus : deviner le
+# hash a déjà été faux une fois par le passé).
+LOCAL_WEB_REPO = "https://github.com/hichamTa/domoticium-local-web"
+LOCAL_WEB_SLUG = "domoticium_local_web"
+
 # ── Mot de passe Mosquitto — généré une fois, persisté dans /data/ ─────────────
 _MOSQUITTO_PASS_FILE = "/data/mosquitto_pass"
 if os.path.exists(_MOSQUITTO_PASS_FILE):
@@ -1242,6 +1254,99 @@ def install_frigate():
     if _configure_frigate_and_start():
         return
     warn("Frigate toujours inopérationnel après réinstallation — vérifier les logs Frigate dans HA")
+
+
+def _resolve_local_web_slug(attempts: int = 4, delay: float = 5.0) -> bool:
+    """Détermine le VRAI slug de l'add-on "Domoticium — Accès local" installable
+    depuis LOCAL_WEB_REPO — même technique et même prudence que
+    _resolve_frigate_slug() (deviner le hash du dépôt a déjà été faux une fois
+    en prod, cf. commentaire de FRIGATE_SLUG). Met à jour la variable globale
+    LOCAL_WEB_SLUG si trouvé."""
+    global LOCAL_WEB_SLUG
+    for attempt in range(1, attempts + 1):
+        try:
+            r = sup_get("/store/repositories")
+            body = r.json()
+            repos = body.get("data", body) if isinstance(body, dict) else body
+            repos = repos.get("repositories", repos) if isinstance(repos, dict) else repos
+            repo_slug = next(
+                (repo.get("slug") for repo in repos
+                 if isinstance(repo, dict) and repo.get("source") == LOCAL_WEB_REPO),
+                None,
+            )
+            if repo_slug:
+                r2 = sup_get("/store/addons")
+                body2 = r2.json()
+                addons = body2.get("data", body2) if isinstance(body2, dict) else body2
+                addons = addons.get("addons", addons) if isinstance(addons, dict) else addons
+                for addon in addons:
+                    if (
+                        isinstance(addon, dict)
+                        and addon.get("repository") == repo_slug
+                        and str(addon.get("slug", "")).endswith("_domoticium_local_web")
+                    ):
+                        LOCAL_WEB_SLUG = addon["slug"]
+                        log(f"[local-web] Slug résolu dynamiquement : {LOCAL_WEB_SLUG}")
+                        return True
+        except Exception as e:
+            warn(f"[local-web] Résolution du slug (tentative {attempt}/{attempts}) : {e}")
+        if attempt < attempts:
+            time.sleep(delay)
+    warn("[local-web] Impossible de résoudre le slug depuis le store — utilisation du fallback codé en dur")
+    return False
+
+
+def install_local_web_addon():
+    """Installe ET met à jour automatiquement l'add-on "Domoticium — Accès
+    local" (chantier 2026-09-06, cf. HANDOFF.md côté web) — même schéma que
+    install_frigate() pour un dépôt tiers, en plus simple (pas de config à
+    écrire avant installation, pas de logique de réinstallation en cas
+    d'échec — à ajouter plus tard si un vrai besoin apparaît en conditions
+    réelles, pas anticipé sans preuve).
+
+    Idempotent — appelé à chaque démarrage de l'addon, comme install_alarmo().
+    Transmet automatiquement ingest_secret (déjà connu de CET addon) aux
+    options du nouvel add-on — aucune saisie manuelle pour Hicham, jamais.
+    """
+    log("── Domoticium — Accès local ─────────────────")
+
+    existing_urls = _sup_repos()
+    if LOCAL_WEB_REPO not in existing_urls:
+        r = sup_post("/store/repositories", {"repository": LOCAL_WEB_REPO})
+        if r.ok:
+            log("✓ Dépôt Accès local ajouté")
+            time.sleep(5)
+        else:
+            warn(f"Dépôt Accès local : {r.status_code} — on continue")
+    else:
+        r = sup_post("/store/reload", timeout=60)
+        log(f"[local-web] Rafraîchissement du store → {r.status_code}")
+
+    _resolve_local_web_slug()
+
+    if not _is_addon_installed(LOCAL_WEB_SLUG):
+        log("Installation de l'add-on Accès local…")
+        r = sup_post(f"/store/addons/{LOCAL_WEB_SLUG}/install", timeout=180)
+        if not (r.ok or "already_installed" in r.text or "already installed" in r.text.lower()):
+            warn(f"Installation Accès local : {r.status_code} {r.text[:200]}")
+            return
+        log("✓ Add-on Accès local installé")
+        time.sleep(5)
+    else:
+        log("Add-on Accès local déjà installé")
+
+    # ingest_secret transmis à chaque démarrage (pas seulement à l'install) —
+    # couvre le cas d'une rotation future du secret côté site, idempotent si
+    # inchangé (mêmes options réécrites, sans effet).
+    r = sup_post(f"/addons/{LOCAL_WEB_SLUG}/options", {"options": {"ingest_secret": INGEST_SECRET}})
+    if not r.ok:
+        warn(f"[local-web] Écriture ingest_secret : {r.status_code} {r.text[:200]}")
+
+    r = sup_post(f"/addons/{LOCAL_WEB_SLUG}/start")
+    if r.ok or "already" in r.text.lower():
+        log("✓ Add-on Accès local démarré")
+    else:
+        warn(f"[local-web] Démarrage : {r.status_code} {r.text[:200]}")
 
 
 _FRIGATE_AUTH_MARKER = "/data/.frigate_auth_disabled"
@@ -9010,6 +9115,7 @@ if __name__ == "__main__":
         log("Déjà configuré — démarrage du service.")
 
     install_alarmo()  # idempotent — vérifie/installe Alarmo à chaque démarrage
+    install_local_web_addon()  # idempotent — vérifie/installe l'add-on "Accès local" à chaque démarrage
     _ensure_alarmo_night_mode()  # idempotent — active le mode nuit une fois par site
     _ensure_alarmo_area_name()  # idempotent — renomme la zone "Alarmo" → "Habitation"
     _ensure_z2m_availability()  # idempotent — patch les sites déjà provisionnés
