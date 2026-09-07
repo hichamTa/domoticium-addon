@@ -172,6 +172,25 @@ else:
     with open(_MOSQUITTO_PASS_FILE, "w") as _f:
         _f.write(MOSQUITTO_PASS)
 
+# ── Mot de passe API go2rtc — même mécanisme, propre à CE site (2026-09-07,
+# cf. HANDOFF.md : fuite trouvée, go2rtc:1984 accessible sans authentification
+# à quiconque sur le réseau local, dont les identifiants RTSP/ONVIF en clair
+# via /api/streams). go2rtc laisse toujours passer les requêtes venant de
+# 127.0.0.1 SANS vérifier ce mot de passe, même quand il est configuré (vérifié
+# dans sa vraie doc, pas supposé — github.com/AlexxIT/go2rtc) : l'addon
+# lui-même (GO2RTC_API_BASE) et le relais du tunnel Cloudflare
+# (_Go2rtcProxyHandler, qui relaie aussi depuis 127.0.0.1) continuent de
+# fonctionner sans aucun changement de code. Seul un accès direct depuis le
+# réseau local (une IP différente de 127.0.0.1) devra désormais le fournir.
+_GO2RTC_API_PASS_FILE = "/data/go2rtc_api_pass"
+if os.path.exists(_GO2RTC_API_PASS_FILE):
+    with open(_GO2RTC_API_PASS_FILE) as _f:
+        GO2RTC_API_PASSWORD = _f.read().strip()
+else:
+    GO2RTC_API_PASSWORD = secrets.token_hex(16)
+    with open(_GO2RTC_API_PASS_FILE, "w") as _f:
+        _f.write(GO2RTC_API_PASSWORD)
+
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
 
 # Masquage de zones "en dur" (§93) — {stream_name: [{"x":0-1,"y":0-1,"w":0-1,"h":0-1}, ...]}.
@@ -1412,13 +1431,30 @@ def _webrtc_config_yaml_lines() -> list[str]:
     filtrées par filters.networks: [udp4, tcp4] pour exclure l'IPv6 locale instable de
     son interface pont Docker.
 
-    Pas de clé api/origin ici : create_config.py (script Frigate qui régénère
-    /dev/shm/go2rtc.yaml) injecte automatiquement api.origin: "*" dès que go2rtc.api
-    est absent de la config — ce qui est notre cas. Sans ce "*", go2rtc applique un
-    contrôle same-origin strict sur son WebSocket de signalisation (cf. internal/api/
-    ws/ws.go côté go2rtc) qui rejette app.domoticium.fr (origine différente du nom
-    d'hôte du tunnel Cloudflare)."""
+    Clé api (origin/username/password) le 2026-09-07 — anciennement un bloc
+    séparé ("go2rtc: / api: / origin: '*'", juste avant l'appel à cette
+    fonction) datant du 2026-07-22 (l'injection automatique par create_config.py,
+    qui n'a lieu QUE si go2rtc.api est absent de la config, avait été trouvée
+    insuffisante en conditions réelles — rejet WebSocket persistant). Fusionné
+    ICI (une seule clé "api:" par section go2rtc — deux clés identiques dans le
+    même mapping produiraient un YAML ambigu) pour ajouter username/password
+    (cf. HANDOFF.md : go2rtc:1984 accessible sans authentification à quiconque
+    sur le réseau local, identifiants RTSP/ONVIF en clair via /api/streams).
+    `origin: "*"` reste nécessaire pour la même raison qu'avant : sans lui,
+    go2rtc applique un contrôle same-origin strict sur son WebSocket de
+    signalisation (cf. internal/api/ws/ws.go côté go2rtc) qui rejette
+    app.domoticium.fr (origine différente du nom d'hôte du tunnel Cloudflare).
+    `local_auth` n'est PAS utile ici : le comportement "127.0.0.1 toujours
+    exempté du mot de passe" est PAR DÉFAUT et inconditionnel côté go2rtc
+    (vérifié dans sa vraie doc, github.com/AlexxIT/go2rtc), pas une option à
+    activer — l'addon (GO2RTC_API_BASE) et le relais du tunnel Cloudflare
+    (_Go2rtcProxyHandler, relaie aussi depuis 127.0.0.1) continuent de
+    fonctionner sans aucun changement de code ailleurs."""
     lines = [
+        "  api:",
+        '    username: "domoticium"',
+        f'    password: "{GO2RTC_API_PASSWORD}"',
+        '    origin: "*"',
         "  webrtc:",
         '    listen: "0.0.0.0:8555"',
         "    filters:",
@@ -1500,15 +1536,15 @@ def _generate_frigate_yaml() -> str:
 
     if _cameras:
         lines.append("go2rtc:")
-        # api.origin: "*" explicite — create_config.py (script Frigate qui régénère
-        # /dev/shm/go2rtc.yaml) est censé l'injecter automatiquement quand go2rtc.api
-        # est absent de la config, mais confirmé en conditions réelles le 2026-07-22 :
-        # ça ne suffit pas (rejet WebSocket persistant, cf. HANDOFF §58/§59 —
-        # internal/api/ws/ws.go côté go2rtc n'accepte que "" ou "*", sans repli par
-        # défaut). Le définir nous-mêmes retire la dépendance à ce comportement
-        # implicite plutôt que de continuer à en deviner la raison exacte.
-        lines.append("  api:")
-        lines.append('    origin: "*"')
+        # La clé "api:" (origin/username/password) est émise UNE SEULE FOIS, dans
+        # _webrtc_config_yaml_lines() plus bas (même section go2rtc, ajoutée à
+        # `lines` juste après ce bloc) — PAS ici. Avant le 2026-09-07 un bloc
+        # "api: / origin: '*'" était dupliqué ici en plus (confirmé en conditions
+        # réelles le 2026-07-22 : la laisser à l'injection automatique de
+        # create_config.py, côté Frigate, ne suffit pas — rejet WebSocket
+        # persistant, cf. HANDOFF §58/§59) — retiré en ajoutant username/password
+        # à _webrtc_config_yaml_lines() : 2 clés "api:" dans le même mapping
+        # go2rtc: auraient produit un YAML ambigu (clé dupliquée).
         # PAS de base_path ici — voir GO2RTC_API_BASE et _Go2rtcProxyHandler : le
         # retrait du préfixe /cameras (exigé par Cloudflare Tunnel côté externe) se fait
         # dans un proxy local dédié, pas dans go2rtc lui-même (base_path cassait le
