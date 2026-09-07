@@ -175,13 +175,19 @@ else:
 # ── Mot de passe API go2rtc — même mécanisme, propre à CE site (2026-09-07,
 # cf. HANDOFF.md : fuite trouvée, go2rtc:1984 accessible sans authentification
 # à quiconque sur le réseau local, dont les identifiants RTSP/ONVIF en clair
-# via /api/streams). go2rtc laisse toujours passer les requêtes venant de
-# 127.0.0.1 SANS vérifier ce mot de passe, même quand il est configuré (vérifié
-# dans sa vraie doc, pas supposé — github.com/AlexxIT/go2rtc) : l'addon
-# lui-même (GO2RTC_API_BASE) et le relais du tunnel Cloudflare
-# (_Go2rtcProxyHandler, qui relaie aussi depuis 127.0.0.1) continuent de
-# fonctionner sans aucun changement de code. Seul un accès direct depuis le
-# réseau local (une IP différente de 127.0.0.1) devra désormais le fournir.
+# via /api/streams. go2rtc EXEMPTE en théorie les requêtes venant de
+# 127.0.0.1 (vérifié dans sa vraie doc ET son code source réel) — MAIS
+# Frigate (donc go2rtc) tourne en réseau Docker isolé : tout appelant
+# EXTÉRIEUR à son conteneur (l'addon, le relais tunnel) traverse le NAT du
+# pont Docker pour l'atteindre, qui réécrit l'adresse source (hairpin NAT,
+# comportement Docker connu — jamais 127.x vu côté go2rtc, quelle que soit
+# l'adresse visée côté appelant). Vérifié en conditions réelles le 2026-09-07
+# (déployé sans ça une 1re fois → cassait la vue caméra cloud → annulé →
+# vraie cause trouvée → cf. commentaire de _webrtc_config_yaml_lines()) :
+# aucun appelant externe n'est jamais exempté ici. D'où GO2RTC_API_AUTH
+# ci-dessous, présenté explicitement par CHAQUE appelant (addon ET relais
+# tunnel _Go2rtcProxyHandler) plutôt que de compter sur une exemption qui ne
+# peut pas s'appliquer à cette topologie.
 _GO2RTC_API_PASS_FILE = "/data/go2rtc_api_pass"
 if os.path.exists(_GO2RTC_API_PASS_FILE):
     with open(_GO2RTC_API_PASS_FILE) as _f:
@@ -190,6 +196,7 @@ else:
     GO2RTC_API_PASSWORD = secrets.token_hex(16)
     with open(_GO2RTC_API_PASS_FILE, "w") as _f:
         _f.write(GO2RTC_API_PASSWORD)
+GO2RTC_API_AUTH = ("domoticium", GO2RTC_API_PASSWORD)  # requests.*(auth=GO2RTC_API_AUTH)
 
 _cameras: dict[str, str] = {}  # {stream_name: rtsp_url}
 
@@ -1444,26 +1451,32 @@ def _webrtc_config_yaml_lines() -> list[str]:
     go2rtc applique un contrôle same-origin strict sur son WebSocket de
     signalisation (cf. internal/api/ws/ws.go côté go2rtc) qui rejette
     app.domoticium.fr (origine différente du nom d'hôte du tunnel Cloudflare).
-    `local_auth` n'est PAS utile ici : le comportement "127.0.0.1 toujours
-    exempté du mot de passe" est PAR DÉFAUT et inconditionnel côté go2rtc
-    (vérifié dans sa vraie doc, github.com/AlexxIT/go2rtc), pas une option à
-    activer — l'addon (GO2RTC_API_BASE) et le relais du tunnel Cloudflare
-    (_Go2rtcProxyHandler, relaie aussi depuis 127.0.0.1) continuent de
-    fonctionner sans aucun changement de code ailleurs."""
+
+    1er essai (même jour) : compter sur l'exemption "127.0.0.1 passe toujours
+    sans mot de passe" documentée par go2rtc — DÉPLOYÉ PUIS ANNULÉ, cassait la
+    vue caméra cloud réelle (le relais tunnel _Go2rtcProxyHandler recevait 401
+    malgré sa connexion depuis 127.0.0.1). Vraie cause trouvée en lisant le
+    code source réel de la version déployée (v1.9.10, pas juste la doc) :
+    `middlewareAuth()` compare bien `r.RemoteAddr` à un préfixe "127." — mais
+    Frigate (donc go2rtc embarqué) tourne en réseau Docker ISOLÉ
+    (host_network: false dans son propre config.yaml, déjà noté plus haut dans
+    ce fichier) : TOUT appelant EXTÉRIEUR au conteneur Frigate — l'addon
+    Domoticium (host_network: true) ET le relais tunnel, MÊME en visant
+    "127.0.0.1:1984" côté appelant — traverse le NAT du pont Docker pour
+    atteindre le port publié, qui réécrit l'adresse source en l'IP de la
+    passerelle du pont (ex: 172.17.0.1), jamais 127.x, AVANT que go2rtc ne la
+    voie. Aucun appelant EXTÉRIEUR à ce conteneur ne peut donc jamais
+    apparaître "local" à ses yeux, quelle que soit l'adresse visée côté
+    appelant — comportement Docker connu (hairpin NAT), pas un bug go2rtc.
+    Vrai fix : présenter le mot de passe explicitement plutôt que compter sur
+    une exemption qui ne peut pas s'appliquer ici — cf. GO2RTC_API_AUTH,
+    ajouté aux requêtes de l'addon (_go2rtc_upsert_stream etc.) ET injecté par
+    _Go2rtcProxyHandler dans chaque requête relayée pour le tunnel."""
     lines = [
         "  api:",
+        '    username: "domoticium"',
+        f'    password: "{GO2RTC_API_PASSWORD}"',
         '    origin: "*"',
-        # username/password RETIRÉS le 2026-09-07 (déployés puis annulés dans la
-        # même session) — vérifié en conditions réelles APRÈS déploiement (pas
-        # juste supposé) : contrairement à ce que documente go2rtc ("passes
-        # requests from localhost... without HTTP authorisation, even if you
-        # have it configured"), le relais du tunnel Cloudflare (_Go2rtcProxyHandler,
-        # qui se connecte pourtant bien depuis 127.0.0.1) recevait AUSSI un 401,
-        # cassant la vue caméra cloud réelle pour de vrai — confirmé sur /api/ws
-        # ET /api/streams à travers le tunnel. Cause exacte pas encore identifiée
-        # (cf. HANDOFF.md) — annulé plutôt que laissé cassé le temps d'investiguer
-        # calmement. GO2RTC_API_PASSWORD reste généré/persisté (inutilisé pour
-        # l'instant) — pas besoin de le régénérer une fois la vraie cause trouvée.
         "  webrtc:",
         '    listen: "0.0.0.0:8555"',
         "    filters:",
@@ -3905,6 +3918,7 @@ def _go2rtc_upsert_stream(name: str, rtsp_url: str, timeout: float = 5.0) -> boo
         r = requests.put(
             f"{GO2RTC_API_BASE}/api/streams",
             params={"name": name, "src": rtsp_url},
+            auth=GO2RTC_API_AUTH,
             timeout=timeout,
         )
         return r.ok
@@ -3919,6 +3933,7 @@ def _go2rtc_remove_stream(name: str, timeout: float = 5.0) -> bool:
         r = requests.delete(
             f"{GO2RTC_API_BASE}/api/streams",
             params={"src": name},
+            auth=GO2RTC_API_AUTH,
             timeout=timeout,
         )
         return r.ok
@@ -3937,6 +3952,7 @@ def _go2rtc_probe_online(name: str, timeout: float = 6.0) -> bool:
         r = requests.get(
             f"{GO2RTC_API_BASE}/api/frame.jpeg",
             params={"src": name},
+            auth=GO2RTC_API_AUTH,
             timeout=timeout,
         )
         ok = r.ok and r.headers.get("Content-Type", "").startswith("image")
@@ -6046,7 +6062,7 @@ def _go2rtc_active_consumers() -> dict[str, bool]:
     ouverte) les flux ayant au moins un consommateur actif (quelqu'un regarde le direct
     en ce moment — HLS/WebRTC). Retourne {stream_name: bool}."""
     try:
-        r = requests.get(f"{GO2RTC_API_BASE}/api/streams", timeout=5)
+        r = requests.get(f"{GO2RTC_API_BASE}/api/streams", auth=GO2RTC_API_AUTH, timeout=5)
         if not r.ok:
             return {}
         return {name: bool((info or {}).get("consumers")) for name, info in r.json().items()}
@@ -7591,7 +7607,7 @@ def _go2rtc_stream_already_persisted(name: str, rtsp_url: str) -> bool:
     cf. code source internal/streams/stream.go MarshalJSON/producer.go). Best-effort :
     toute erreur renvoie False (traité comme "pas encore synchronisé" par l'appelant)."""
     try:
-        r = requests.get(f"{GO2RTC_API_BASE}/api/streams", timeout=5)
+        r = requests.get(f"{GO2RTC_API_BASE}/api/streams", auth=GO2RTC_API_AUTH, timeout=5)
         if not r.ok:
             return False
         stream = r.json().get(name)
@@ -9183,6 +9199,21 @@ def _read_http_head(sock: socket.socket) -> bytes:
     return buf
 
 
+# Authorization Basic précalculée une fois — cf. GO2RTC_API_AUTH (main.py, plus
+# haut) : le navigateur (via le tunnel Cloudflare) ne connaît jamais ce mot de
+# passe, donc _rewrite_go2rtc_head() doit l'AJOUTER à chaque requête relayée.
+# Nécessaire depuis le 2026-09-07 (cf. son commentaire) : Frigate/go2rtc tourne
+# en réseau Docker isolé, aucun appelant EXTÉRIEUR à son conteneur — pas même
+# celui qui vise "127.0.0.1" côté appelant, comme ce proxy — n'est jamais vu
+# "local" par go2rtc (hairpin NAT du pont Docker), donc jamais exempté de mot
+# de passe. Toute Authorization déjà présente dans la requête d'origine
+# (aucune en pratique — CameraPlayer.tsx n'en envoie pas) est remplacée, pas
+# cumulée : un seul schéma d'auth a un sens ici.
+_GO2RTC_AUTH_HEADER = b"Authorization: Basic " + base64.b64encode(
+    f"{GO2RTC_API_AUTH[0]}:{GO2RTC_API_AUTH[1]}".encode()
+)
+
+
 def _rewrite_go2rtc_head(head: bytes):
     """Retire le préfixe /cameras de la ligne de requête avant de relayer vers go2rtc
     (qui ne connaît que ses routes nues). Force aussi Connection: close sur les requêtes
@@ -9190,7 +9221,9 @@ def _rewrite_go2rtc_head(head: bytes):
     requête à un chemin différent que notre relecture ne reverrait jamais (on ne lit que
     la 1ère ligne de chaque connexion) ; en HTTP simple ça coûte juste une reconnexion TCP
     locale, négligeable. Exception : les upgrades WebSocket (signalisation WebRTC),
-    qui doivent rester ouverts — on n'y touche pas."""
+    qui doivent rester ouverts — on n'y touche pas. Injecte aussi l'authentification
+    go2rtc (cf. _GO2RTC_AUTH_HEADER) — nécessaire pour CE relais comme pour tout
+    autre appelant, cf. son commentaire."""
     sep = b"\r\n\r\n"
     idx = head.find(sep)
     head_part, body_start = (head[:idx], head[idx + 4:]) if idx != -1 else (head, b"")
@@ -9211,6 +9244,8 @@ def _rewrite_go2rtc_head(head: bytes):
     if not is_websocket:
         request_lines = [line for line in request_lines if not line.lower().startswith(b"connection:")]
         request_lines.append(b"Connection: close")
+    request_lines = [line for line in request_lines if not line.lower().startswith(b"authorization:")]
+    request_lines.append(_GO2RTC_AUTH_HEADER)
     return b"\r\n".join(request_lines) + sep + body_start, is_websocket
 
 
