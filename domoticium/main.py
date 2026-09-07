@@ -1452,9 +1452,18 @@ def _webrtc_config_yaml_lines() -> list[str]:
     fonctionner sans aucun changement de code ailleurs."""
     lines = [
         "  api:",
-        '    username: "domoticium"',
-        f'    password: "{GO2RTC_API_PASSWORD}"',
         '    origin: "*"',
+        # username/password RETIRÉS le 2026-09-07 (déployés puis annulés dans la
+        # même session) — vérifié en conditions réelles APRÈS déploiement (pas
+        # juste supposé) : contrairement à ce que documente go2rtc ("passes
+        # requests from localhost... without HTTP authorisation, even if you
+        # have it configured"), le relais du tunnel Cloudflare (_Go2rtcProxyHandler,
+        # qui se connecte pourtant bien depuis 127.0.0.1) recevait AUSSI un 401,
+        # cassant la vue caméra cloud réelle pour de vrai — confirmé sur /api/ws
+        # ET /api/streams à travers le tunnel. Cause exacte pas encore identifiée
+        # (cf. HANDOFF.md) — annulé plutôt que laissé cassé le temps d'investiguer
+        # calmement. GO2RTC_API_PASSWORD reste généré/persisté (inutilisé pour
+        # l'instant) — pas besoin de le régénérer une fois la vraie cause trouvée.
         "  webrtc:",
         '    listen: "0.0.0.0:8555"',
         "    filters:",
