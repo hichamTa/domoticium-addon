@@ -1338,7 +1338,9 @@ def install_local_web_addon():
     # ingest_secret transmis à chaque démarrage (pas seulement à l'install) —
     # couvre le cas d'une rotation future du secret côté site, idempotent si
     # inchangé (mêmes options réécrites, sans effet).
-    r = sup_post(f"/addons/{LOCAL_WEB_SLUG}/options", {"options": {"ingest_secret": INGEST_SECRET}})
+    r = sup_post(f"/addons/{LOCAL_WEB_SLUG}/options", {
+        "options": {"ingest_secret": INGEST_SECRET, "site_prefix": SITE_PREFIX}
+    })
     if not r.ok:
         warn(f"[local-web] Écriture ingest_secret : {r.status_code} {r.text[:200]}")
 
