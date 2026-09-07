@@ -6375,6 +6375,22 @@ def handle_local_devices() -> dict:
     devices = devices_result.get("result", []) if devices_result and devices_result.get("success") else []
     device_area = {d.get("id"): d.get("area_id") for d in devices}
 
+    # Device VIRTUEL créé par l'intégration MQTT pour exposer les contrôles du
+    # pont Zigbee2MQTT lui-même (permit join, restart, log level, version...) —
+    # pas un équipement du logement. La plupart de ses entités sont déjà
+    # filtrées par entity_category (diagnostic/config) ou domaine (button),
+    # SAUF le switch "Permit join" (entity_category vide côté Z2M) — trouvé en
+    # conditions réelles (Hicham, capture du dashboard local). Exclu par
+    # DEVICE plutôt qu'entité par entité : attrape aussi tout futur contrôle
+    # de pont que Z2M ajouterait avec la même absence de catégorie, pas
+    # seulement "Permit join" (vérifié contre les vraies données du site de
+    # test : 8 entités partagent ce device_id, manufacturer="Zigbee2MQTT",
+    # model="Bridge" — identité stable, pas un nom affiché renommable).
+    _noise_device_ids = {
+        d.get("id") for d in devices
+        if d.get("manufacturer") == "Zigbee2MQTT" and d.get("model") == "Bridge"
+    }
+
     entities_result = _ha_ws_call("config/entity_registry/list")
     entities = entities_result.get("result", []) if entities_result and entities_result.get("success") else []
 
@@ -6398,6 +6414,8 @@ def handle_local_devices() -> dict:
         if e.get("entity_category") in ("diagnostic", "config"):
             continue
         if e.get("platform") in _NOISE_PLATFORMS:
+            continue
+        if e.get("device_id") in _noise_device_ids:
             continue
 
         state = states_by_entity.get(entity_id) or {}
