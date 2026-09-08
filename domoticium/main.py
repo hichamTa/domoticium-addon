@@ -6932,6 +6932,16 @@ def _handle_ha_command(payload: bytes):
         ieee_address   = data.get("ieee_address")   or None
         matter_node_id = data.get("matter_node_id")
         area_name      = data.get("area_name")      or None
+        # (2026-09-08, mode local, "audit useHomeStore") `name` optionnel —
+        # renomme le device dans le registre HA (name_by_user) EN PLUS de son
+        # area, dans le MÊME appel WS. Ajouté pour le mode local : sans
+        # Supabase pour stocker un nom personnalisé, HA (name_by_user) EST le
+        # seul endroit où ce nom peut vivre — sinon le prochain cycle de
+        # lecture (_build_local_devices) écraserait silencieusement tout
+        # renommage optimiste côté web au tour suivant. Absent/vide = nom
+        # inchangé (comportement historique préservé pour le cloud, qui
+        # n'appelle ce cmd_type que pour l'area).
+        name = data.get("name") or None
 
         device_id = _get_ha_device_id(
             entity_id=entity_id, ieee_address=ieee_address, matter_node_id=matter_node_id
@@ -6949,9 +6959,13 @@ def _handle_ha_command(payload: bytes):
             if not area_id:
                 warn(f"[ha/command] set_device_area: area '{area_name}' non trouvée")
 
-        result = _ha_ws_call("config/device_registry/update", device_id=device_id, area_id=area_id)
+        ws_kwargs = {"device_id": device_id, "area_id": area_id}
+        if name:
+            ws_kwargs["name_by_user"] = name
+        result = _ha_ws_call("config/device_registry/update", **ws_kwargs)
         if result and result.get("success"):
-            log(f"[ha/command] Device area mis à jour : {entity_id or ieee_address} → {area_name or 'aucune'}")
+            log(f"[ha/command] Device mis à jour : {entity_id or ieee_address} → "
+                f"area={area_name or 'aucune'}{f', name={name}' if name else ''}")
         else:
             warn(f"[ha/command] Erreur set_device_area : {result}")
 
