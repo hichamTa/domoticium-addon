@@ -3084,6 +3084,55 @@ def handle_list_ha_automations() -> dict:
     return {"ok": True, "automations": automations}
 
 
+def handle_list_ha_scripts() -> dict:
+    """Énumère les scripts HA (GET /states filtré sur script.*) — mode local
+    uniquement, chantier "vraie intégration locale" v7 (2026-09-08, cf.
+    HANDOFF.md côté web). Les scènes Domoticium sont poussées vers HA comme
+    des scripts (domoticium_scene_<local_id>, cf. script_upsert dans
+    _handle_ha_command) — en local, sans Supabase pour stocker leurs
+    métadonnées (nom/icône/steps structurés), ce sont CES scripts eux-mêmes
+    qui deviennent la seule source de vérité côté web (icon lu depuis
+    l'attribut natif HA, steps redécompilés depuis `sequence` via
+    haSequenceToSteps, cf. lib/scenes.ts). Même limitation assumée que
+    handle_list_ha_automations : pas d'endpoint REST "lister toutes les
+    configs", lecture unitaire par script derrière /states — best-effort, un
+    script illisible ne fait pas échouer les autres."""
+    try:
+        r = ha_get("/states")
+        if not r.ok:
+            return {"ok": False, "scripts": []}
+        states = r.json()
+    except Exception as e:
+        warn(f"[scripts-ha] lecture /states: {e}")
+        return {"ok": False, "scripts": []}
+
+    scripts = []
+    for s in states:
+        entity_id = s.get("entity_id", "")
+        if not entity_id.startswith("script."):
+            continue
+        object_id = entity_id.split(".", 1)[1]
+        attrs = s.get("attributes") or {}
+
+        config = None
+        try:
+            cr = ha_get(f"/config/script/config/{object_id}")
+            if cr.ok:
+                config = cr.json()
+        except Exception as e:
+            warn(f"[scripts-ha] lecture config {object_id}: {e}")
+
+        scripts.append({
+            "object_id": object_id,
+            "entity_id": entity_id,
+            "alias": attrs.get("friendly_name", entity_id),
+            "icon": attrs.get("icon"),
+            "config": config,
+        })
+
+    return {"ok": True, "scripts": scripts}
+
+
 def handle_get_device_triggers(ieee_address: str | None, matter_node_id: int | None) -> dict:
     """Liste les "device triggers" HA d'une télécommande/bouton de scène (Zigbee
     ou Matter) — pas d'entité à lire, ce mécanisme est la source de vérité pour
@@ -8991,6 +9040,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_alarmo_sensor_groups_route()
         elif route == "/automations/ha":
             self._handle_ha_automations_route()
+        elif route == "/scripts/ha":
+            self._handle_ha_scripts_route()
         elif route == "/devices/triggers":
             self._handle_device_triggers_route()
         elif route == "/automations/calendars":
@@ -9057,6 +9108,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_list_ha_automations())
         except Exception as e:
             warn(f"[automations-ha] {e}")
+            self._reject(500, str(e))
+
+    def _handle_ha_scripts_route(self):
+        try:
+            self._ok(handle_list_ha_scripts())
+        except Exception as e:
+            warn(f"[scripts-ha] {e}")
             self._reject(500, str(e))
 
     def _handle_device_triggers_route(self):
