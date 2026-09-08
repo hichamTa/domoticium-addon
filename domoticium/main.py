@@ -1380,8 +1380,18 @@ def install_local_web_addon():
     # ingest_secret transmis à chaque démarrage (pas seulement à l'install) —
     # couvre le cas d'une rotation future du secret côté site, idempotent si
     # inchangé (mêmes options réécrites, sans effet).
+    # go2rtc_password (2026-09-08, chantier caméras locales) : même
+    # mécanisme — GO2RTC_API_PASSWORD est déjà connu de CET addon (généré/
+    # persisté une fois dans /data/go2rtc_api_pass, cf. plus haut), jamais
+    # saisi à la main par Hicham. Sans ça, l'add-on local ne peut pas
+    # s'authentifier auprès de go2rtc (127.0.0.1:1984, exige Basic Auth
+    # depuis le fix sécurité du 2026-09-07) — caméras locales muettes.
     r = sup_post(f"/addons/{LOCAL_WEB_SLUG}/options", {
-        "options": {"ingest_secret": INGEST_SECRET, "site_prefix": SITE_PREFIX}
+        "options": {
+            "ingest_secret": INGEST_SECRET,
+            "site_prefix": SITE_PREFIX,
+            "go2rtc_password": GO2RTC_API_PASSWORD,
+        }
     })
     if not r.ok:
         warn(f"[local-web] Écriture ingest_secret : {r.status_code} {r.text[:200]}")
