@@ -160,15 +160,22 @@ MOSQUITTO_USER = "domoticium"
 # (même prudence que pour FRIGATE_SLUG, cf. commentaire au-dessus : deviner le
 # hash a déjà été faux une fois par le passé).
 #
-# 2026-09-08 : pointe maintenant vers hichamTa/domoticium-web — le VRAI web/
-# (chantier "build standalone + empaquetage", cf. HANDOFF.md côté web) —
-# jusqu'ici pointait vers hichamTa/domoticium-local-web, un prototype de
-# squelette (2 composants de démo, jamais le vrai code applicatif) qui a
-# servi à valider l'auth OAuth2/le build standalone avant que le vrai web/
-# soit prêt à être empaqueté de la même façon. Slug "domoticium_web" (pas
-# "domoticium_local_web") côté nouveau repo — _resolve_local_web_slug() mis
-# à jour en conséquence.
-LOCAL_WEB_REPO = "https://github.com/hichamTa/domoticium-web"
+# 2026-09-08 (chantier "add-on public, code privé", demande explicite
+# d'Hicham) — LOCAL_WEB_REPO pointe vers hichamTa/domoticium-local-web, PAS
+# hichamTa/domoticium-web où vit le vrai code (celui-ci reste privé — testé
+# en conditions réelles ce soir : Supervisor ne sait cloner qu'un dépôt
+# PUBLIC, git clone anonyme, aucune authentification possible). Repurposé en
+# simple coquille : juste repository.json + config.yaml, dont l'`image:`
+# pointe vers ghcr.io/hichamta/domoticium-web — une image Docker déjà
+# construite, publiée automatiquement depuis le VRAI repo (privé) par
+# GitHub Actions à chaque changement de code (cf. .github/workflows/
+# publish-addon-image.yml côté web). Home Assistant télécharge cette image
+# toute prête, ne clone/ne voit jamais le code source. Slug
+# "domoticium_web" (pas "domoticium_local_web", l'ancien slug du prototype
+# qui vivait ici avant) — _resolve_local_web_slug() mis à jour en
+# conséquence ; coexiste sans conflit avec l'ancien prototype s'il traîne
+# encore installé sur un site (slug différent).
+LOCAL_WEB_REPO = "https://github.com/hichamTa/domoticium-local-web"
 LOCAL_WEB_SLUG = "domoticium_web"
 
 # ── Mot de passe Mosquitto — généré une fois, persisté dans /data/ ─────────────
