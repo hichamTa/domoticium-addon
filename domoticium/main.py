@@ -4961,6 +4961,19 @@ _z2m_friendly_to_ieee: dict[str, str] = {}
 # /alarmo/keypad (thread HTTP séparé, cf. _CommandHandler) de répondre
 # instantanément sans redemander la liste à Z2M à chaque requête web.
 _last_z2m_devices_list: list = []
+# ieee_address -> dernier état COMPLET reçu sur zigbee2mqtt/{friendly_name}
+# (cf. on_local_message et _report_zigbee_state_direct, qui pousse le MÊME
+# payload vers Supabase pour le mode cloud) — jusqu'ici jeté après l'envoi
+# Supabase, jamais retenu ici. Mode local (audit useHomeStore, "device sans
+# entité utilisable", 2026-09-08) : `_build_local_devices()` n'a pas de
+# Supabase à lire, ce cache est donc SA seule source pour les mêmes valeurs
+# (battery/action/linkquality...) qu'un device Zigbee sans entité HA
+# principale liée ne publie nulle part ailleurs (même bug que §167-169,
+# jamais corrigé côté local faute d'exister à l'époque). Republié en entier
+# à chaque changement par Z2M (jamais un diff partiel, cf. migration
+# 0076_pi_report_zigbee_state.sql) — une simple affectation suffit, pas de
+# merge nécessaire.
+_last_z2m_raw_state: dict[str, dict] = {}
 
 # (2026-09-01) Suivi des réponses à zigbee2mqtt/bridge/request/device/reporting/configure
 # (cf. _handle_zigbee_boost_reporting) — Z2M répond de façon asynchrone sur
@@ -6560,6 +6573,13 @@ def _build_local_devices() -> list[dict]:
             ),
             "vendor": definition.get("vendor") or "",
             "model": definition.get("model") or "",
+            # Schéma des exposes Z2M (battery/action/linkquality/...) — gap
+            # "device sans entité utilisable" en local (2026-09-08) :
+            # jusqu'ici jamais transmis par cette route, features restait
+            # TOUJOURS [] côté web (local.ts, mapDevice) quel que soit le
+            # device. Même donnée déjà utilisée juste au-dessus pour
+            # _detect_device_type(), simplement pas conservée avant.
+            "features": exposes,
         }
 
     # Matter : node_id -> identité, depuis matter-server (get_nodes).
@@ -6732,6 +6752,14 @@ def _build_local_devices() -> list[dict]:
             "capabilities": _ha_attributes_to_capabilities(primary_id, primary_attrs),
             "state": _ha_entity_to_normalized_patch(primary_id, primary_state.get("state"), primary_attrs),
             "entities": secondary_entities,
+            # Gap "device sans entité utilisable" (2026-09-08) — schéma +
+            # valeurs des exposes Z2M (battery/action/linkquality/...) pour un
+            # device Zigbee, MÊME s'il n'a aucune entité HA principale pour
+            # les porter (ex: une télécommande classée sensor-generic, même
+            # cas que §167-169 déjà corrigé côté cloud). `ieee` uniquement :
+            # Matter/Wi-Fi n'ont pas cette notion, restent []/None.
+            "features": (zigbee_by_ieee.get(ieee, {}).get("features") or []) if ieee else [],
+            "rawAttributes": _last_z2m_raw_state.get(ieee) if ieee else None,
         })
 
     return devices_out
@@ -7415,6 +7443,12 @@ def on_local_message(client, userdata, msg):
             try:
                 raw_state = json.loads(payload.decode())
                 if isinstance(raw_state, dict):
+                    # Cache LOCAL (2026-09-08, gap "device sans entité
+                    # utilisable" en mode local) — en plus de l'envoi
+                    # Supabase existant, jamais un remplacement : la seule
+                    # source disponible pour _build_local_devices(), qui n'a
+                    # aucun Supabase à lire.
+                    _last_z2m_raw_state[ieee] = raw_state
                     threading.Thread(
                         target=_report_zigbee_state_direct, args=(ieee, raw_state), daemon=True
                     ).start()
