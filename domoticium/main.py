@@ -159,8 +159,17 @@ MOSQUITTO_USER = "domoticium"
 # fois le dépôt indexé par le Supervisor, jamais utilisé tel quel en prod
 # (même prudence que pour FRIGATE_SLUG, cf. commentaire au-dessus : deviner le
 # hash a déjà été faux une fois par le passé).
-LOCAL_WEB_REPO = "https://github.com/hichamTa/domoticium-local-web"
-LOCAL_WEB_SLUG = "domoticium_local_web"
+#
+# 2026-09-08 : pointe maintenant vers hichamTa/domoticium-web — le VRAI web/
+# (chantier "build standalone + empaquetage", cf. HANDOFF.md côté web) —
+# jusqu'ici pointait vers hichamTa/domoticium-local-web, un prototype de
+# squelette (2 composants de démo, jamais le vrai code applicatif) qui a
+# servi à valider l'auth OAuth2/le build standalone avant que le vrai web/
+# soit prêt à être empaqueté de la même façon. Slug "domoticium_web" (pas
+# "domoticium_local_web") côté nouveau repo — _resolve_local_web_slug() mis
+# à jour en conséquence.
+LOCAL_WEB_REPO = "https://github.com/hichamTa/domoticium-web"
+LOCAL_WEB_SLUG = "domoticium_web"
 
 # ── Mot de passe Mosquitto — généré une fois, persisté dans /data/ ─────────────
 _MOSQUITTO_PASS_FILE = "/data/mosquitto_pass"
@@ -1309,7 +1318,7 @@ def _resolve_local_web_slug(attempts: int = 4, delay: float = 5.0) -> bool:
                     if (
                         isinstance(addon, dict)
                         and addon.get("repository") == repo_slug
-                        and str(addon.get("slug", "")).endswith("_domoticium_local_web")
+                        and str(addon.get("slug", "")).endswith("_domoticium_web")
                     ):
                         LOCAL_WEB_SLUG = addon["slug"]
                         log(f"[local-web] Slug résolu dynamiquement : {LOCAL_WEB_SLUG}")
