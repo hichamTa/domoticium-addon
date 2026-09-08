@@ -2688,6 +2688,8 @@ def handle_matter_merge_reject(suggestion_id: str) -> dict:
     return {"ok": True}
 
 
+_ALARMO_SHORT_EXIT_TIME = 5  # secondes — voir docstring ci-dessous
+
 def _ensure_alarmo_night_mode():
     """Patch one-shot idempotent (même principe que _ensure_z2m_availability) :
     Alarmo active tout seul les modes "absent"/"présent" à sa toute première
@@ -2695,16 +2697,41 @@ def _ensure_alarmo_night_mode():
     officielle) mais PAS "nuit" — sans quoi cocher "nuit" sur un capteur serait
     sans effet, le mode lui-même n'existant pas encore côté panneau. Un seul
     appel one-shot par site suffit (persiste en base Alarmo), mais on le revérifie
-    à chaque démarrage pour couvrir les sites déjà provisionnés avant ce fix."""
+    à chaque démarrage pour couvrir les sites déjà provisionnés avant ce fix.
+
+    Étendu le 2026-09-08 (demande explicite Hicham, après avoir remarqué un
+    délai de 60s perceptible en armant "Présent"/"Nuit" depuis l'app locale) :
+    force AUSSI un délai de sortie COURT (_ALARMO_SHORT_EXIT_TIME, 5s) pour ces
+    deux modes. Contrairement à "Absent" (on doit réellement sortir de la
+    maison — délai de sortie raisonnable, laissé au défaut usine Alarmo,
+    15s/30s vérifiés en réel), "Présent"/"Nuit" s'arment alors qu'on reste DANS
+    la maison : un long délai de sortie n'a pas lieu d'être. Le défaut usine
+    Alarmo pour "Présent" s'est avéré être 60s sur le site de test (jamais
+    explicitement fixé par notre code jusqu'ici, juste préservé tel quel) —
+    même chose pour "Nuit" (60s, mais LÀ hardcodé par nous-mêmes à l'origine,
+    juste trop long). Comme pour l'activation du mode nuit lui-même : un mode
+    d'armement n'est pas un choix personnalisable par site (cf. commentaire de
+    _ensure_alarmo_area_name(), qui documente cette distinction) — donc forcé
+    à chaque démarrage, pas seulement au tout premier provisionnement. Sans
+    condition sur "déjà activé" comme avant (la vérification portait UNIQUEMENT
+    sur `enabled`, jamais rejouée une fois vrai — insuffisant maintenant qu'il
+    faut aussi corriger `exit_time` sur des sites où le mode nuit est déjà
+    activé, comme le site de test)."""
     area_id, area = _alarmo_get_sole_area()
     if not area_id:
         return
     modes = area.get("modes") or {}
-    if (modes.get("armed_night") or {}).get("enabled"):
-        log("[alarmo] ✓ Mode nuit déjà activé — rien à faire")
-        return
     away = modes.get("armed_away") or {}
     home = modes.get("armed_home") or {}
+    night = modes.get("armed_night") or {}
+    already_ok = (
+        night.get("enabled")
+        and home.get("exit_time") == _ALARMO_SHORT_EXIT_TIME
+        and night.get("exit_time") == _ALARMO_SHORT_EXIT_TIME
+    )
+    if already_ok:
+        log("[alarmo] ✓ Mode nuit activé, délais présent/nuit déjà courts — rien à faire")
+        return
     payload = {
         "area_id": area_id,
         "modes": {
@@ -2718,23 +2745,23 @@ def _ensure_alarmo_night_mode():
             },
             "armed_home": {
                 "enabled": bool(home.get("enabled", True)),
-                "exit_time": home.get("exit_time"),
-                "entry_time": home.get("entry_time"),
+                "exit_time": _ALARMO_SHORT_EXIT_TIME,
+                "entry_time": home.get("entry_time", 30),
                 "trigger_time": home.get("trigger_time", 1800),
             },
             "armed_night": {
                 "enabled": True,
-                "exit_time": 60,
-                "entry_time": 60,
-                "trigger_time": 1800,
+                "exit_time": _ALARMO_SHORT_EXIT_TIME,
+                "entry_time": night.get("entry_time", 30),
+                "trigger_time": night.get("trigger_time", 1800),
             },
         },
     }
     r = ha_post("/alarmo/area", payload)
     if r.ok:
-        log("[alarmo] ✓ Mode nuit activé")
+        log(f"[alarmo] ✓ Mode nuit activé, délais présent/nuit réduits à {_ALARMO_SHORT_EXIT_TIME}s")
     else:
-        warn(f"[alarmo] Activation mode nuit échouée ({r.status_code}): {r.text[:200]}")
+        warn(f"[alarmo] Configuration modes présent/nuit échouée ({r.status_code}): {r.text[:200]}")
 
 
 # Réglages "Modes" (délai de sortie/entrée, temps de fonctionnement avant
@@ -9577,7 +9604,7 @@ if __name__ == "__main__":
 
     install_alarmo()  # idempotent — vérifie/installe Alarmo à chaque démarrage
     install_local_web_addon()  # idempotent — vérifie/installe l'add-on "Accès local" à chaque démarrage
-    _ensure_alarmo_night_mode()  # idempotent — active le mode nuit une fois par site
+    _ensure_alarmo_night_mode()  # idempotent — active le mode nuit + force délais courts présent/nuit
     _ensure_alarmo_area_name()  # idempotent — renomme la zone "Alarmo" → "Habitation"
     _ensure_z2m_availability()  # idempotent — patch les sites déjà provisionnés
 
