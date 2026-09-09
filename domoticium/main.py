@@ -7032,17 +7032,32 @@ def _handle_ha_command(payload: bytes):
                  f"(entity={entity_id}, ieee={ieee_address}, matter_node_id={matter_node_id})")
             return
 
+        # ⚠️ Bug réel trouvé le 2026-09-09 (rencontré en testant un renommage
+        # groupé, un device a atterri dans la mauvaise pièce) : `area_id`
+        # n'est ajouté à `ws_kwargs` QUE si effectivement résolu — jamais
+        # envoyé comme `None` explicite. `config/device_registry/update` (HA)
+        # traite un `area_id` explicitement présent, même `null`, comme "vider
+        # l'aire du device" — PAS "ne rien changer". Avant ce fix, tout appel
+        # SANS area_name valide (y compris un simple renommage sans changement
+        # de pièce, cas qui va devenir courant côté cloud, cf. commit web
+        # associé) risquait de VIDER l'aire déjà en place au lieu de la
+        # laisser intacte.
         area_id = None
         if area_name:
             areas   = _get_ha_areas()
             area    = next((a for a in areas if a.get("name") == area_name), None)
             area_id = area["area_id"] if area else None
             if not area_id:
-                warn(f"[ha/command] set_device_area: area '{area_name}' non trouvée")
+                warn(f"[ha/command] set_device_area: area '{area_name}' non trouvée — aire laissée inchangée")
 
-        ws_kwargs = {"device_id": device_id, "area_id": area_id}
+        ws_kwargs = {"device_id": device_id}
+        if area_id:
+            ws_kwargs["area_id"] = area_id
         if name:
             ws_kwargs["name_by_user"] = name
+        if len(ws_kwargs) == 1:
+            log(f"[ha/command] set_device_area: rien à mettre à jour pour {entity_id or ieee_address} (ni aire ni nom résolus)")
+            return
         result = _ha_ws_call("config/device_registry/update", **ws_kwargs)
         if result and result.get("success"):
             log(f"[ha/command] Device mis à jour : {entity_id or ieee_address} → "
