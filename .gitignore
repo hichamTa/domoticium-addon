@@ -16,6 +16,11 @@ domoticium-local-web/
 *.command
 *.docx
 *.png
+# ...sauf les icônes de l'add-on lui-même (icon.png/logo.png, affichés par le
+# Supervisor HA dans le store) — le blanket *.png ci-dessus vise les logos de
+# travail à la racine (logo_concept_*.png etc.), pas les assets réels de l'addon.
+!domoticium/icon.png
+!domoticium/logo.png
 
 # Fichiers de config locale
 .env.local
