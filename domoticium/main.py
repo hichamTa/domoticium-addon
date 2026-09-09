@@ -1580,6 +1580,20 @@ def _generate_frigate_yaml() -> str:
         f'  user: "{MOSQUITTO_USER}"',
         f'  password: "{MOSQUITTO_PASS}"',
         "",
+        # ⚠️ TEST TEMPORAIRE (2026-09-09, demande explicite Hicham) — chantier
+        # "reconnaissance de plaques" (cf. HANDOFF.md, encore au stade design) :
+        # avant de construire quoi que ce soit, vérifier que la LPR native de
+        # Frigate (PaddleOCR + détecteur YOLOv9, 100% locale/gratuite) lit
+        # correctement une vraie plaque sur CE matériel précis. Point de
+        # vigilance réel, pas juste théorique : la doc officielle de Frigate
+        # liste "CPU avec AVX+AVX2" comme minimum — instructions x86 qu'un
+        # Raspberry Pi (ARM) n'a PAS physiquement, aucun accélérateur matériel
+        # (Coral/Hailo) configuré ici. Global, affecte tous les sites tant que
+        # ce n'est pas retiré — À RETIRER si le test ne convainc pas, ou à
+        # remonter proprement (option add-on ?) si Hicham valide la suite.
+        "lpr:",
+        "  enabled: true",
+        "",
     ]
 
     if _cameras:
@@ -1685,7 +1699,19 @@ def _generate_frigate_yaml() -> str:
                 "          roles:",
                 "            - detect",
                 "    detect:",
-                "      enabled: false",
+                # ⚠️ TEST TEMPORAIRE (même chantier que "lpr: enabled: true"
+                # au-dessus, cf. son commentaire) : la LPR a besoin d'une
+                # vraie détection "car"/"motorcycle" pour avoir quelque chose
+                # à lire — activée UNIQUEMENT sur la caméra dont le nom
+                # contient "exterieur" (celle qui voit une allée/un portail),
+                # jamais sur les autres. Aucun accélérateur matériel
+                # configuré ici : tourne sur CPU nu, exactement ce qu'on
+                # veut mesurer. À retirer si le test ne convainc pas.
+                f"      enabled: {'true' if 'exterieur' in name else 'false'}",
+                "    objects:",
+                "      track:",
+                "        - car",
+                "        - motorcycle",
                 "    record:",
                 "      enabled: false",
             ]
