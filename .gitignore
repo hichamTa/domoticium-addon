@@ -8,6 +8,7 @@ pi/
 pi-deploy/
 vps/
 domoticium-app/
+domoticium-local-web/
 .claude/
 
 # Fichiers système / éditeurs
