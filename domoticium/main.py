@@ -1691,8 +1691,29 @@ def _generate_frigate_yaml() -> str:
             # l'état confirmé fonctionnel (§61) : un input pointé sur le flux MASQUÉ
             # {name} (restream interne go2rtc, 127.0.0.1:8554, aucune 2e connexion
             # physique vers la caméra).
+            # ⚠️ TEST TEMPORAIRE (2026-09-09, suite immédiate du test ci-dessus) —
+            # Hicham : "on va tester sur la caméra intérieure... je vais juste
+            # projeter une plaque d'immatriculation sur mon PC". Une plaque
+            # affichée sur un écran n'a pas la forme d'une "voiture" pour le
+            # détecteur d'objets — le chemin normal (LPR déclenchée par un
+            # objet car/motorcycle confirmé, cf. caméra "exterieur" ci-dessus)
+            # ne se déclencherait donc jamais. Frigate documente un mode
+            # dédié pour ce cas précis (docs.frigate.video/configuration/
+            # license_plate_recognition — "Dedicated LPR camera") : caméra en
+            # `type: "lpr"`, pipeline de détection d'objets standard
+            # entièrement contourné (`detect.enabled: false`, `objects.track`
+            # VIDE), le lecteur de plaque tourne directement sur toute
+            # l'image dès qu'il y a du MOUVEMENT. `record.enabled: true`
+            # nécessaire ICI (contrairement aux autres caméras) : la doc
+            # précise que le topic MQTT `frigate/reviews` — seul moyen de
+            # vérifier le résultat à distance, `frigate/events` ne publie
+            # PAS les mises à jour de ce mode dédié — n'est publié que si
+            # l'enregistrement est activé.
+            is_dedicated_lpr_test = "interieur" in name
+            lines.append(f"  {name}:")
+            if is_dedicated_lpr_test:
+                lines.append('    type: "lpr"')
             lines += [
-                f"  {name}:",
                 "    ffmpeg:",
                 "      inputs:",
                 f"        - path: rtsp://127.0.0.1:8554/{name}",
@@ -1700,20 +1721,26 @@ def _generate_frigate_yaml() -> str:
                 "            - detect",
                 "    detect:",
                 # ⚠️ TEST TEMPORAIRE (même chantier que "lpr: enabled: true"
-                # au-dessus, cf. son commentaire) : la LPR a besoin d'une
-                # vraie détection "car"/"motorcycle" pour avoir quelque chose
-                # à lire — activée UNIQUEMENT sur la caméra dont le nom
-                # contient "exterieur" (celle qui voit une allée/un portail),
-                # jamais sur les autres. Aucun accélérateur matériel
-                # configuré ici : tourne sur CPU nu, exactement ce qu'on
-                # veut mesurer. À retirer si le test ne convainc pas.
+                # au-dessus, cf. son commentaire) : la LPR "normale" a besoin
+                # d'une vraie détection "car"/"motorcycle" pour avoir quelque
+                # chose à lire — activée UNIQUEMENT sur la caméra dont le nom
+                # contient "exterieur" (celle qui voit une allée/un portail).
+                # La caméra "intérieur" (mode dédié, cf. juste au-dessus)
+                # reste À "false" ici aussi — c'est le mode dédié qui bypass
+                # ce pipeline entièrement, pas cette valeur qui l'active.
+                # Aucun accélérateur matériel configuré ici : tourne sur CPU
+                # nu, exactement ce qu'on veut mesurer. À retirer si le test
+                # ne convainc pas.
                 f"      enabled: {'true' if 'exterieur' in name else 'false'}",
                 "    objects:",
-                "      track:",
-                "        - car",
-                "        - motorcycle",
+            ]
+            if is_dedicated_lpr_test:
+                lines.append("      track: []")
+            else:
+                lines += ["      track:", "        - car", "        - motorcycle"]
+            lines += [
                 "    record:",
-                "      enabled: false",
+                f"      enabled: {'true' if is_dedicated_lpr_test else 'false'}",
             ]
             # Identifiants ONVIF réutilisés depuis l'URL RTSP déjà stockée (même
             # hypothèse qu'ailleurs dans le fichier : matériel grand public utilise
