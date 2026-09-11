@@ -317,7 +317,8 @@ def _ws_recv_exact(sock, n: int) -> bytes:
     return buf
 
 
-def _ha_ws_connect(long_lived: bool = False, access_token: str = None):
+def _ha_ws_connect(long_lived: bool = False, access_token: str = None, host: str = "supervisor",
+                    port: int = 80, path: str = "/core/websocket"):
     """Ouvre et authentifie une session WebSocket HA.
     Retourne (ws_send, ws_recv, ws_close) ou (None, None, None) en cas d'erreur.
     ws_send(data: dict) — inclure {"id": N} dans data.
@@ -325,21 +326,35 @@ def _ha_ws_connect(long_lived: bool = False, access_token: str = None):
     long_lived=True (ex: run_ha_ws_bridge) : retire le timeout après l'auth — sinon le
     timeout de connexion (15s) s'applique aussi aux recv() suivants, et une simple absence
     d'événement HA pendant 15s est prise pour une erreur de connexion (reconnexion en boucle).
-    access_token : jeton à utiliser pour l'étape d'auth WS — par défaut SUPERVISOR_TOKEN
-    (accès admin de l'addon). Passé explicitement par _handle_ha_session_token_create/
-    _revoke (2026-09-12, accès distant technicien) pour s'authentifier avec le jeton
-    délégué du CLIENT plutôt que celui de l'addon — cf. HANDOFF côté web : ce chantier a
-    été déplacé de Vercel vers l'addon après que 3 implémentations WebSocket différentes
-    (ws, client fait main, WebSocket natif Node) aient toutes échoué de façon identique
-    depuis l'environnement d'exécution Vercel (jamais reproduit ici, en local).
+
+    access_token/host/port/path : par défaut (SUPERVISOR_TOKEN, "supervisor"/80/"/core/websocket")
+    — connexion authentifiée en tant qu'add-on via le proxy du Supervisor, comportement
+    inchangé pour tous les appelants existants.
+
+    ⚠️ 2026-09-12 (accès distant technicien) — piège réel trouvé en lisant le code source du
+    Supervisor (github.com/home-assistant/supervisor, supervisor/api/proxy.py) : la méthode
+    `websocket()` de ce proxy fait SA PROPRE authentification préalable via
+    `self.sys_apps.from_token(supervisor_token)` — elle n'accepte QUE des jetons enregistrés
+    par le Supervisor pour CET add-on précis (ex. SUPERVISOR_TOKEN), jamais un jeton HA
+    utilisateur arbitraire (comme le refresh_token délégué du client, converti en access_token
+    via /auth/token) — même chose côté REST (`/core/api/*` : la requête réelle vers HA Core
+    part toujours avec l'identité PROPRE du Supervisor, l'Authorization de l'appelant ne sert
+    qu'à valider l'accès AU PROXY lui-même). Concrètement : impossible de créer un LLAT lié à
+    un utilisateur HA précis en passant par ce proxy, quel que soit le jeton présenté.
+    D'où les paramètres host/port/path ci-dessus : `_handle_ha_session_token_create`/`_revoke`
+    passent `host="127.0.0.1", port=8123, path="/api/websocket"` — connexion DIRECTE à HA Core
+    (possible car `host_network: true` dans config.yaml, cet add-on partage la pile réseau de
+    l'hôte, donc 127.0.0.1:8123 est le vrai port d'écoute de Home Assistant Core, pas besoin du
+    Supervisor) — HA Core authentifie alors réellement le jeton comme un jeton utilisateur
+    normal, exactement le comportement voulu, plutôt que le pré-filtre du Supervisor.
     """
     try:
-        s = socket.create_connection(("supervisor", 80), timeout=15)
+        s = socket.create_connection((host, port), timeout=15)
 
         key = base64.b64encode(os.urandom(16)).decode()
         s.sendall((
-            "GET /core/websocket HTTP/1.1\r\n"
-            "Host: supervisor\r\n"
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
@@ -431,9 +446,18 @@ def _ha_mint_access_token(refresh_token: str) -> str:
     web/project-remote-ha-access-consent) contre un access_token HA de courte durée.
     Miroir exact de mintHaAccessToken() dans web/src/lib/ha/delegatedSession.ts — même
     endpoint, même client_id — exécuté ICI (en local, sur le Pi) plutôt que depuis Vercel
-    pour l'accès distant technicien (2026-09-12, cf. _handle_ha_session_token_create)."""
+    pour l'accès distant technicien (2026-09-12, cf. _handle_ha_session_token_create).
+
+    ⚠️ Appel DIRECT à HA Core (127.0.0.1:8123), PAS via {SUP}/core/api — le proxy du
+    Supervisor pour /core/api/{path} préfixe systématiquement "api/" (donc /core/api/auth/token
+    viserait .../api/auth/token, qui n'existe pas — le vrai endpoint HA est /auth/token, hors
+    /api/) ET, même avec le bon chemin, ce proxy fait toujours la requête réelle vers HA Core
+    avec l'identité PROPRE du Supervisor, jamais avec les identifiants de l'appelant — cf.
+    commentaire détaillé dans _ha_ws_connect(). 127.0.0.1:8123 fonctionne car
+    host_network: true (config.yaml) fait partager à cet add-on la pile réseau de l'hôte,
+    où Home Assistant Core écoute réellement."""
     resp = requests.post(
-        f"{SUP}/core/auth/token",
+        "http://127.0.0.1:8123/auth/token",
         data={
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -8884,7 +8908,9 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         except Exception as e:
             return self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
 
-        ws_send, ws_recv, ws_close = _ha_ws_connect(access_token=access_token)
+        ws_send, ws_recv, ws_close = _ha_ws_connect(
+            access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
+        )
         if not ws_send:
             return self._reject(502, "Connexion WebSocket HA échouée")
         try:
@@ -8925,7 +8951,9 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         if not refresh_token_id:
             return self._reject(400, "Jeton HA sans claim iss")
 
-        ws_send, ws_recv, ws_close = _ha_ws_connect(access_token=session_token)
+        ws_send, ws_recv, ws_close = _ha_ws_connect(
+            access_token=session_token, host="127.0.0.1", port=8123, path="/api/websocket"
+        )
         if not ws_send:
             return self._reject(502, "Connexion WebSocket HA échouée")
         try:
