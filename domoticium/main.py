@@ -317,7 +317,7 @@ def _ws_recv_exact(sock, n: int) -> bytes:
     return buf
 
 
-def _ha_ws_connect(long_lived: bool = False):
+def _ha_ws_connect(long_lived: bool = False, access_token: str = None):
     """Ouvre et authentifie une session WebSocket HA.
     Retourne (ws_send, ws_recv, ws_close) ou (None, None, None) en cas d'erreur.
     ws_send(data: dict) — inclure {"id": N} dans data.
@@ -325,6 +325,13 @@ def _ha_ws_connect(long_lived: bool = False):
     long_lived=True (ex: run_ha_ws_bridge) : retire le timeout après l'auth — sinon le
     timeout de connexion (15s) s'applique aussi aux recv() suivants, et une simple absence
     d'événement HA pendant 15s est prise pour une erreur de connexion (reconnexion en boucle).
+    access_token : jeton à utiliser pour l'étape d'auth WS — par défaut SUPERVISOR_TOKEN
+    (accès admin de l'addon). Passé explicitement par _handle_ha_session_token_create/
+    _revoke (2026-09-12, accès distant technicien) pour s'authentifier avec le jeton
+    délégué du CLIENT plutôt que celui de l'addon — cf. HANDOFF côté web : ce chantier a
+    été déplacé de Vercel vers l'addon après que 3 implémentations WebSocket différentes
+    (ws, client fait main, WebSocket natif Node) aient toutes échoué de façon identique
+    depuis l'environnement d'exécution Vercel (jamais reproduit ici, en local).
     """
     try:
         s = socket.create_connection(("supervisor", 80), timeout=15)
@@ -387,7 +394,7 @@ def _ha_ws_connect(long_lived: bool = False):
         msg = _recv()
         if msg.get("type") != "auth_required":
             raise Exception(f"auth_required attendu, reçu: {msg.get('type')}")
-        _send({"type": "auth", "access_token": SUPERVISOR_TOKEN})
+        _send({"type": "auth", "access_token": access_token or SUPERVISOR_TOKEN})
         msg = _recv()
         if msg.get("type") != "auth_ok":
             raise Exception(f"Auth WS échouée: {msg}")
@@ -418,6 +425,30 @@ def _ha_ws_call(cmd_type: str, **params):
             ws_close()
         except Exception:
             pass
+
+def _ha_mint_access_token(refresh_token: str) -> str:
+    """Échange un refresh_token OAuth2 délégué (consentement client, cf. HANDOFF côté
+    web/project-remote-ha-access-consent) contre un access_token HA de courte durée.
+    Miroir exact de mintHaAccessToken() dans web/src/lib/ha/delegatedSession.ts — même
+    endpoint, même client_id — exécuté ICI (en local, sur le Pi) plutôt que depuis Vercel
+    pour l'accès distant technicien (2026-09-12, cf. _handle_ha_session_token_create)."""
+    resp = requests.post(
+        f"{SUP}/core/auth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": f"{APP_URL}/",
+        },
+        timeout=15,
+    )
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    if not resp.ok or not body.get("access_token"):
+        raise Exception(f"Rafraîchissement du jeton HA échoué: {body.get('error') or resp.status_code}")
+    return body["access_token"]
+
 
 def _sup_repos():
     """Retourne la liste des URLs de dépôts depuis le Supervisor.
@@ -8825,6 +8856,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
                 "/matter/merge/reject":  self._handle_matter_merge_reject_route,
                 "/wifi/shelly/add":      self._handle_wifi_shelly_add_route,
+                "/ha/session-token/create": self._handle_ha_session_token_create,
+                "/ha/session-token/revoke": self._handle_ha_session_token_revoke,
             }
             handler = handlers.get(route)
             if not handler:
@@ -8833,6 +8866,79 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         except Exception as e:
             warn(f"[cmd-server] {self.path}: {e}")
             self._reject(500, str(e))
+
+    def _handle_ha_session_token_create(self, data):
+        """Accès distant technicien (2026-09-12) — crée un jeton de session HA (LLAT)
+        indépendant pour le technicien, à partir du refresh_token délégué du client.
+        Exécuté ICI (addon, process persistant, WS local vers HA) plutôt que depuis
+        Vercel : 3 implémentations WebSocket différentes côté cloud (ws, client fait
+        main, WebSocket natif Node) ont toutes échoué de façon identique et
+        inexplicable spécifiquement sur l'environnement d'exécution Vercel (jamais
+        reproduit en local ni depuis une IP résidentielle) — cf. HANDOFF.md côté web.
+        Miroir de createHaSessionToken() dans delegatedSession.ts, ligne pour ligne."""
+        refresh_token = data.get("delegatedRefreshToken")
+        if not refresh_token:
+            return self._reject(400, "delegatedRefreshToken requis")
+        try:
+            access_token = _ha_mint_access_token(refresh_token)
+        except Exception as e:
+            return self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
+
+        ws_send, ws_recv, ws_close = _ha_ws_connect(access_token=access_token)
+        if not ws_send:
+            return self._reject(502, "Connexion WebSocket HA échouée")
+        try:
+            ws_send({
+                "id": 1,
+                "type": "auth/long_lived_access_token",
+                "lifespan": 1,
+                "client_name": "Domoticium — session technicien",
+            })
+            result = ws_recv()
+            if not result.get("success"):
+                error = (result.get("error") or {}).get("message") or "Erreur Home Assistant"
+                return self._reject(502, error)
+            llat = result.get("result")
+            if not isinstance(llat, str):
+                return self._reject(502, "Réponse HA inattendue pour long_lived_access_token")
+            self._ok({"sessionToken": llat})
+        except Exception as e:
+            self._reject(502, f"Session WebSocket HA échouée: {e}")
+        finally:
+            try:
+                ws_close()
+            except Exception:
+                pass
+
+    def _handle_ha_session_token_revoke(self, data):
+        """Révoque un jeton de session technicien — se connecte avec le jeton lui-même
+        (il s'authentifie comme le même utilisateur délégué) puis demande à HA de
+        supprimer son propre refresh_token sous-jacent (identifié via son claim "iss").
+        Miroir de revokeHaSessionToken() dans delegatedSession.ts."""
+        session_token = data.get("sessionToken")
+        if not session_token:
+            return self._reject(400, "sessionToken requis")
+        try:
+            refresh_token_id = _jwt_payload(session_token).get("iss")
+        except Exception:
+            return self._reject(400, "Jeton HA mal formé")
+        if not refresh_token_id:
+            return self._reject(400, "Jeton HA sans claim iss")
+
+        ws_send, ws_recv, ws_close = _ha_ws_connect(access_token=session_token)
+        if not ws_send:
+            return self._reject(502, "Connexion WebSocket HA échouée")
+        try:
+            ws_send({"id": 1, "type": "auth/delete_refresh_token", "refresh_token_id": refresh_token_id})
+            ws_recv()
+            self._ok()
+        except Exception as e:
+            self._reject(502, f"Révocation WebSocket HA échouée: {e}")
+        finally:
+            try:
+                ws_close()
+            except Exception:
+                pass
 
     def _handle_cmd(self, data):
         service = data.get("service", "")
