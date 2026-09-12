@@ -8767,15 +8767,13 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
 
     def _respond(self, code, data):
         body = json.dumps(data).encode()
-        if code >= 500 or code == 502:
-            _debug_log(f"_respond: about to send_response({code}), body len={len(body)}")
+        _debug_log(f"_respond: about to send_response({code}), body len={len(body)}, path={self.path}")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        if code >= 500 or code == 502:
-            _debug_log(f"_respond: wfile.write termine pour code={code}")
+        _debug_log(f"_respond: wfile.write termine pour code={code}, path={self.path}")
 
     def _reject(self, code, msg):
         self._respond(code, {"error": msg})
@@ -9412,8 +9410,26 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_devices_route()
         elif route == "/debug/session-log":
             self._handle_debug_session_log_route()
+        elif route == "/debug/ping-core":
+            self._handle_debug_ping_core_route()
         else:
             self._reject(404, "Route inconnue")
+
+    def _handle_debug_ping_core_route(self):
+        """Diagnostic temporaire (2026-09-12) — isole si UN SIMPLE appel sortant vers
+        127.0.0.1:8123 suffit à casser la réponse HTTP (502 Cloudflare brut observé),
+        indépendamment de toute logique de session technicien. À retirer une fois la
+        vraie cause trouvée."""
+        _debug_log("ping-core: avant requests.get 127.0.0.1:8123/")
+        try:
+            resp = requests.get("http://127.0.0.1:8123/", timeout=5)
+            _debug_log(f"ping-core: reponse recue, status={resp.status_code}")
+        except BaseException as e:
+            _debug_log(f"ping-core: EXCEPTION: {type(e).__name__}: {e}")
+            return self._reject(502, f"ping-core échoué: {e}")
+        _debug_log("ping-core: appel _ok()")
+        self._ok({"status": resp.status_code})
+        _debug_log("ping-core: _ok() est revenu sans lever d'exception")
 
     def _handle_debug_session_log_route(self):
         """Diagnostic temporaire (2026-09-12) — lit /data/session_debug.log écrit par
