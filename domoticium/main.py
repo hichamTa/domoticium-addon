@@ -8918,7 +8918,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         try:
             access_token = _ha_mint_access_token(refresh_token)
         except Exception as e:
-            return self._ok({"ok": False, "error": f"Rafraîchissement du jeton HA échoué: {e}"})
+            return self._ok({"ok": False, "error": str(e)})
 
         ws_send, ws_recv, ws_close = _ha_ws_connect(
             access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
