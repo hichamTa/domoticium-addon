@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, traceback, urllib.parse, uuid, zipfile
+import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
 from datetime import datetime, date
 import paho.mqtt.client as mqtt
 import requests
@@ -441,19 +441,6 @@ def _ha_ws_call(cmd_type: str, **params):
         except Exception:
             pass
 
-def _debug_log(msg: str):
-    """Diagnostic temporaire (2026-09-12, accès distant technicien) — écrit sur disque
-    (/data, persistant) car le 502 Cloudflare brut observé sur /ha/session-token/create
-    empêche même une réponse HTTP normale de sortir ; warn()/logs stdout inaccessibles
-    depuis l'extérieur du Pi pour l'instant. Lu via GET /debug/session-log. À retirer
-    une fois la vraie cause trouvée."""
-    try:
-        with open("/data/session_debug.log", "a") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-    except Exception:
-        pass
-
-
 def _ha_mint_access_token(refresh_token: str) -> str:
     """Échange un refresh_token OAuth2 délégué (consentement client, cf. HANDOFF côté
     web/project-remote-ha-access-consent) contre un access_token HA de courte durée.
@@ -469,29 +456,21 @@ def _ha_mint_access_token(refresh_token: str) -> str:
     commentaire détaillé dans _ha_ws_connect(). 127.0.0.1:8123 fonctionne car
     host_network: true (config.yaml) fait partager à cet add-on la pile réseau de l'hôte,
     où Home Assistant Core écoute réellement."""
-    _debug_log("mint: avant requests.post 127.0.0.1:8123/auth/token")
-    try:
-        resp = requests.post(
-            "http://127.0.0.1:8123/auth/token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": f"{APP_URL}/",
-            },
-            timeout=15,
-        )
-    except BaseException as e:
-        _debug_log(f"mint: EXCEPTION pendant requests.post: {type(e).__name__}: {e}")
-        raise
-    _debug_log(f"mint: reponse recue, status={resp.status_code}")
+    resp = requests.post(
+        "http://127.0.0.1:8123/auth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": f"{APP_URL}/",
+        },
+        timeout=15,
+    )
     try:
         body = resp.json()
     except Exception:
         body = {}
     if not resp.ok or not body.get("access_token"):
-        _debug_log(f"mint: echec, body={str(body)[:300]}")
         raise Exception(f"Rafraîchissement du jeton HA échoué: {body.get('error') or resp.status_code}")
-    _debug_log("mint: access_token obtenu avec succes")
     return body["access_token"]
 
 
@@ -8767,13 +8746,11 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
 
     def _respond(self, code, data):
         body = json.dumps(data).encode()
-        _debug_log(f"_respond: about to send_response({code}), body len={len(body)}, path={self.path}")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        _debug_log(f"_respond: wfile.write termine pour code={code}, path={self.path}")
 
     def _reject(self, code, msg):
         self._respond(code, {"error": msg})
@@ -8922,66 +8899,52 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         main, WebSocket natif Node) ont toutes échoué de façon identique et
         inexplicable spécifiquement sur l'environnement d'exécution Vercel (jamais
         reproduit en local ni depuis une IP résidentielle) — cf. HANDOFF.md côté web.
-        Miroir de createHaSessionToken() dans delegatedSession.ts, ligne pour ligne."""
-        # ⚠️ DIAGNOSTIC TEMPORAIRE (2026-09-12) — v2.9.183 échoue avec un 502 BRUT
-        # Cloudflare (content-type text/plain, "error code: 502"), PAS une réponse
-        # JSON de notre _reject() — confirmé en testant directement via curl contre
-        # le tunnel, en comparant avec /cmd (200 OK immédiat, même secret/tunnel).
-        # Preuve que la requête crashe le process/la connexion AVANT qu'aucune
-        # réponse HTTP propre ne puisse être écrite — un `except Exception` normal
-        # n'explique pas ça. Ce bloc capture TOUT (BaseException compris) avec la
-        # trace complète, renvoyée dans la réponse le temps de trouver la vraie
-        # cause — à retirer une fois résolu.
-        _debug_log("=== nouvelle requete /ha/session-token/create ===")
-        try:
-            refresh_token = data.get("delegatedRefreshToken")
-            if not refresh_token:
-                return self._reject(400, "delegatedRefreshToken requis")
-            _debug_log("refresh_token present, appel _ha_mint_access_token")
-            try:
-                access_token = _ha_mint_access_token(refresh_token)
-            except Exception as e:
-                _debug_log(f"mint a leve une exception normale: {type(e).__name__}: {e}")
-                _debug_log("appel _reject(502)...")
-                self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
-                _debug_log("_reject(502) est revenu sans lever d'exception")
-                return
-            _debug_log("mint OK, appel _ha_ws_connect")
+        Miroir de createHaSessionToken() dans delegatedSession.ts.
 
-            ws_send, ws_recv, ws_close = _ha_ws_connect(
-                access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
-            )
-            _debug_log(f"_ha_ws_connect retourne, ws_send={'ok' if ws_send else 'None'}")
-            if not ws_send:
-                return self._reject(502, "Connexion WebSocket HA échouée")
+        ⚠️ Répond TOUJOURS 200 (jamais 502) — piège réel trouvé le 2026-09-12 après
+        des heures de diagnostic (logs sur disque à chaque étape, confirmant que le
+        code Python s'exécute et écrit sa réponse sans la moindre erreur) : le tunnel
+        Cloudflare (`cloudflared`) intercepte et remplace tout code 502 renvoyé par
+        cette origine par SA PROPRE page d'erreur générique (texte brut, "error code:
+        502"), perdant le vrai corps JSON — confirmé en comparant avec des routes
+        existantes (200 OK, toujours transmis intact) contre cette même route avec un
+        502 (toujours remplacé, peu importe la validité de la réponse Python). Le
+        succès/échec se lit donc dans le corps JSON (`ok`/`sessionToken`/`error`),
+        jamais dans le code HTTP — même patron déjà utilisé ailleurs dans ce fichier
+        (haCameraPtz, haAlarmoSetUser)."""
+        refresh_token = data.get("delegatedRefreshToken")
+        if not refresh_token:
+            return self._reject(400, "delegatedRefreshToken requis")
+        try:
+            access_token = _ha_mint_access_token(refresh_token)
+        except Exception as e:
+            return self._ok({"ok": False, "error": f"Rafraîchissement du jeton HA échoué: {e}"})
+
+        ws_send, ws_recv, ws_close = _ha_ws_connect(
+            access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
+        )
+        if not ws_send:
+            return self._ok({"ok": False, "error": "Connexion WebSocket HA échouée"})
+        try:
+            ws_send({
+                "id": 1,
+                "type": "auth/long_lived_access_token",
+                "lifespan": 1,
+                "client_name": "Domoticium — session technicien",
+            })
+            result = ws_recv()
+            if not result.get("success"):
+                error = (result.get("error") or {}).get("message") or "Erreur Home Assistant"
+                return self._ok({"ok": False, "error": error})
+            llat = result.get("result")
+            if not isinstance(llat, str):
+                return self._ok({"ok": False, "error": "Réponse HA inattendue pour long_lived_access_token"})
+            self._ok({"ok": True, "sessionToken": llat})
+        except Exception as e:
+            self._ok({"ok": False, "error": f"Session WebSocket HA échouée: {e}"})
+        finally:
             try:
-                ws_send({
-                    "id": 1,
-                    "type": "auth/long_lived_access_token",
-                    "lifespan": 1,
-                    "client_name": "Domoticium — session technicien",
-                })
-                result = ws_recv()
-                if not result.get("success"):
-                    error = (result.get("error") or {}).get("message") or "Erreur Home Assistant"
-                    return self._reject(502, error)
-                llat = result.get("result")
-                if not isinstance(llat, str):
-                    return self._reject(502, "Réponse HA inattendue pour long_lived_access_token")
-                self._ok({"sessionToken": llat})
-            except Exception as e:
-                self._reject(502, f"Session WebSocket HA échouée: {e}")
-            finally:
-                try:
-                    ws_close()
-                except Exception:
-                    pass
-        except BaseException as e:
-            tb = traceback.format_exc()
-            _debug_log(f"CRASH attrape par le wrapper externe: {type(e).__name__}: {e}\n{tb}")
-            warn(f"[ha-session-token-create] CRASH: {tb}")
-            try:
-                self._reject(500, f"CRASH DIAGNOSTIC: {type(e).__name__}: {e}\n{tb}"[:4000])
+                ws_close()
             except Exception:
                 pass
 
@@ -8989,7 +8952,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         """Révoque un jeton de session technicien — se connecte avec le jeton lui-même
         (il s'authentifie comme le même utilisateur délégué) puis demande à HA de
         supprimer son propre refresh_token sous-jacent (identifié via son claim "iss").
-        Miroir de revokeHaSessionToken() dans delegatedSession.ts."""
+        Miroir de revokeHaSessionToken() dans delegatedSession.ts. Répond TOUJOURS 200,
+        même raison qu'au-dessus (cf. _handle_ha_session_token_create)."""
         session_token = data.get("sessionToken")
         if not session_token:
             return self._reject(400, "sessionToken requis")
@@ -9004,13 +8968,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             access_token=session_token, host="127.0.0.1", port=8123, path="/api/websocket"
         )
         if not ws_send:
-            return self._reject(502, "Connexion WebSocket HA échouée")
+            return self._ok({"ok": False, "error": "Connexion WebSocket HA échouée"})
         try:
             ws_send({"id": 1, "type": "auth/delete_refresh_token", "refresh_token_id": refresh_token_id})
             ws_recv()
-            self._ok()
+            self._ok({"ok": True})
         except Exception as e:
-            self._reject(502, f"Révocation WebSocket HA échouée: {e}")
+            self._ok({"ok": False, "error": f"Révocation WebSocket HA échouée: {e}"})
         finally:
             try:
                 ws_close()
@@ -9408,45 +9372,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_wifi_shelly_discovered_route()
         elif route == "/local/devices":
             self._handle_local_devices_route()
-        elif route == "/debug/session-log":
-            self._handle_debug_session_log_route()
-        elif route == "/debug/ping-core":
-            self._handle_debug_ping_core_route()
         else:
             self._reject(404, "Route inconnue")
-
-    def _handle_debug_ping_core_route(self):
-        """Diagnostic temporaire (2026-09-12) — isole si UN SIMPLE appel sortant vers
-        127.0.0.1:8123 suffit à casser la réponse HTTP (502 Cloudflare brut observé),
-        indépendamment de toute logique de session technicien. À retirer une fois la
-        vraie cause trouvée."""
-        _debug_log("ping-core: avant requests.get 127.0.0.1:8123/")
-        try:
-            resp = requests.get("http://127.0.0.1:8123/", timeout=5)
-            _debug_log(f"ping-core: reponse recue, status={resp.status_code}")
-        except BaseException as e:
-            _debug_log(f"ping-core: EXCEPTION: {type(e).__name__}: {e}")
-            return self._reject(502, f"ping-core échoué: {e}")
-        _debug_log("ping-core: appel _ok()")
-        self._ok({"status": resp.status_code})
-        _debug_log("ping-core: _ok() est revenu sans lever d'exception")
-
-    def _handle_debug_session_log_route(self):
-        """Diagnostic temporaire (2026-09-12) — lit /data/session_debug.log écrit par
-        _debug_log(). À retirer une fois la vraie cause du 502 brut trouvée."""
-        try:
-            with open("/data/session_debug.log") as f:
-                content = f.read()
-        except FileNotFoundError:
-            content = "(fichier absent — aucune requête /ha/session-token/create encore reçue)"
-        except Exception as e:
-            content = f"(erreur lecture: {e})"
-        body = content[-8000:].encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
     def _handle_camera_scan(self):
         try:
