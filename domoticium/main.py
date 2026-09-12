@@ -8767,11 +8767,15 @@ class _CommandHandler(http.server.BaseHTTPRequestHandler):
 
     def _respond(self, code, data):
         body = json.dumps(data).encode()
+        if code >= 500 or code == 502:
+            _debug_log(f"_respond: about to send_response({code}), body len={len(body)}")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        if code >= 500 or code == 502:
+            _debug_log(f"_respond: wfile.write termine pour code={code}")
 
     def _reject(self, code, msg):
         self._respond(code, {"error": msg})
@@ -8940,7 +8944,10 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 access_token = _ha_mint_access_token(refresh_token)
             except Exception as e:
                 _debug_log(f"mint a leve une exception normale: {type(e).__name__}: {e}")
-                return self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
+                _debug_log("appel _reject(502)...")
+                self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
+                _debug_log("_reject(502) est revenu sans lever d'exception")
+                return
             _debug_log("mint OK, appel _ha_ws_connect")
 
             ws_send, ws_recv, ws_close = _ha_ws_connect(
@@ -8973,6 +8980,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                     pass
         except BaseException as e:
             tb = traceback.format_exc()
+            _debug_log(f"CRASH attrape par le wrapper externe: {type(e).__name__}: {e}\n{tb}")
             warn(f"[ha-session-token-create] CRASH: {tb}")
             try:
                 self._reject(500, f"CRASH DIAGNOSTIC: {type(e).__name__}: {e}\n{tb}"[:4000])
