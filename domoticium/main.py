@@ -8882,6 +8882,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/wifi/shelly/add":      self._handle_wifi_shelly_add_route,
                 "/ha/session-token/create": self._handle_ha_session_token_create,
                 "/ha/session-token/revoke": self._handle_ha_session_token_revoke,
+                "/debug/test-ws-llat": self._handle_debug_test_ws_llat,
             }
             handler = handlers.get(route)
             if not handler:
@@ -8975,6 +8976,59 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok({"ok": True})
         except Exception as e:
             self._ok({"ok": False, "error": f"Révocation WebSocket HA échouée: {e}"})
+        finally:
+            try:
+                ws_close()
+            except Exception:
+                pass
+
+    def _handle_debug_test_ws_llat(self, data):
+        """Diagnostic temporaire (2026-09-12) — teste UNIQUEMENT l'étape WS
+        (ws://127.0.0.1:8123/api/websocket + auth/long_lived_access_token), sans passer
+        par le mint (accepte un access_token direct, ex. le jeton admin déjà utilisé pour
+        les tests Supervisor de cette session) — isole si la lenteur/l'échec de la vraie
+        requête technicien vient du mint (déjà confirmé rapide) ou de cette étape WS,
+        jamais testée avec un jeton VALIDE jusqu'ici. Crée un LLAT de test PUIS le
+        supprime immédiatement (nettoyage), pour ne rien laisser traîner. À retirer une
+        fois la vraie cause trouvée."""
+        access_token = data.get("accessToken")
+        if not access_token:
+            return self._reject(400, "accessToken requis")
+        t0 = time.time()
+        timings = {}
+        ws_send, ws_recv, ws_close = _ha_ws_connect(
+            access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
+        )
+        timings["ws_connect"] = round(time.time() - t0, 3)
+        if not ws_send:
+            return self._ok({"ok": False, "error": "Connexion WebSocket échouée", "timings": timings})
+        try:
+            t1 = time.time()
+            ws_send({
+                "id": 1,
+                "type": "auth/long_lived_access_token",
+                "lifespan": 1,
+                "client_name": "Domoticium — test diagnostic (à supprimer)",
+            })
+            result = ws_recv()
+            timings["llat_create"] = round(time.time() - t1, 3)
+            if not result.get("success"):
+                error = (result.get("error") or {}).get("message") or "Erreur Home Assistant"
+                return self._ok({"ok": False, "error": error, "timings": timings})
+            llat = result.get("result")
+            if not isinstance(llat, str):
+                return self._ok({"ok": False, "error": "Réponse HA inattendue", "timings": timings})
+
+            t2 = time.time()
+            refresh_token_id = _jwt_payload(llat).get("iss")
+            ws_send({"id": 2, "type": "auth/delete_refresh_token", "refresh_token_id": refresh_token_id})
+            ws_recv()
+            timings["cleanup_delete"] = round(time.time() - t2, 3)
+            timings["total"] = round(time.time() - t0, 3)
+            self._ok({"ok": True, "timings": timings})
+        except Exception as e:
+            timings["total"] = round(time.time() - t0, 3)
+            self._ok({"ok": False, "error": f"{type(e).__name__}: {e}", "timings": timings})
         finally:
             try:
                 ws_close()
