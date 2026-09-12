@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
+import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, traceback, urllib.parse, uuid, zipfile
 from datetime import datetime, date
 import paho.mqtt.client as mqtt
 import requests
@@ -8900,39 +8900,56 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         inexplicable spécifiquement sur l'environnement d'exécution Vercel (jamais
         reproduit en local ni depuis une IP résidentielle) — cf. HANDOFF.md côté web.
         Miroir de createHaSessionToken() dans delegatedSession.ts, ligne pour ligne."""
-        refresh_token = data.get("delegatedRefreshToken")
-        if not refresh_token:
-            return self._reject(400, "delegatedRefreshToken requis")
+        # ⚠️ DIAGNOSTIC TEMPORAIRE (2026-09-12) — v2.9.183 échoue avec un 502 BRUT
+        # Cloudflare (content-type text/plain, "error code: 502"), PAS une réponse
+        # JSON de notre _reject() — confirmé en testant directement via curl contre
+        # le tunnel, en comparant avec /cmd (200 OK immédiat, même secret/tunnel).
+        # Preuve que la requête crashe le process/la connexion AVANT qu'aucune
+        # réponse HTTP propre ne puisse être écrite — un `except Exception` normal
+        # n'explique pas ça. Ce bloc capture TOUT (BaseException compris) avec la
+        # trace complète, renvoyée dans la réponse le temps de trouver la vraie
+        # cause — à retirer une fois résolu.
         try:
-            access_token = _ha_mint_access_token(refresh_token)
-        except Exception as e:
-            return self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
-
-        ws_send, ws_recv, ws_close = _ha_ws_connect(
-            access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
-        )
-        if not ws_send:
-            return self._reject(502, "Connexion WebSocket HA échouée")
-        try:
-            ws_send({
-                "id": 1,
-                "type": "auth/long_lived_access_token",
-                "lifespan": 1,
-                "client_name": "Domoticium — session technicien",
-            })
-            result = ws_recv()
-            if not result.get("success"):
-                error = (result.get("error") or {}).get("message") or "Erreur Home Assistant"
-                return self._reject(502, error)
-            llat = result.get("result")
-            if not isinstance(llat, str):
-                return self._reject(502, "Réponse HA inattendue pour long_lived_access_token")
-            self._ok({"sessionToken": llat})
-        except Exception as e:
-            self._reject(502, f"Session WebSocket HA échouée: {e}")
-        finally:
+            refresh_token = data.get("delegatedRefreshToken")
+            if not refresh_token:
+                return self._reject(400, "delegatedRefreshToken requis")
             try:
-                ws_close()
+                access_token = _ha_mint_access_token(refresh_token)
+            except Exception as e:
+                return self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
+
+            ws_send, ws_recv, ws_close = _ha_ws_connect(
+                access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
+            )
+            if not ws_send:
+                return self._reject(502, "Connexion WebSocket HA échouée")
+            try:
+                ws_send({
+                    "id": 1,
+                    "type": "auth/long_lived_access_token",
+                    "lifespan": 1,
+                    "client_name": "Domoticium — session technicien",
+                })
+                result = ws_recv()
+                if not result.get("success"):
+                    error = (result.get("error") or {}).get("message") or "Erreur Home Assistant"
+                    return self._reject(502, error)
+                llat = result.get("result")
+                if not isinstance(llat, str):
+                    return self._reject(502, "Réponse HA inattendue pour long_lived_access_token")
+                self._ok({"sessionToken": llat})
+            except Exception as e:
+                self._reject(502, f"Session WebSocket HA échouée: {e}")
+            finally:
+                try:
+                    ws_close()
+                except Exception:
+                    pass
+        except BaseException as e:
+            tb = traceback.format_exc()
+            warn(f"[ha-session-token-create] CRASH: {tb}")
+            try:
+                self._reject(500, f"CRASH DIAGNOSTIC: {type(e).__name__}: {e}\n{tb}"[:4000])
             except Exception:
                 pass
 
