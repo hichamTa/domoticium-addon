@@ -5544,7 +5544,20 @@ def _reconcile_device_states():
     aucun risque ici puisqu'une entité déjà unavailable n'a justement plus de
     valeur dont la fraîcheur compte). Même chemin qu'un vrai événement
     (_relay_ha_state) — auto-réparateur à chaque cycle de sync (5 min), jamais
-    de logique dupliquée avec le bridge événementiel."""
+    de logique dupliquée avec le bridge événementiel.
+
+    (2026-09-12) Extension — SENS INVERSE, bug réel trouvé par Hicham : des
+    appareils ("prise chambre"/"prise salon") restaient marqués `online=false`
+    (alerte comprise) alors que HA les montrait bien normaux ("on") depuis
+    plusieurs jours. Cause : ce filet ne corrigeait jusqu'ici QUE le sens
+    "online=true alors que HA montre unavailable" — jamais l'inverse. Si
+    l'UNIQUE `state_changed` marquant le retour en ligne est manqué (ex:
+    l'add-on redémarre pile à ce moment), rien ne le rattrape : HA ne republie
+    jamais le même état en boucle. Corrige maintenant aussi ce sens : compare
+    la liste des entités marquées `online=false` côté app (nouvelle RPC
+    `pi_list_offline_devices`) à l'état HA RÉEL déjà récupéré ci-dessus — pour
+    celles dont HA ne montre PAS unavailable/unknown, repousse l'état réel
+    (même chemin `_relay_ha_state`, donc `online` recalculé correctement)."""
     r = ha_get("/states")
     if not r.ok:
         warn(f"[reconcile] /states {r.status_code}: {r.text[:150]}")
@@ -5554,6 +5567,10 @@ def _reconcile_device_states():
     except Exception as e:
         warn(f"[reconcile] réponse /states invalide: {e}")
         return
+
+    states_by_entity = {
+        s["entity_id"]: s for s in states if isinstance(s, dict) and s.get("entity_id")
+    }
 
     n = 0
     for s in states:
@@ -5570,6 +5587,33 @@ def _reconcile_device_states():
         n += 1
     if n:
         log(f"[reconcile] {n} entité(s) unavailable/unknown repoussée(s) (filet périodique)")
+
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:list_offline_devices"
+        resp = _supabase_rpc("pi_list_offline_devices", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+        })
+        offline_entity_ids = [row["ha_entity_id"] for row in resp.json()] if resp.ok else []
+    except Exception as e:
+        warn(f"[reconcile] pi_list_offline_devices échoué : {e}")
+        offline_entity_ids = []
+
+    m = 0
+    for entity_id in offline_entity_ids:
+        s = states_by_entity.get(entity_id)
+        if not s:
+            continue
+        state_val = s.get("state", "")
+        if state_val in ("unavailable", "unknown"):
+            continue  # toujours réellement hors ligne, rien à corriger
+        domain = entity_id.split(".")[0] if "." in entity_id else ""
+        if domain not in RELAY_DOMAINS:
+            continue
+        _relay_ha_state(entity_id, state_val, s.get("attributes") or {})
+        m += 1
+    if m:
+        log(f"[reconcile] {m} entité(s) revenue(s) en ligne re-synchronisée(s) (filet périodique)")
 
 
 def _sync_all_to_ha():
