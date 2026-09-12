@@ -441,6 +441,19 @@ def _ha_ws_call(cmd_type: str, **params):
         except Exception:
             pass
 
+def _debug_log(msg: str):
+    """Diagnostic temporaire (2026-09-12, accès distant technicien) — écrit sur disque
+    (/data, persistant) car le 502 Cloudflare brut observé sur /ha/session-token/create
+    empêche même une réponse HTTP normale de sortir ; warn()/logs stdout inaccessibles
+    depuis l'extérieur du Pi pour l'instant. Lu via GET /debug/session-log. À retirer
+    une fois la vraie cause trouvée."""
+    try:
+        with open("/data/session_debug.log", "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
 def _ha_mint_access_token(refresh_token: str) -> str:
     """Échange un refresh_token OAuth2 délégué (consentement client, cf. HANDOFF côté
     web/project-remote-ha-access-consent) contre un access_token HA de courte durée.
@@ -456,21 +469,29 @@ def _ha_mint_access_token(refresh_token: str) -> str:
     commentaire détaillé dans _ha_ws_connect(). 127.0.0.1:8123 fonctionne car
     host_network: true (config.yaml) fait partager à cet add-on la pile réseau de l'hôte,
     où Home Assistant Core écoute réellement."""
-    resp = requests.post(
-        "http://127.0.0.1:8123/auth/token",
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": f"{APP_URL}/",
-        },
-        timeout=15,
-    )
+    _debug_log("mint: avant requests.post 127.0.0.1:8123/auth/token")
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:8123/auth/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": f"{APP_URL}/",
+            },
+            timeout=15,
+        )
+    except BaseException as e:
+        _debug_log(f"mint: EXCEPTION pendant requests.post: {type(e).__name__}: {e}")
+        raise
+    _debug_log(f"mint: reponse recue, status={resp.status_code}")
     try:
         body = resp.json()
     except Exception:
         body = {}
     if not resp.ok or not body.get("access_token"):
+        _debug_log(f"mint: echec, body={str(body)[:300]}")
         raise Exception(f"Rafraîchissement du jeton HA échoué: {body.get('error') or resp.status_code}")
+    _debug_log("mint: access_token obtenu avec succes")
     return body["access_token"]
 
 
@@ -8909,18 +8930,23 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         # n'explique pas ça. Ce bloc capture TOUT (BaseException compris) avec la
         # trace complète, renvoyée dans la réponse le temps de trouver la vraie
         # cause — à retirer une fois résolu.
+        _debug_log("=== nouvelle requete /ha/session-token/create ===")
         try:
             refresh_token = data.get("delegatedRefreshToken")
             if not refresh_token:
                 return self._reject(400, "delegatedRefreshToken requis")
+            _debug_log("refresh_token present, appel _ha_mint_access_token")
             try:
                 access_token = _ha_mint_access_token(refresh_token)
             except Exception as e:
+                _debug_log(f"mint a leve une exception normale: {type(e).__name__}: {e}")
                 return self._reject(502, f"Rafraîchissement du jeton HA échoué: {e}")
+            _debug_log("mint OK, appel _ha_ws_connect")
 
             ws_send, ws_recv, ws_close = _ha_ws_connect(
                 access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
             )
+            _debug_log(f"_ha_ws_connect retourne, ws_send={'ok' if ws_send else 'None'}")
             if not ws_send:
                 return self._reject(502, "Connexion WebSocket HA échouée")
             try:
@@ -9376,8 +9402,27 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_wifi_shelly_discovered_route()
         elif route == "/local/devices":
             self._handle_local_devices_route()
+        elif route == "/debug/session-log":
+            self._handle_debug_session_log_route()
         else:
             self._reject(404, "Route inconnue")
+
+    def _handle_debug_session_log_route(self):
+        """Diagnostic temporaire (2026-09-12) — lit /data/session_debug.log écrit par
+        _debug_log(). À retirer une fois la vraie cause du 502 brut trouvée."""
+        try:
+            with open("/data/session_debug.log") as f:
+                content = f.read()
+        except FileNotFoundError:
+            content = "(fichier absent — aucune requête /ha/session-token/create encore reçue)"
+        except Exception as e:
+            content = f"(erreur lecture: {e})"
+        body = content[-8000:].encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_camera_scan(self):
         try:
