@@ -235,7 +235,20 @@ _camera_masks: dict[str, list[dict]] = {}
 # toute façon), mais fragile en général — ce verrou fait passer les appels un par un :
 # état et redémarrage toujours cohérents, plus de résultat "ok=False" trompeur pour
 # une opération qui a en réalité réussi.
-_camera_configure_lock = threading.Lock()
+#
+# Devenu aussi le verrou dédié pour toute LECTURE non triviale de _cameras/
+# _camera_masks (audit dette technique, point 20, 2026-09-18) : write_frigate_config()
+# (via _generate_frigate_yaml) et _resync_go2rtc_streams() itèrent tous les deux sur
+# _cameras.items() avec du travail (I/O compris) entre chaque élément — une vraie
+# itération Python, pas une simple lecture atomique — pendant qu'un thread HTTP
+# concurrent peut muter le dict via handle_camera_configure()/handle_camera_mask().
+# Sans protection, ça peut lever RuntimeError("dictionary changed size during
+# iteration"), jamais observé en réel mais réel en théorie (1 seul site réel
+# aujourd'hui, faible trafic concurrent). RLock (pas Lock) : write_frigate_config()
+# est appelé À LA FOIS depuis l'intérieur de handle_camera_configure()/
+# handle_camera_mask() (déjà sous ce verrou) ET depuis d'autres call sites qui ne
+# l'ont jamais pris — Lock aurait provoqué un deadlock immédiat sur le 1er cas.
+_camera_configure_lock = threading.RLock()
 
 # Un seul commissioning Matter à la fois (matter-server ne sait pas gérer 2 sessions
 # PASE simultanées vers le même discriminator — vu en test réel : 2 requêtes à 1s
@@ -3510,10 +3523,11 @@ def handle_alarmo_set_automation(
 def write_frigate_config():
     """Écrit /homeassistant/frigate.yml. Le prepare script Frigate le copie dans son
     stockage privé à chaque démarrage — c'est la seule voie de config utilisée."""
-    content = _generate_frigate_yaml()
-    with open("/homeassistant/frigate.yml", "w") as fh:
-        fh.write(content)
-    log(f"✓ config Frigate mise à jour ({len(_cameras)} caméra(s))")
+    with _camera_configure_lock:
+        content = _generate_frigate_yaml()
+        with open("/homeassistant/frigate.yml", "w") as fh:
+            fh.write(content)
+        log(f"✓ config Frigate mise à jour ({len(_cameras)} caméra(s))")
 
 
 # ── MQTT / Automations ───────────────────────────────────────────────────────
@@ -7964,9 +7978,10 @@ def _resync_go2rtc_streams():
     régénéré PROPREMENT à CHAQUE démarrage du conteneur — jamais touché par le script
     HomeKit (fichier différent). D'où : un redémarrage complet plutôt qu'un patch à
     chaud dès qu'un écart est détecté."""
-    if not _cameras:
-        return
-    missing = [name for name, url in _cameras.items() if not _go2rtc_stream_already_persisted(name, url)]
+    with _camera_configure_lock:
+        if not _cameras:
+            return
+        missing = [name for name, url in _cameras.items() if not _go2rtc_stream_already_persisted(name, url)]
     if not missing:
         return
     log(f"[frigate] Caméra(s) absente(s) de go2rtc ({', '.join(missing)}) — redémarrage pour resynchroniser…")
@@ -8886,7 +8901,11 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
     def do_POST(self):
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
-        if self.headers.get("X-Site-Secret") != INGEST_SECRET:
+        # hmac.compare_digest (pas !=) : comparaison en temps constant, évite une
+        # attaque par timing sur le secret (audit dette technique, point 21,
+        # 2026-09-18) — risque théorique faible (HTTPS + secret long) mais correctif
+        # d'une ligne.
+        if not hmac.compare_digest(self.headers.get("X-Site-Secret") or "", INGEST_SECRET):
             return self._reject(401, "Non autorisé")
 
         try:
@@ -9393,7 +9412,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
 
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
-        if self.headers.get("X-Site-Secret") != INGEST_SECRET:
+        if not hmac.compare_digest(self.headers.get("X-Site-Secret") or "", INGEST_SECRET):
             return self._reject(401, "Non autorisé")
         if route == "/camera/scan":
             self._handle_camera_scan()
