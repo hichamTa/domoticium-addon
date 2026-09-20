@@ -115,6 +115,54 @@ def _supabase_rpc(fn_name: str, payload: dict, timeout: float = 10.0) -> request
         timeout=timeout,
     )
 
+def _normalize_device(
+    protocol: str, *, external_id, name: str, type_: str,
+    vendor: str = "", model: str = "", online: bool | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """Forme commune envoyée à pi_sync_devices (harmonisation Zigbee/Matter/WiFi,
+    chantier approuvé — cf. plan de session). `external_id` est routé côté SQL
+    vers ieee_address/matter_node_id/wifi_id selon `protocol`. `online` reste
+    optionnel et absent pour Zigbee : la synchro périodique bridge/devices n'a
+    jamais eu de signal de présence fiable (contrairement à Matter/WiFi, qui
+    l'ont à chaque cycle) — l'omettre dit explicitement à pi_sync_devices de ne
+    pas toucher online/alertes pour cette ligne, exactement le comportement
+    actuel d'upsert_zigbee_device (jamais modifié sur UPDATE)."""
+    device: dict = {
+        "external_id": str(external_id),
+        "name": name,
+        "type": type_,
+        "vendor": vendor or "",
+        "model": model or "",
+        "extra": extra or {},
+    }
+    if online is not None:
+        device["online"] = online
+    return device
+
+
+def _sync_devices_to_supabase(protocol: str, devices: list[dict], timeout: float = 30.0) -> bool:
+    """Appelle pi_sync_devices — remplace le bloc signature+appel+log répété en
+    fin de chaque _sync_*_direct (harmonisation Zigbee/Matter/WiFi). True si
+    réussi. `devices` : liste d'objets déjà normalisés via _normalize_device."""
+    try:
+        ts = int(time.time())
+        id_sorted = ",".join(sorted(d["external_id"] for d in devices))
+        message = f"{SITE_PREFIX}:{ts}:device_sync:{protocol}:{id_sorted}"
+        r = _supabase_rpc("pi_sync_devices", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_protocol": protocol, "p_devices": devices,
+        }, timeout=timeout)
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_sync_devices({protocol}) {r.status_code}: {r.text[:200]}")
+            return False
+        log(f"[supabase] pi_sync_devices({protocol}) — {len(devices)} devices, réponse: {r.text[:120]}")
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_sync_devices({protocol}): {e}")
+        return False
+
+
 Z2M_REPO       = "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt"
 Z2M_SLUG       = "45df7312_zigbee2mqtt"
 MATTER_SLUG    = "core_matter_server"
@@ -7413,8 +7461,11 @@ def _detect_device_type(
 
 
 def _sync_zigbee_devices_direct(devices_list) -> bool:
-    """pi_sync_zigbee_devices via Supabase direct — True si réussi. Réplique le
-    filtrage (coordinateur/interview non terminée exclus) fait par la route Vercel."""
+    """pi_sync_devices (protocole "zigbee") via Supabase direct — True si réussi.
+    Réplique le filtrage (coordinateur/interview non terminée exclus) fait par
+    la route Vercel. Basculé de pi_sync_zigbee_devices (RPC dédiée, toujours en
+    place mais plus appelée par l'add-on) vers la RPC générique le 2026-09-21,
+    cf. chantier d'harmonisation Zigbee/Matter/WiFi."""
     global _z2m_friendly_to_ieee
     try:
         payload_devices = []
@@ -7503,20 +7554,28 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
                         target=_report_device_availability_direct, args=(ieee, online), daemon=True
                     ).start()
 
-        ts = int(time.time())
-        ieee_sorted = ",".join(sorted(d["ieee_address"] for d in payload_devices))
-        message = f"{SITE_PREFIX}:{ts}:zigbee_sync:{ieee_sorted}"
-        r = _supabase_rpc("pi_sync_zigbee_devices", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_devices": payload_devices,
-        }, timeout=30)
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_sync_zigbee_devices {r.status_code}: {r.text[:200]}")
-            return False
-        log(f"[supabase] pi_sync_zigbee_devices — {len(payload_devices)} devices, réponse: {r.text[:120]}")
-        return True
+        # Harmonisation Zigbee/Matter/WiFi (chantier approuvé, 2026-09-21) —
+        # bascule vers pi_sync_devices générique. `online` volontairement absent
+        # ici : cf. docstring de _normalize_device, la synchro Zigbee n'a jamais
+        # eu de signal de présence fiable à ce stade (contrairement à Matter/
+        # WiFi) — la RPC laisse online/alertes intacts pour ces lignes, comme
+        # upsert_zigbee_device le fait déjà.
+        normalized = [
+            _normalize_device(
+                "zigbee",
+                external_id=d["ieee_address"], name=d["name"], type_=d["type"],
+                vendor=d["vendor"], model=d["model"],
+                extra={
+                    "z2m_name": d["z2m_name"],
+                    "features": d["features"],
+                    "power_source": d["power_source"],
+                },
+            )
+            for d in payload_devices
+        ]
+        return _sync_devices_to_supabase("zigbee", normalized, timeout=30)
     except Exception as e:
-        warn(f"[supabase] pi_sync_zigbee_devices: {e}")
+        warn(f"[supabase] pi_sync_devices(zigbee): {e}")
         return False
 
 
