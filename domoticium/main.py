@@ -4897,22 +4897,27 @@ def _detect_wifi_device_type(domain: str, device_class):
 
 
 def _post_wifi_sync(devices_payload: list) -> bool:
-    """pi_sync_wifi_devices via Supabase direct — True si réussi."""
+    """pi_sync_devices (protocole "ha", wifi) via Supabase direct — True si
+    réussi. Basculé de pi_sync_wifi_devices vers la RPC générique le
+    2026-09-21, cf. chantier d'harmonisation Zigbee/Matter/WiFi (dernier des 3
+    protocoles, après Zigbee/Matter déjà vérifiés en réel). `online` toujours
+    fourni ici (état HA live au moment du sync) — WiFi gagne au passage une
+    vraie alerte hors-ligne anti-flap, qu'il n'avait jamais eue jusqu'ici
+    (pi_sync_wifi_devices ne touchait jamais la table alerts)."""
     try:
-        ts = int(time.time())
-        id_sorted = ",".join(sorted(str(d["wifi_id"]) for d in devices_payload))
-        message = f"{SITE_PREFIX}:{ts}:wifi_sync:{id_sorted}"
-        r = _supabase_rpc("pi_sync_wifi_devices", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_devices": devices_payload,
-        }, timeout=30)
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_sync_wifi_devices {r.status_code}: {r.text[:200]}")
-            return False
-        log(f"[supabase] pi_sync_wifi_devices — {len(devices_payload)} devices, réponse: {r.text[:120]}")
-        return True
+        normalized = [
+            _normalize_device(
+                "ha",
+                external_id=d["wifi_id"], name=d["name"], type_=d["type"],
+                vendor=d.get("vendor") or "", model=d.get("model") or "",
+                online=d.get("online", True),
+                extra={"ha_entity_id": d.get("ha_entity_id")},
+            )
+            for d in devices_payload
+        ]
+        return _sync_devices_to_supabase("ha", normalized, timeout=30)
     except Exception as e:
-        warn(f"[supabase] pi_sync_wifi_devices: {e}")
+        warn(f"[supabase] pi_sync_devices(ha): {e}")
         return False
 
 
@@ -4922,7 +4927,8 @@ def _sync_wifi_devices_to_app():
     _sync_matter_devices_to_app(), mais la source est le device_registry HA
     (pas de liste dédiée façon matter-server get_nodes() ou bridge/devices Z2M).
     Groupe les entités par device_id HA, choisit une entité principale par
-    priorité de domaine, upsert via pi_sync_wifi_devices (clé wifi_id)."""
+    priorité de domaine, upsert via pi_sync_devices/protocole "ha" (clé
+    wifi_id)."""
     dev_result = _ha_ws_call("config/device_registry/list")
     if not dev_result or not dev_result.get("success"):
         return
