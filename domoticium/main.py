@@ -5231,8 +5231,15 @@ _boosted_ieees: set[str] = set()
 # même nom de property côté Z2M) — désambiguïsé par l'unité réelle de l'expose
 # (V → secteur, mV → pile), jamais par le nom seul.
 _REPORTING_ATTRS = {
-    "power":       ("haElectricalMeasurement", "activePower",          5,        False),
-    "current":     ("haElectricalMeasurement", "rmsCurrent",           0.05,     False),
+    # power/current : seuils desserrés le 2026-09-21 (2e passe du correctif
+    # egress Supabase, sur demande explicite d'Hicham d'aller plus loin) —
+    # 0,05 A était plus fin que le bruit de mesure réel d'un capteur de
+    # courant bas de gamme, déclenchant un report quasiment à chaque cycle
+    # même sans vraie variation de charge. 0,15 A/8 W filtrent ce bruit sans
+    # perdre les vraies transitions (allumer/éteindre une charge change
+    # bien plus que ça).
+    "power":       ("haElectricalMeasurement", "activePower",          8,        False),
+    "current":     ("haElectricalMeasurement", "rmsCurrent",           0.15,     False),
     "voltage":     ("haElectricalMeasurement", "rmsVoltage",           5,        False),
     "energy":      ("seMetering",               "currentSummDelivered", 0.1,     False),
     "temperature": ("msTemperatureMeasurement", "measuredValue",       100,      True),
@@ -5316,14 +5323,20 @@ def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
         # réelles : 259 649 appels HTTP en 24h rien que sur le report d'un
         # device Zigbee (~3/s en continu). Générique à TOUT attribut de
         # _REPORTING_ATTRS, donc à TOUT futur équipement/client, pas
-        # spécifique aux prises qui l'ont révélé — remonté à 10s (Hicham,
-        # discuté explicitement : imperceptible sur un dashboard, contrairement
-        # aux commandes/actionnement d'équipement qui n'utilisent jamais ce
-        # mécanisme — cf. genOnOff, jamais dans _REPORTING_ATTRS). min(...,
-        # max_interval) : ne jamais dépasser l'intervalle max lui-même (invalide
-        # côté ZCL) si battery_reporting_seconds est configuré plus bas que 10s
-        # sur un futur site.
-        min_interval = min(10, max_interval)
+        # spécifique aux prises qui l'ont révélé. 1re passe : 10s. 2e passe
+        # (toujours le 2026-09-21, sur demande explicite d'Hicham "aller plus
+        # loin" après avoir vu que 10s seul ramenait la conso mensuelle
+        # projetée à ~6,5-7 Go — toujours au-dessus du forfait gratuit 5,5 Go) :
+        # remonté à 20s, ET seuils de changement desserrés ci-dessus
+        # (power/current) — l'intervalle seul ne plafonne que le PIRE cas, les
+        # seuils desserrés réduisent la fréquence RÉELLE en filtrant le bruit
+        # de mesure qui saturait l'ancien seuil à chaque cycle. Toujours
+        # imperceptible sur un dashboard, toujours sans lien avec
+        # l'actionnement d'équipement (cf. commentaire plus haut, genOnOff
+        # jamais dans _REPORTING_ATTRS). min(..., max_interval) : ne jamais
+        # dépasser l'intervalle max lui-même (invalide côté ZCL) si
+        # battery_reporting_seconds est configuré plus bas sur un futur site.
+        min_interval = min(20, max_interval)
         _local_client.publish(
             "zigbee2mqtt/bridge/request/device/reporting/configure",
             json.dumps({
