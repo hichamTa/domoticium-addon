@@ -4818,32 +4818,28 @@ def _extract_matter_device_info(node: dict):
 
 
 def _sync_matter_devices_direct(devices_payload) -> bool:
-    """pi_sync_matter_devices via Supabase direct — True si réussi. Un doublon
-    détecté (node_id renouvelé) ne fusionne plus automatiquement ici — une
-    suggestion en attente est créée côté SQL, confirmée explicitement par le
-    client (cf. handle_matter_merge_confirm, route /matter/merge/confirm)."""
+    """pi_sync_devices (protocole "matter") via Supabase direct — True si réussi.
+    Un doublon détecté (node_id renouvelé) ne fusionne plus automatiquement ici
+    — une suggestion en attente est créée côté SQL (logique de détection
+    reprise à l'identique dans pi_sync_devices), confirmée explicitement par le
+    client (cf. handle_matter_merge_confirm, route /matter/merge/confirm).
+    Basculé de pi_sync_matter_devices vers la RPC générique le 2026-09-21, cf.
+    chantier d'harmonisation Zigbee/Matter/WiFi (Zigbee fait en premier,
+    Matter ensuite)."""
     try:
-        rpc_devices = [{
-            "node_id": d["node_id"], "name": d["name"],
-            "type": d["device_type"], "vendor": d.get("vendor_name") or "",
-            "model": d.get("product_name") or "", "online": d.get("online", True),
-            "explicitly_added": d.get("explicitly_added", False),
-        } for d in devices_payload]
-
-        ts = int(time.time())
-        id_sorted = ",".join(sorted(str(d["node_id"]) for d in rpc_devices))
-        message = f"{SITE_PREFIX}:{ts}:matter_sync:{id_sorted}"
-        r = _supabase_rpc("pi_sync_matter_devices", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_devices": rpc_devices,
-        }, timeout=30)
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_sync_matter_devices {r.status_code}: {r.text[:200]}")
-            return False
-        log(f"[supabase] pi_sync_matter_devices — {len(rpc_devices)} devices, réponse: {r.text[:120]}")
-        return True
+        normalized = [
+            _normalize_device(
+                "matter",
+                external_id=d["node_id"], name=d["name"], type_=d["device_type"],
+                vendor=d.get("vendor_name") or "", model=d.get("product_name") or "",
+                online=d.get("online", True),
+                extra={"explicitly_added": d.get("explicitly_added", False)},
+            )
+            for d in devices_payload
+        ]
+        return _sync_devices_to_supabase("matter", normalized, timeout=30)
     except Exception as e:
-        warn(f"[supabase] pi_sync_matter_devices: {e}")
+        warn(f"[supabase] pi_sync_devices(matter): {e}")
         return False
 
 
