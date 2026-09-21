@@ -7609,47 +7609,53 @@ def _report_room_assignments_direct(room_updates) -> bool:
 
 
 def _report_device_availability_direct(ieee: str, online: bool) -> bool:
-    """pi_report_device_availability via Supabase direct — True si réussi. Reçoit
-    l'état réel de zigbee2mqtt/{friendly_name}/availability (cf. on_local_message),
-    contrairement à pi_sync_zigbee_devices qui force online=true à chaque synchro
-    périodique sans jamais le réévaluer."""
+    """pi_report_device_state (protocole "zigbee", p_online explicite) via
+    Supabase direct — True si réussi. Reçoit l'état réel de
+    zigbee2mqtt/{friendly_name}/availability (cf. on_local_message),
+    contrairement à la synchro périodique qui n'a jamais de signal fiable (cf.
+    _normalize_device). Basculé de pi_report_device_availability vers la RPC
+    consolidée le 2026-09-21 (chantier d'harmonisation, 2e étape) — la RPC
+    défère elle-même au chemin ha_entity_id si ce device en a déjà un
+    (même garde que l'ancienne RPC dédiée)."""
     try:
         ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:device_availability:{ieee}:{str(online).lower()}"
-        r = _supabase_rpc("pi_report_device_availability", {
+        message = f"{SITE_PREFIX}:{ts}:device_state:zigbee:{ieee}"
+        r = _supabase_rpc("pi_report_device_state", {
             "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_ieee_address": ieee, "p_online": online,
+            "p_protocol": "zigbee", "p_external_id": ieee, "p_online": online,
         })
         if r.status_code >= 300:
-            warn(f"[supabase] pi_report_device_availability {r.status_code}: {r.text[:200]}")
+            warn(f"[supabase] pi_report_device_state(zigbee availability) {r.status_code}: {r.text[:200]}")
             return False
         return True
     except Exception as e:
-        warn(f"[supabase] pi_report_device_availability: {e}")
+        warn(f"[supabase] pi_report_device_state(zigbee availability): {e}")
         return False
 
 
 def _report_zigbee_state_direct(ieee: str, raw_state: dict) -> bool:
-    """pi_report_zigbee_state via Supabase direct — True si réussi. Reçoit l'état
-    COMPLET publié par Z2M sur zigbee2mqtt/{friendly_name} (cf. on_local_message) :
-    seule source de valeurs réelles pour un device Zigbee sans entité HA principale
-    liée (ex: une télécommande classée sensor-generic, cf. §167) — jusqu'ici son
-    schéma d'exposes s'affichait côté web (§168) mais sans aucune valeur, faute de
+    """pi_report_device_state (protocole "zigbee", p_raw_attributes) via
+    Supabase direct — True si réussi. Reçoit l'état COMPLET publié par Z2M sur
+    zigbee2mqtt/{friendly_name} (cf. on_local_message) : seule source de
+    valeurs réelles pour un device Zigbee sans entité HA principale liée (ex:
+    une télécommande classée sensor-generic, cf. §167) — jusqu'ici son schéma
+    d'exposes s'affichait côté web (§168) mais sans aucune valeur, faute de
     pipeline de capture pour ce topic (bug remonté par Hicham en conditions
-    réelles, 2026-08-09 : "—" partout sur battery/action/linkquality)."""
+    réelles, 2026-08-09 : "—" partout sur battery/action/linkquality).
+    Basculé de pi_report_zigbee_state vers la RPC consolidée le 2026-09-21."""
     try:
         ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:zigbee_state:{ieee}"
-        r = _supabase_rpc("pi_report_zigbee_state", {
+        message = f"{SITE_PREFIX}:{ts}:device_state:zigbee:{ieee}"
+        r = _supabase_rpc("pi_report_device_state", {
             "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_ieee_address": ieee, "p_raw_state": raw_state,
+            "p_protocol": "zigbee", "p_external_id": ieee, "p_raw_attributes": raw_state,
         })
         if r.status_code >= 300:
-            warn(f"[supabase] pi_report_zigbee_state {r.status_code}: {r.text[:200]}")
+            warn(f"[supabase] pi_report_device_state(zigbee state) {r.status_code}: {r.text[:200]}")
             return False
         return True
     except Exception as e:
-        warn(f"[supabase] pi_report_zigbee_state: {e}")
+        warn(f"[supabase] pi_report_device_state(zigbee state): {e}")
         return False
 
 
