@@ -6409,6 +6409,21 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
 _state_batch: dict = {}
 _state_batch_lock = threading.Lock()
 
+# Frein dédié aux entités "sensor.*" (audit egress Supabase, 2026-09-21,
+# 2e volet — étend à Matter/WiFi le même principe que le boost Zigbee
+# ci-dessus : "prise pour cause de bruit de mesure" était spécifique à
+# Zigbee, mais un capteur Matter/WiFi bavard cause exactement le même
+# problème via CE chemin — _report_device_state_direct est le point d'entrée
+# UNIQUE et déjà partagé par les 3 protocoles dès qu'une entité a un
+# ha_entity_id. Domaine "sensor" choisi précisément : jamais un actionneur
+# (light/switch/cover/lock/fan/climate), jamais l'alarme (déjà hors batch,
+# cf. _relay_ha_state) ni un binary_sensor de sécurité (mouvement/ouverture/
+# fumée) — seulement des mesures passives (température/CO2/humidité/
+# puissance/etc.), exactement le même genre d'attribut que _REPORTING_ATTRS
+# côté Zigbee. Ne retarde jamais une commande ni un capteur de sécurité.
+_SENSOR_REPORT_MIN_INTERVAL_S = 20
+_sensor_report_last_sent: dict[str, float] = {}
+
 # ── Watchdog caméras ─────────────────────────────────────────────────────────
 # Sonde go2rtc toutes les 60s, envoie les deltas dans le même flush que les états.
 _cam_watch_online: dict[str, bool] = {}   # streamName → dernière valeur connue
@@ -6545,7 +6560,27 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
     multi-mesures) quand aucun device principal ne correspond à cet entity_id —
     ces mesures n'étaient jusqu'ici JAMAIS rafraîchies après leur liaison
     initiale (bug trouvé en conditions réelles, Hicham, 2026-08-05 : "mon
-    capteur est resté figé depuis plusieurs jours")."""
+    capteur est resté figé depuis plusieurs jours").
+
+    Frein "sensor.*" (2026-09-21, cf. commentaire de _sensor_report_last_sent
+    ci-dessus) : un capteur Matter/WiFi qui republie plusieurs fois par
+    seconde (ex: qualité de l'air) traverse ce même point d'entrée — sans
+    filtre, il aurait généré le même dépassement egress que Zigbee, pour un
+    coût bien réel côté Supabase. Retourne False (comme un échec réseau) sur
+    un envoi volontairement retardé : _flush_state_batch le réintègre alors
+    tel quel dans _state_batch (mécanisme de retry déjà existant, cf. son
+    docstring) — retenté au cycle suivant (2.5s), avec la valeur la PLUS
+    RÉCENTE si une autre est arrivée entre-temps (setdefault ne réécrit
+    jamais une valeur plus fraîche). Garantit un envoi dès que l'intervalle
+    est écoulé, jamais une perte silencieuse — même garantie que
+    maximum_report_interval côté Zigbee."""
+    domain = entity_id.split(".")[0] if "." in entity_id else ""
+    if domain == "sensor":
+        now = time.time()
+        last_sent = _sensor_report_last_sent.get(entity_id, 0.0)
+        if now - last_sent < _SENSOR_REPORT_MIN_INTERVAL_S:
+            return False
+        _sensor_report_last_sent[entity_id] = now
     try:
         patch = _ha_entity_to_normalized_patch(entity_id, state, attributes)
         capabilities = _ha_attributes_to_capabilities(entity_id, attributes)
