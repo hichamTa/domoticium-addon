@@ -5309,11 +5309,26 @@ def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
         with _reporting_configure_lock:
             _reporting_configure_events[key] = ev
             _reporting_configure_results.pop(key, None)
+        # Bug réel trouvé le 2026-09-21 (facture Supabase, dépassement egress
+        # gratuit) : minimum_report_interval à 1s laissait un device dont la
+        # mesure a du bruit naturel (courant/tension électriques surtout)
+        # republier jusqu'à 1x/seconde en continu — confirmé en conditions
+        # réelles : 259 649 appels HTTP en 24h rien que sur le report d'un
+        # device Zigbee (~3/s en continu). Générique à TOUT attribut de
+        # _REPORTING_ATTRS, donc à TOUT futur équipement/client, pas
+        # spécifique aux prises qui l'ont révélé — remonté à 10s (Hicham,
+        # discuté explicitement : imperceptible sur un dashboard, contrairement
+        # aux commandes/actionnement d'équipement qui n'utilisent jamais ce
+        # mécanisme — cf. genOnOff, jamais dans _REPORTING_ATTRS). min(...,
+        # max_interval) : ne jamais dépasser l'intervalle max lui-même (invalide
+        # côté ZCL) si battery_reporting_seconds est configuré plus bas que 10s
+        # sur un futur site.
+        min_interval = min(10, max_interval)
         _local_client.publish(
             "zigbee2mqtt/bridge/request/device/reporting/configure",
             json.dumps({
                 "id": ieee, "endpoint": 1, "cluster": cluster, "attribute": attr,
-                "minimum_report_interval": 1, "maximum_report_interval": max_interval,
+                "minimum_report_interval": min_interval, "maximum_report_interval": max_interval,
                 "reportable_change": change,
             }),
             qos=1,
