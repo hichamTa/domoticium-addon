@@ -5357,6 +5357,15 @@ def _post_ingest_commission_status(
 
 _z2m_online: bool | None = None  # état Z2M courant, None = inconnu
 
+# Audit add-on 2026-09-22 : le heartbeat (toutes les 60s) confirmait seulement
+# que le processus Python tournait et joignait Supabase — un run_ha_ws_bridge()
+# mort ou bloqué en boucle de reconnexion (ex: jeton HA expiré, crash silencieux
+# du thread) laissait le site "en ligne" côté app alors qu'aucun état d'appareil
+# ne remontait plus jamais. Vrai/Faux reflète l'état de connexion WS actuel
+# (pas de lock : simple assignation bool, déjà atomique sous le GIL), inclus
+# dans chaque heartbeat pour que Supabase puisse détecter ce cas précis.
+_ws_bridge_connected = False
+
 # ── Sync omnipresente App → HA ────────────────────────────────────────────────
 _sync_requested  = threading.Event()  # déclenche un sync immédiat (ex: device supprimé)
 _mqtt_broker_checked = False          # flag one-shot pour _check_and_fix_mqtt_broker
@@ -6161,9 +6170,11 @@ def _heartbeat_direct() -> bool:
     try:
         ts = int(time.time())
         z2m_part = "null" if _z2m_online is None else str(_z2m_online).lower()
-        message = f"{SITE_PREFIX}:{ts}:heartbeat:{z2m_part}"
+        ws_part = str(_ws_bridge_connected).lower()
+        message = f"{SITE_PREFIX}:{ts}:heartbeat:{z2m_part}:{ws_part}"
         payload: dict = {
             "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_ws_bridge_alive": _ws_bridge_connected,
         }
         if _z2m_online is not None:
             payload["p_z2m_online"] = _z2m_online
@@ -6237,7 +6248,9 @@ def run_ha_ws_bridge():
     "unavailable" au démarrage de l'add-on, ou depuis avant que l'add-on ne tourne —
     HA ne republie jamais "unavailable" en boucle, donc rien ne corrige un online=true
     resté stale sans ce filet)."""
+    global _ws_bridge_connected
     while True:
+        _ws_bridge_connected = False
         ws_send, ws_recv, ws_close = _ha_ws_connect(long_lived=True)
         if not ws_send:
             time.sleep(15)
@@ -6249,6 +6262,7 @@ def run_ha_ws_bridge():
             ws_send({"id": 2, "type": "subscribe_events", "event_type": "entity_registry_updated"})
             ws_recv()  # ack subscription
             log("[ha-ws-bridge] Souscrit à state_changed + entity_registry_updated")
+            _ws_bridge_connected = True
 
             while True:
                 msg = ws_recv()
@@ -6290,6 +6304,7 @@ def run_ha_ws_bridge():
                         _sync_requested.set()
 
         except Exception as e:
+            _ws_bridge_connected = False
             warn(f"[ha-ws-bridge] Erreur: {e} — reconnexion dans 15s")
         finally:
             try:
