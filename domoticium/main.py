@@ -10045,6 +10045,46 @@ def _pipe_bytes(src: socket.socket, dst: socket.socket):
                 pass
 
 
+_CAMERA_SESSION_COOKIE = "domoticium_camera_session"
+
+
+def _verify_camera_session_cookie(head: bytes) -> bool:
+    """Vérifie le cookie de session caméra posé par GET /api/cameras/session
+    côté web (audit add-on 2026-09-22) — seule protection de ce proxy, qui
+    n'en avait AUCUNE jusqu'ici : n'importe qui connaissant l'URL du site
+    (hostname du tunnel) avait un accès complet au flux vidéo ET à l'API
+    go2rtc, sans le secret du site. Un navigateur ne pouvant pas envoyer
+    d'en-tête personnalisé sur une connexion WebSocket native (contrainte du
+    navigateur, pas de ce code — cf. CameraPlayer.tsx), l'authentification
+    passe par un cookie (envoyé automatiquement par le navigateur pour tout
+    sous-domaine de domoticium.fr, contrairement à X-Site-Secret) — signé
+    avec le MÊME secret que tout le reste de l'addon (INGEST_SECRET), jamais
+    transmis tel quel au navigateur, seul le HMAC en sort côté web."""
+    if not INGEST_SECRET:
+        return False
+    m = re.search(rb"(?im)^Cookie:\s*(.+)$", head)
+    if not m:
+        return False
+    value = None
+    for part in m.group(1).decode("latin-1").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == _CAMERA_SESSION_COOKIE:
+            value = v
+            break
+    if not value or "." not in value:
+        return False
+    expiry_str, _, sig = value.partition(".")
+    try:
+        expiry = int(expiry_str)
+    except ValueError:
+        return False
+    if expiry < time.time():
+        return False
+    message = f"{SITE_PREFIX}:camera-session:{expiry}"
+    expected = hmac.new(INGEST_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
 class _Go2rtcProxyHandler(socketserver.BaseRequestHandler):
     """Retire le préfixe /cameras (imposé par le tunnel Cloudflare, qui ne réécrit
     jamais les chemins transmis à l'origine) puis relaie tel quel vers go2rtc
@@ -10058,6 +10098,14 @@ class _Go2rtcProxyHandler(socketserver.BaseRequestHandler):
             client_sock.settimeout(10)
             head = _read_http_head(client_sock)
             if not head:
+                return
+            if not _verify_camera_session_cookie(head):
+                try:
+                    client_sock.sendall(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                except OSError:
+                    pass
                 return
             new_head, _is_websocket = _rewrite_go2rtc_head(head)
             upstream = socket.create_connection(_GO2RTC_UPSTREAM_ADDR, timeout=10)
