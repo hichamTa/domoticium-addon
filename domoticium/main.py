@@ -2342,10 +2342,18 @@ def handle_alarmo_set_panel_state(entity_id: str, action: str, code: str | None)
     after_r = ha_get(f"/states/{entity_id}")
     after_state = after_r.json().get("state") if after_r.ok else None
 
-    # Lecture d'état impossible : on ne bloque pas l'utilisateur pour un simple souci
-    # de lecture, seulement quand on est SÛR que rien n'a bougé.
+    # Lecture d'état impossible. Audit add-on 2026-09-22 : le repli "ok: True"
+    # inconditionnel ici pouvait faire croire à un client que son domicile est
+    # armé alors qu'un simple souci de lecture d'état a masqué un refus réel côté
+    # Alarmo (fail-open dangereux, sécurité physique) — jamais toléré côté
+    # armement, où l'incertitude doit se traduire par un échec explicite (le
+    # client réessaie). Le désarmement reste tolérant : un échec silencieux dans
+    # ce sens laisse au pire l'alarme armée par erreur (gênant, jamais
+    # dangereux), comportement déjà documenté et volontaire.
     if before_state is None or after_state is None:
-        return {"ok": True}
+        if action == "disarm":
+            return {"ok": True}
+        return {"ok": False, "error": "État du panneau introuvable — réessayez pour confirmer"}
 
     # État cible déjà atteint avant même l'appel (ex: cliquer "Absent" alors que déjà
     # armé "Absent") — Alarmo l'ignore silencieusement lui aussi (log "already set to
@@ -3797,7 +3805,11 @@ def configure_mqtt(force: bool = False):
             warn(f"[MQTT] Erreurs dans le formulaire : {errors}")
 
         payload = _build_mqtt_broker_payload(schema)
-        log(f"[MQTT] Payload envoyé : {payload}")
+        # Audit add-on 2026-09-22 : ce payload contient MOSQUITTO_PASS en clair
+        # (champ "password" du flow HA) — jamais loggé tel quel, même si ce mot
+        # de passe est auto-généré et local (127.0.0.1:1883), pas saisi par le client.
+        redacted_payload = {k: ("***" if "pass" in k.lower() else v) for k, v in payload.items()}
+        log(f"[MQTT] Payload envoyé : {redacted_payload}")
 
         ok, flow = _mqtt_submit(flow_id, payload, f"form step={step_id}")
         if not ok or _mqtt_is_done(flow):
@@ -5114,7 +5126,10 @@ def handle_matter_commission(request_id: str, code: str):
 
     def _do():
         try:
-            log(f"Matter commission {request_id[:8]}… code={code}")
+            # Audit add-on 2026-09-22 : le code de commissioning (PIN/QR, valable
+            # le temps de la fenêtre de jumelage) ne doit jamais apparaître en
+            # clair dans les logs Supervisor.
+            log(f"Matter commission {request_id[:8]}… code=***")
             success, detail = _matter_commission_ws(code, request_id)
             if success:
                 log(f"✓ Matter commission réussie — node_id={detail}")
@@ -6017,20 +6032,28 @@ RELAY_DOMAINS = {
 def _relay_ha_state(entity_id: str, state_val: str, attributes: dict):
     """Pousse un état HA (entity_id/state/attributes) vers Supabase — même chemin
     que ce que déclenche un `state_changed` réel (WS bridge) : alarm_control_panel
-    en appel direct (peu fréquent, pas besoin du batch), le reste accumulé dans
-    _state_batch (_flush_state_batch() l'envoie toutes les 2.5s, dédupliqué par
-    entity_id). Factorisé (2026-09-02) pour être appelable aussi depuis
-    _reconcile_device_states() — la réconciliation périodique doit produire
-    EXACTEMENT le même effet qu'un vrai événement, pas une logique parallèle."""
+    en appel direct immédiat (peu fréquent, pas besoin d'attendre le cycle du
+    batch), le reste accumulé dans _state_batch (_flush_state_batch() l'envoie
+    toutes les 2.5s, dédupliqué par entity_id). Factorisé (2026-09-02) pour être
+    appelable aussi depuis _reconcile_device_states() — la réconciliation
+    périodique doit produire EXACTEMENT le même effet qu'un vrai événement, pas
+    une logique parallèle.
+
+    Audit add-on 2026-09-22 : l'appel direct alarme n'avait aucun filet de
+    retry (contrairement à _state_batch) — un échec (Supabase indisponible,
+    timeout) perdait la transition définitivement. En cas d'échec du premier
+    essai immédiat, réintégré dans _alarm_state_batch pour être retenté par
+    _flush_state_batch au prochain cycle (2.5s), même garantie de livraison
+    que le reste."""
     domain = entity_id.split(".")[0] if "." in entity_id else ""
     if domain not in RELAY_DOMAINS or not INGEST_SECRET:
         return
     if domain == "alarm_control_panel":
-        threading.Thread(
-            target=_report_alarm_state_direct,
-            args=(entity_id, state_val, attributes),
-            daemon=True,
-        ).start()
+        def _send_alarm_with_retry():
+            if not _report_alarm_state_direct(entity_id, state_val, attributes):
+                with _state_batch_lock:
+                    _alarm_state_batch[entity_id] = (state_val, attributes)
+        threading.Thread(target=_send_alarm_with_retry, daemon=True).start()
         return
     with _state_batch_lock:
         _state_batch[entity_id] = (state_val, attributes)
@@ -6409,6 +6432,17 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
 _state_batch: dict = {}
 _state_batch_lock = threading.Lock()
 
+# Retry pour l'état alarme — audit add-on 2026-09-22 : contrairement à tous les
+# autres domaines de RELAY_DOMAINS (garantis par _state_batch/_flush_state_batch,
+# cf. docstring de cette dernière), alarm_control_panel était envoyé par un
+# thread direct sans AUCUN filet — un échec (Supabase indisponible, timeout
+# réseau) perdait la transition d'alarme définitivement, sans retry ni
+# rattrapage, sur la donnée la plus sensible du système. Dict séparé (pas
+# _state_batch) car l'alarme utilise une RPC dédiée (pi_report_alarm_state,
+# pas pi_report_device_state — cf. _report_alarm_state_direct). Réutilise
+# _state_batch_lock (opérations rares et triviales, pas de contention réelle).
+_alarm_state_batch: dict = {}
+
 # Frein dédié aux entités "sensor.*" (audit egress Supabase, 2026-09-21,
 # 2e volet — étend à Matter/WiFi le même principe que le boost Zigbee
 # ci-dessus : "prise pour cause de bruit de mesure" était spécifique à
@@ -6651,7 +6685,8 @@ def _report_camera_status_direct(stream_name: str, online: bool) -> bool:
 
 
 def _flush_state_batch():
-    """Thread de fond : envoie états devices + statuts caméras toutes les 2.5s via
+    """Thread de fond : envoie états devices + statuts caméras + retries d'état
+    alarme (cf. _alarm_state_batch, audit add-on 2026-09-22) toutes les 2.5s via
     Supabase direct (un appel HMAC par item). Un item qui échoue (réseau, Supabase
     indisponible) est réintégré au batch pour être retenté au prochain cycle — pas
     de repli Vercel, aucune donnée perdue silencieusement.
@@ -6668,6 +6703,8 @@ def _flush_state_batch():
             with _state_batch_lock:
                 batch = dict(_state_batch)
                 _state_batch.clear()
+                alarm_batch = dict(_alarm_state_batch)
+                _alarm_state_batch.clear()
 
             with _cam_watch_lock:
                 cam_batch = {
@@ -6681,6 +6718,10 @@ def _flush_state_batch():
                 eid: (st, attrs) for eid, (st, attrs) in batch.items()
                 if not _report_device_state_direct(eid, st, attrs)
             }
+            failed_alarm = {
+                eid: (st, attrs) for eid, (st, attrs) in alarm_batch.items()
+                if not _report_alarm_state_direct(eid, st, attrs)
+            }
             failed_cams = {
                 name: online for name, online in cam_batch.items()
                 if not _report_camera_status_direct(name, online)
@@ -6690,6 +6731,10 @@ def _flush_state_batch():
                 with _state_batch_lock:
                     for eid, v in failed_states.items():
                         _state_batch.setdefault(eid, v)
+            if failed_alarm:
+                with _state_batch_lock:
+                    for eid, v in failed_alarm.items():
+                        _alarm_state_batch.setdefault(eid, v)
             if failed_cams:
                 with _cam_watch_lock:
                     _cam_watch_dirty.update(failed_cams.keys())
@@ -7151,6 +7196,51 @@ def _get_ha_device_id(entity_id=None, ieee_address=None, matter_node_id=None):
     return None
 
 
+def _validate_ha_action_steps(steps) -> bool:
+    """Vérifie récursivement que chaque appel de service d'une séquence
+    d'actions HA respecte ALLOWED_SERVICES. Audit add-on 2026-09-22 :
+    script_upsert/automation_upsert (ci-dessous) construisaient un script/
+    automatisation HA à partir d'un `sequence`/`action` ENTIÈREMENT fourni par
+    l'appelant, sans jamais repasser par la whitelist appliquée sur la route
+    /cmd (ligne ~9199) — un tel script, une fois créé, est déclenchable via
+    `script.turn_on` (lui bien whitelisté), permettant en pratique d'exécuter
+    N'IMPORTE QUEL service HA en 2 appels. Couvre les 3 seules constructions de
+    contrôle réellement produites par l'app (cf. web/src/lib/automationBuilder.ts) :
+    delay (rien à valider), repeat.sequence, choose[].sequence + default —
+    toute autre forme (wait_for_trigger, if/then, parallel, event…) est
+    refusée par défaut plutôt que de maintenir une liste blanche de clés de
+    contrôle qui pourrait devenir incomplète.
+    """
+    if not isinstance(steps, list):
+        return False
+    for step in steps:
+        if not isinstance(step, dict):
+            return False
+        svc = step.get("service") or step.get("action")
+        if svc:
+            if not isinstance(svc, str) or "." not in svc:
+                return False
+            domain, _, verb = svc.partition(".")
+            if verb not in ALLOWED_SERVICES.get(domain, set()):
+                return False
+            continue
+        if "delay" in step:
+            continue
+        if "repeat" in step and isinstance(step["repeat"], dict):
+            if not _validate_ha_action_steps(step["repeat"].get("sequence", [])):
+                return False
+            continue
+        if "choose" in step and isinstance(step["choose"], list):
+            for branch in step["choose"]:
+                if not isinstance(branch, dict) or not _validate_ha_action_steps(branch.get("sequence", [])):
+                    return False
+            if "default" in step and not _validate_ha_action_steps(step.get("default", [])):
+                return False
+            continue
+        return False
+    return True
+
+
 def _handle_ha_command(payload: bytes):
     """Exécute une commande ha/command reçue via MQTT."""
     try:
@@ -7169,10 +7259,14 @@ def _handle_ha_command(payload: bytes):
             return
 
         if cmd_type == "script_upsert":
+            sequence = data.get("sequence", [])
+            if not _validate_ha_action_steps(sequence):
+                warn(f"[ha/command] script_upsert refusé (service non autorisé dans sequence) : {object_id}")
+                return
             script_cfg = {
                 "alias":    data.get("alias", object_id),
                 "icon":     data.get("icon", "mdi:play"),
-                "sequence": data.get("sequence", []),
+                "sequence": sequence,
                 "mode":     "single",
             }
             r = ha_post(f"/config/script/config/{object_id}", script_cfg)
@@ -7213,11 +7307,15 @@ def _handle_ha_command(payload: bytes):
             # réglage de mode d'exécution (unique/redémarrer/file/parallèle) ajouté côté
             # web n'aurait donc jamais atteint HA, quelle que soit la valeur envoyée.
             # Repris depuis data (repli "single", comportement historique préservé).
+            action = data.get("action", [])
+            if not _validate_ha_action_steps(action):
+                warn(f"[ha/command] automation_upsert refusé (service non autorisé dans action) : {object_id}")
+                return
             auto_cfg = {
                 "alias":     data.get("alias", object_id),
                 "trigger":   data.get("trigger", []),
                 "condition": data.get("condition", []),
-                "action":    data.get("action", []),
+                "action":    action,
                 "mode":      data.get("mode", "single"),
             }
             r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
@@ -8301,10 +8399,17 @@ ALLOWED_SERVICES = {
     # activation était rejetée en 403 (trouvé en conditions réelles le 2026-07-26,
     # après un signalement d'Hicham : le bouton "Activer" ne faisait rien).
     "script":        {"turn_on", "turn_off", "toggle"},
-    "alarm_control_panel": {
-        "alarm_arm_home", "alarm_arm_away", "alarm_arm_night",
-        "alarm_arm_vacation", "alarm_disarm", "alarm_trigger",
-    },
+    # alarm_control_panel RETIRÉ le 2026-09-22 (audit add-on) : cette entrée
+    # permettait de contourner ENTIÈREMENT handle_alarmo_set_panel_state() via
+    # la route générique /command — Alarmo répond 200 OK côté HA même quand un
+    # code est refusé en interne (cf. docstring de cette fonction), et la route
+    # générique ne relit jamais l'état avant/après pour détecter ce faux-succès.
+    # Un appelant utilisant /command pour armer/désarmer recevait donc "ok"
+    # même si RIEN n'a été armé/désarmé — risque de sécurité physique réel.
+    # Vérifié avant suppression : aucun code web n'utilise plus ce chemin
+    # (grep exhaustif sur "alarm_control_panel." dans web/src — seuls 2
+    # commentaires obsolètes, code réel déjà migré vers la route dédiée
+    # /alarmo/set-panel-state, cf. haAlarmoSetPanelState côté web).
     # Ajouté 2026-08-27 pour le toggle activer/désactiver des automatisations
     # importées depuis HA (import bidirectionnel, cf. handle_list_ha_automations
     # plus haut) — absent jusqu'ici, un appel automation.turn_on/turn_off était
