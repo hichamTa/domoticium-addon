@@ -9298,6 +9298,46 @@ _FRIGATE_PTZ_COMMANDS = {
 _PTZ_STEP_SECONDS = 0.2
 
 
+# Audit add-on 2026-09-22 : dernier point de l'audit restant — jusqu'ici
+# X-Site-Secret était le secret INGEST_SECRET envoyé TEL QUEL sur chaque appel,
+# comparé en temps constant (hmac.compare_digest) mais sans aucune notion de
+# fraîcheur : un secret intercepté/exfiltré une seule fois (log, MITM malgré
+# TLS, poste compromis côté Vercel) reste rejouable indéfiniment jusqu'à
+# rotation manuelle. Bascule vers un jeton signé par requête, même schéma que
+# _pi_verify côté Postgres (HMAC + fenêtre de fraîcheur) mais pour le sens
+# inverse (cloud → Pi) — jusqu'ici seul le sens Pi → Supabase avait ce
+# traitement. Format : "<timestamp>.<hmac_hex>", hmac calculé sur
+# "<timestamp>:<method>:<route>:<sha256(corps)>" — lier la route ET le corps
+# empêche de rejouer une commande capturée sur une AUTRE route ou avec un
+# AUTRE corps (ex: rejouer un "arm_away" capturé comme "disarm" en changeant
+# juste le corps serait sinon possible si seul le timestamp était signé).
+# Fenêtre à 60s (plus stricte que les 300s de _pi_verify) — délibéré : cette
+# direction déclenche de vraies actions (armer/désarmer l'alarme, verrous),
+# pas seulement de la télémétrie, la fenêtre de rejeu doit rester courte.
+# Pas de cache de nonces en plus de la fenêtre (contrairement à un anti-rejeu
+# "parfait") — même niveau de garantie que _pi_verify (déjà accepté comme
+# suffisant pour ce projet), et chaque appel réel a de toute façon un
+# timestamp+route+corps différent en pratique (aucune fonction de ce fichier
+# ne réessaie automatiquement la même commande côté serveur).
+_COMMAND_AUTH_WINDOW_SECONDS = 60
+
+
+def _verify_site_secret_header(header_value: str, method: str, route: str, body: bytes) -> bool:
+    if not header_value or "." not in header_value:
+        return False
+    ts_str, _, sig = header_value.partition(".")
+    try:
+        ts = int(ts_str)
+    except ValueError:
+        return False
+    if abs(time.time() - ts) > _COMMAND_AUTH_WINDOW_SECONDS:
+        return False
+    body_hash = hashlib.sha256(body).hexdigest()
+    message = f"{ts}:{method}:{route}:{body_hash}"
+    expected = hmac.new(INGEST_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
 class _CommandHandler(http.server.BaseHTTPRequestHandler):
     # Audit add-on 2026-09-22 : aucun timeout de connexion, aucune limite de
     # taille de corps sur ce serveur — un appelant (même sans secret valide,
@@ -9411,16 +9451,16 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
 
     def do_POST(self):
         remote_addr = self.client_address[0]
-        route_for_audit = self.path.split("?", 1)[0]
+        # Le tunnel Cloudflare route ce port via le préfixe /addon (hostname unique
+        # par site, partagé avec les caméras — cf. lib/cloudflare/tunnel.ts côté Vercel).
+        # Calculé une seule fois ici (plutôt qu'après l'auth comme avant) : la
+        # signature du header X-Site-Secret est liée à cette route logique — même
+        # valeur des deux côtés (client ET add-on), indépendante du préfixe /addon
+        # qui est un détail de routage du tunnel, pas connu tel quel par l'appelant.
+        route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
+        route = route.split("?", 1)[0]
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
-        # hmac.compare_digest (pas !=) : comparaison en temps constant, évite une
-        # attaque par timing sur le secret (audit dette technique, point 21,
-        # 2026-09-18) — risque théorique faible (HTTPS + secret long) mais correctif
-        # d'une ligne.
-        if not hmac.compare_digest(self.headers.get("X-Site-Secret") or "", INGEST_SECRET):
-            _audit_command(route_for_audit, remote_addr, "rejected:unauthorized")
-            return self._reject(401, "Non autorisé")
 
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -9439,19 +9479,25 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 if not chunk:
                     break
                 remaining -= len(chunk)
-            _audit_command(route_for_audit, remote_addr, "rejected:body_too_large")
+            _audit_command(route, remote_addr, "rejected:body_too_large")
             return self._reject(413, "Corps trop volumineux")
+
+        raw = self.rfile.read(length) if length else b""
+        # La vérification du secret dépend désormais du corps exact reçu (lié dans
+        # la signature, cf. _verify_site_secret_header) — doit donc se faire APRÈS
+        # la lecture ci-dessus, plutôt qu'avant comme la simple comparaison
+        # statique précédente. Coût borné par MAX_BODY_BYTES (2 Mo) dans tous les
+        # cas, authentifié ou non — pas une nouvelle piste de déni de service.
+        if not _verify_site_secret_header(self.headers.get("X-Site-Secret") or "", "POST", route, raw):
+            _audit_command(route, remote_addr, "rejected:unauthorized")
+            return self._reject(401, "Non autorisé")
         try:
-            raw = self.rfile.read(length) if length else b"{}"
-            data = json.loads(raw.decode() or "{}")
+            data = json.loads(raw.decode() or "{}") if raw else {}
         except Exception:
-            _audit_command(route_for_audit, remote_addr, "rejected:invalid_json")
+            _audit_command(route, remote_addr, "rejected:invalid_json")
             return self._reject(400, "JSON invalide")
 
         try:
-            # Le tunnel Cloudflare route ce port via le préfixe /addon (hostname unique
-            # par site, partagé avec les caméras — cf. lib/cloudflare/tunnel.ts côté Vercel).
-            route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
             handlers = {
                 "/cmd":                  self._handle_cmd,
                 "/matter/commission":    self._handle_matter_commission,
@@ -9491,7 +9537,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             _audit_command(route, remote_addr, "ok")
         except Exception as e:
             warn(f"[cmd-server] {self.path}: {e}")
-            _audit_command(route_for_audit, remote_addr, f"rejected:error:{type(e).__name__}")
+            _audit_command(route, remote_addr, f"rejected:error:{type(e).__name__}")
             self._reject(500, str(e))
 
     def _handle_ha_session_token_create(self, data):
@@ -9969,7 +10015,10 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
 
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
-        if not hmac.compare_digest(self.headers.get("X-Site-Secret") or "", INGEST_SECRET):
+        # GET n'a pas de corps — signature liée à route+méthode seulement (la
+        # query string, elle, n'est jamais sensible ici : toutes les routes GET
+        # sont des lectures, cf. _verify_site_secret_header).
+        if not _verify_site_secret_header(self.headers.get("X-Site-Secret") or "", "GET", route, b""):
             return self._reject(401, "Non autorisé")
         if route == "/camera/scan":
             self._handle_camera_scan()
