@@ -4139,58 +4139,87 @@ def _ensure_ha_trusted_proxy():
     return True
 
 
+def _setup_step(label: str, fn, check_fn, attempts: int = 3, backoff=(5, 15)) -> bool:
+    """Exécute une étape de run_setup() avec retry — audit add-on 2026-09-22 :
+    aucune des fonctions install_*/setup_* ne lève d'exception proprement
+    gérée ni ne remonte de statut ; un simple hoquet réseau (timeout Supervisor
+    pendant le tout premier boot, connexion domestique modeste) pouvait soit
+    planter tout le process (exception non rattrapée), soit laisser l'étape
+    silencieusement incomplète. `check_fn` vérifie l'ÉTAT RÉEL après chaque
+    tentative (mêmes primitives qu'ailleurs dans le fichier, ex.
+    _is_addon_installed) — on ne fait jamais confiance à un simple "ça n'a pas
+    levé d'exception". Sûr à rappeler plusieurs fois : chaque fonction
+    install_*/setup_* est déjà idempotente (_is_addon_installed/markers
+    one-shot), donc une "nouvelle tentative" est en réalité un aller-retour
+    supplémentaire, jamais une double installation."""
+    for attempt in range(1, attempts + 1):
+        try:
+            fn()
+        except Exception as e:
+            warn(f"[setup] {label} (tentative {attempt}/{attempts}) a levé une exception : {e}")
+        if check_fn():
+            if attempt > 1:
+                log(f"[setup] {label} confirmé après {attempt} tentative(s)")
+            return True
+        if attempt < attempts:
+            delay = backoff[min(attempt - 1, len(backoff) - 1)]
+            warn(f"[setup] {label} pas encore prêt (tentative {attempt}/{attempts}) — nouvelle tentative dans {delay}s")
+            time.sleep(delay)
+    warn(f"[setup] {label} a échoué après {attempts} tentatives")
+    return False
+
+
 def run_setup():
+    # Filet de sécurité global (audit add-on 2026-09-22) : aucune clé
+    # `watchdog` dans config.yaml — un crash total du process ici (exception
+    # non prévue, ex. dans wait_for_ha() ou l'écriture finale du marker)
+    # nécessiterait une intervention manuelle de Hicham sur CE site précis.
+    # Capturé et journalisé plutôt que de laisser planter : SETUP_DONE ne sera
+    # de toute façon jamais écrit dans ce cas, donc le prochain redémarrage de
+    # l'add-on retente toute la séquence — même filet que pour chaque étape
+    # individuelle ci-dessous (_setup_step), juste au niveau le plus large.
+    try:
+        _run_setup_inner()
+    except Exception as e:
+        warn(f"═══ run_setup() a levé une exception non prévue, configuration abandonnée : {e} ═══")
+        warn("SETUP_DONE non écrit — retenté au prochain démarrage de l'add-on.")
+
+
+def _run_setup_inner():
     wait_for_ha()
     log("═══ Début de la configuration Domoticium ═══")
 
+    ok = True
+
     # 1. Mosquitto local d'abord — Z2M et HA MQTT integration en dépendent
-    setup_mosquitto()
+    ok &= _setup_step("Mosquitto", setup_mosquitto, lambda: _is_addon_installed(MOSQUITTO_SLUG))
 
     # 2. HA MQTT integration → Mosquitto local
-    configure_mqtt()
+    ok &= _setup_step("intégration MQTT HA", configure_mqtt, _mqtt_config_entry_exists)
 
     # 3. Z2M → Mosquitto local
-    install_zigbee2mqtt()
+    ok &= _setup_step("Zigbee2MQTT", install_zigbee2mqtt, lambda: _is_addon_installed(Z2M_SLUG))
 
     # 4. Supprimer l'ancien discovery_prefix non-standard (migration v1.5 → v1.6)
-    remove_legacy_mqtt_discovery_prefix()
+    # — cosmétique/cleanup, jamais bloquant pour la suite.
+    try:
+        remove_legacy_mqtt_discovery_prefix()
+    except Exception as e:
+        warn(f"[setup] remove_legacy_mqtt_discovery_prefix a échoué (non bloquant) : {e}")
 
-    install_matter_server()
+    ok &= _setup_step("Matter Server", install_matter_server, lambda: _is_addon_installed(MATTER_SLUG))
     if INSTALL_THREAD_ROUTER:
-        install_thread_border_router()
-    install_frigate()
+        ok &= _setup_step("Thread Border Router", install_thread_border_router, lambda: _is_addon_installed(THREAD_SLUG))
+    ok &= _setup_step("Frigate", install_frigate, lambda: _is_addon_installed(FRIGATE_SLUG))
 
-    ha_post("/services/homeassistant/reload_all")
+    try:
+        ha_post("/services/homeassistant/reload_all")
+    except Exception as e:
+        warn(f"[setup] reload_all a échoué (non bloquant) : {e}")
 
-    # Audit add-on 2026-09-22 : aucune des fonctions install_*/setup_*
-    # ci-dessus ne lève d'exception ni ne retourne de statut en cas d'échec
-    # (juste un warn() interne, puis continuation ou retour anticipé) —
-    # SETUP_DONE était donc écrit INCONDITIONNELLEMENT, marquant le site
-    # "configuré" même si un composant central (Z2M, Matter, Frigate…) n'a en
-    # réalité jamais démarré (ex: blip réseau pendant le tout premier boot),
-    # sans que personne ne le sache — plus jamais réinstallé automatiquement
-    # ensuite tant que force_setup n'est pas activé à la main. Vérifie l'ÉTAT
-    # RÉEL de chaque étape obligatoire après coup (plutôt que de faire remonter
-    # un booléen à travers chaque fonction — plus risqué à faire correctement
-    # partout dans un fichier de cette taille) avec les mêmes primitives déjà
-    # utilisées ailleurs (_is_addon_installed, _mqtt_config_entry_exists).
-    missing = []
-    if not _is_addon_installed(MOSQUITTO_SLUG):
-        missing.append("Mosquitto")
-    if not _mqtt_config_entry_exists():
-        missing.append("intégration MQTT HA")
-    if not _is_addon_installed(Z2M_SLUG):
-        missing.append("Zigbee2MQTT")
-    if not _is_addon_installed(MATTER_SLUG):
-        missing.append("Matter Server")
-    if INSTALL_THREAD_ROUTER and not _is_addon_installed(THREAD_SLUG):
-        missing.append("Thread Border Router")
-    if not _is_addon_installed(FRIGATE_SLUG):
-        missing.append("Frigate")
-
-    if missing:
-        warn(f"═══ Configuration INCOMPLÈTE — étapes manquantes : {', '.join(missing)} ═══")
-        warn("SETUP_DONE non écrit — la configuration sera retentée au prochain démarrage de l'add-on.")
+    if not ok:
+        warn("═══ Configuration INCOMPLÈTE malgré les tentatives de reprise — SETUP_DONE non écrit ═══")
+        warn("La configuration sera retentée au prochain démarrage de l'add-on.")
         return
 
     with open(SETUP_DONE, "w") as f:
