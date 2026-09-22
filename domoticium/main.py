@@ -1931,7 +1931,21 @@ def _hacs_deploy_files() -> bool:
         zip_resp.raise_for_status()
         os.makedirs(HACS_DIR, exist_ok=True)
         with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
-            zf.extractall(HACS_DIR)
+            # Protection zip-slip (audit add-on 2026-09-22) : extractall() sans
+            # validation suit tel quel un chemin membre du zip du genre
+            # "../../etc/cron.d/x" et écrirait hors de HACS_DIR — risque faible
+            # en pratique (dépôt officiel hacs/integration, HTTPS, upstream de
+            # confiance) mais un vrai point de confiance supply-chain : si ce
+            # compte GitHub était un jour compromis, le zip s'exécuterait avec
+            # les mêmes droits que l'add-on sur chaque site client. Chaque
+            # membre est résolu et vérifié rester sous HACS_DIR avant extraction.
+            hacs_dir_real = os.path.realpath(HACS_DIR)
+            for member in zf.namelist():
+                dest = os.path.realpath(os.path.join(HACS_DIR, member))
+                if not (dest == hacs_dir_real or dest.startswith(hacs_dir_real + os.sep)):
+                    warn(f"[hacs] Membre zip suspect ignoré (hors de {HACS_DIR}) : {member!r}")
+                    continue
+                zf.extract(member, HACS_DIR)
         log(f"✓ HACS {release.get('tag_name', '?')} déployé → {HACS_DIR}")
         return True
     except Exception as e:
@@ -3103,8 +3117,21 @@ def _ensure_alarmo_sos_automation(devices_list):
         return  # Alarmo pas encore installé/configuré
 
     friendly_name = _find_ias_ace_keypad(devices_list, {"emergency"})
-    if not friendly_name or friendly_name == _sos_wired_for:
-        return  # pas de clavier compatible appairé, ou déjà câblé sans changement
+    if not friendly_name:
+        # Audit add-on 2026-09-22 : un clavier désappairé/renommé laissait
+        # l'automation SOS câblée sur un topic MQTT mort — orpheline mais
+        # inerte (plus jamais déclenchée), jamais nettoyée jusqu'ici. Un
+        # renommage vers un AUTRE clavier compatible reste géré normalement
+        # plus bas (même object_id, l'upsert la remplace en place).
+        if _sos_wired_for is not None:
+            _handle_ha_command(json.dumps({
+                "type": "automation_delete", "object_id": _SOS_AUTOMATION_OBJECT_ID,
+            }).encode())
+            log(f"[alarmo] SOS retiré (plus de clavier compatible appairé, était câblé sur '{_sos_wired_for}')")
+            _sos_wired_for = None
+        return
+    if friendly_name == _sos_wired_for:
+        return  # déjà câblé sans changement
 
     panel_entity_id = _alarmo_panel_entity_id(area_id)
     if not panel_entity_id:
@@ -3188,7 +3215,21 @@ def _ensure_alarmo_keypad_control(devices_list):
         return  # Alarmo pas encore installé/configuré
 
     friendly_name = _find_ias_ace_keypad(devices_list, {"disarm", "arm_all_zones"})
-    if not friendly_name or friendly_name == _keypad_wired_for:
+    if not friendly_name:
+        # Audit add-on 2026-09-22 : même nettoyage que _ensure_alarmo_sos_automation
+        # (cf. son commentaire) — les 2 automatisations câblées sur un clavier
+        # disparu restaient orphelines indéfiniment.
+        if _keypad_wired_for is not None:
+            _handle_ha_command(json.dumps({
+                "type": "automation_delete", "object_id": _KEYPAD_ARM_OBJECT_ID,
+            }).encode())
+            _handle_ha_command(json.dumps({
+                "type": "automation_delete", "object_id": _KEYPAD_FEEDBACK_OBJECT_ID,
+            }).encode())
+            log(f"[alarmo] Armement/désarmement clavier retiré (plus de clavier compatible appairé, était câblé sur '{_keypad_wired_for}')")
+            _keypad_wired_for = None
+        return
+    if friendly_name == _keypad_wired_for:
         return
 
     panel_entity_id = _alarmo_panel_entity_id(area_id)
@@ -4285,6 +4326,31 @@ def restart_frigate() -> bool:
     return r.ok
 
 
+def _redact_rtsp_credentials(text: str, rtsp_url: str) -> str:
+    """Retire toute occurrence du mot de passe caméra contenu dans rtsp_url
+    (forme brute ET url-encodée) d'un message avant de le logger — audit
+    add-on 2026-09-22 : un message d'exception requests/urllib3 embarque
+    typiquement l'URL complète (avec sa query string) de la requête en
+    échec ; le mot de passe saisi par le client (passé en paramètre `src`
+    ci-dessous) pouvait ainsi finir en clair dans les logs Supervisor sur un
+    simple échec réseau transitoire (go2rtc indisponible, timeout).
+    ⚠️ Une regex cherchant "://user:pass@" tel quel NE SUFFIT PAS : requests
+    encode `src` dans la query string (`:`→%3A, `@`→%40), vérifié en local
+    avant ce correctif — c'est pourquoi on remplace la sous-chaîne connue
+    (extraite de rtsp_url lui-même) sous ses deux formes, plutôt que de
+    deviner un motif dans le texte déjà formé."""
+    m = re.match(r'^\w+://([^:@/]+):([^@/]+)@', rtsp_url)
+    if not m:
+        return text
+    user, pwd = m.group(1), m.group(2)
+    redacted = text.replace(f"{user}:{pwd}", "***:***")
+    redacted = redacted.replace(urllib.parse.quote(f"{user}:{pwd}", safe=""), "***:***")
+    if pwd:
+        redacted = redacted.replace(pwd, "***")
+        redacted = redacted.replace(urllib.parse.quote(pwd, safe=""), "***")
+    return redacted
+
+
 def _go2rtc_upsert_stream(name: str, rtsp_url: str, timeout: float = 5.0) -> bool:
     """Ajoute/remplace un flux go2rtc à chaud (API PUT /api/streams) — les autres
     caméras (et sessions WebRTC/HLS actives) ne sont pas coupées, contrairement à un
@@ -4298,7 +4364,7 @@ def _go2rtc_upsert_stream(name: str, rtsp_url: str, timeout: float = 5.0) -> boo
         )
         return r.ok
     except Exception as e:
-        warn(f"[go2rtc] upsert stream '{name}' : {e}")
+        warn(f"[go2rtc] upsert stream '{name}' : {_redact_rtsp_credentials(str(e), rtsp_url)}")
         return False
 
 
@@ -6946,7 +7012,12 @@ def on_local_connect(client, userdata, flags, reason_code, properties):
         warn(f"[local] Connexion Mosquitto échouée ({reason_code})")
         return
     client.subscribe([("zigbee2mqtt/#", 1)])  # tous les messages Z2M (états + bridge/state)
-    log("[local] Connecté Mosquitto — souscrit zigbee2mqtt/# et ha/#")
+    # Audit add-on 2026-09-22 : ce log annonçait une souscription à "ha/#" qui
+    # n'existe pas (reliquat de l'ancienne architecture EMQX, cf. commentaire
+    # historique plus haut dans le fichier — _handle_ha_command() n'est plus
+    # jamais atteinte via MQTT, seulement en appel Python direct) — corrigé
+    # pour refléter la réalité, aucun risque de confusion pour un futur dev.
+    log("[local] Connecté Mosquitto — souscrit zigbee2mqtt/#")
 
 
 def _get_ha_areas():
