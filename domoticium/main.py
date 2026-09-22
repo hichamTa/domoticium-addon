@@ -906,6 +906,29 @@ def _ensure_z2m_availability():
 
 # ── Matter Server ─────────────────────────────────────────────────────────────
 
+def _wait_matter_server_ready(max_attempts: int = 12) -> bool:
+    """Attend jusqu'à ~24s que matter-server accepte des connexions TCP sur
+    localhost:5580 (même port que _matter_ws_connect). Audit add-on 2026-09-22 :
+    install_matter_server() enchaînait auparavant restart → création immédiate
+    de l'intégration HA "matter" SANS attendre, contrairement à Frigate
+    (_wait_frigate_ready) — un restart frais prend quelques secondes à ouvrir
+    son port WS, donc la création d'intégration échouait souvent en silence
+    (retombait sur "à activer manuellement si besoin", déjà vu en usage réel).
+    Simple connect TCP (pas le handshake WS complet de _matter_ws_connect) :
+    suffisant pour savoir si le port écoute, sans le coût d'un aller-retour
+    protocolaire complet à chaque tentative."""
+    for i in range(max_attempts):
+        try:
+            s = socket.create_connection(("localhost", 5580), timeout=2)
+            s.close()
+            log(f"✓ matter-server opérationnel (:5580, ~{i * 2}s)")
+            return True
+        except OSError:
+            time.sleep(2)
+    warn("matter-server pas disponible sur :5580 après ~24s — intégration HA tentée quand même")
+    return False
+
+
 def install_matter_server():
     log("── Matter Server ────────────────────────────")
 
@@ -926,6 +949,8 @@ def install_matter_server():
         log("✓ Matter Server démarré")
     else:
         warn(f"✗ {r.status_code} Matter Server restart : {r.text[:150]}")
+
+    _wait_matter_server_ready()
 
     flow = ha_post("/config/config_entries/flow", {"handler": "matter"})
     if flow.ok and flow.json().get("type") == "create_entry":
