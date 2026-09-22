@@ -3578,11 +3578,25 @@ def handle_alarmo_set_automation(
 
 def write_frigate_config():
     """Écrit /homeassistant/frigate.yml. Le prepare script Frigate le copie dans son
-    stockage privé à chaque démarrage — c'est la seule voie de config utilisée."""
+    stockage privé à chaque démarrage — c'est la seule voie de config utilisée.
+
+    Écriture atomique (audit add-on 2026-09-22) : un `open(..., "w")` direct
+    laisse une fenêtre où le fichier est tronqué/vide pendant l'écriture — une
+    coupure d'alimentation ou un kill du process pile à ce moment corrompt
+    frigate.yml, qui refuse alors de démarrer au redémarrage suivant (panne
+    caméra totale du site jusqu'à intervention manuelle). Écrit dans un fichier
+    temporaire sur le MÊME volume puis `os.replace()` (atomique sous Linux,
+    même filesystem) — soit l'ancien fichier reste intact, soit le nouveau
+    est intégralement en place, jamais un état intermédiaire visible."""
     with _camera_configure_lock:
         content = _generate_frigate_yaml()
-        with open("/homeassistant/frigate.yml", "w") as fh:
+        target = "/homeassistant/frigate.yml"
+        tmp = f"{target}.tmp-{os.getpid()}"
+        with open(tmp, "w") as fh:
             fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
         log(f"✓ config Frigate mise à jour ({len(_cameras)} caméra(s))")
 
 
@@ -4147,6 +4161,38 @@ def run_setup():
     install_frigate()
 
     ha_post("/services/homeassistant/reload_all")
+
+    # Audit add-on 2026-09-22 : aucune des fonctions install_*/setup_*
+    # ci-dessus ne lève d'exception ni ne retourne de statut en cas d'échec
+    # (juste un warn() interne, puis continuation ou retour anticipé) —
+    # SETUP_DONE était donc écrit INCONDITIONNELLEMENT, marquant le site
+    # "configuré" même si un composant central (Z2M, Matter, Frigate…) n'a en
+    # réalité jamais démarré (ex: blip réseau pendant le tout premier boot),
+    # sans que personne ne le sache — plus jamais réinstallé automatiquement
+    # ensuite tant que force_setup n'est pas activé à la main. Vérifie l'ÉTAT
+    # RÉEL de chaque étape obligatoire après coup (plutôt que de faire remonter
+    # un booléen à travers chaque fonction — plus risqué à faire correctement
+    # partout dans un fichier de cette taille) avec les mêmes primitives déjà
+    # utilisées ailleurs (_is_addon_installed, _mqtt_config_entry_exists).
+    missing = []
+    if not _is_addon_installed(MOSQUITTO_SLUG):
+        missing.append("Mosquitto")
+    if not _mqtt_config_entry_exists():
+        missing.append("intégration MQTT HA")
+    if not _is_addon_installed(Z2M_SLUG):
+        missing.append("Zigbee2MQTT")
+    if not _is_addon_installed(MATTER_SLUG):
+        missing.append("Matter Server")
+    if INSTALL_THREAD_ROUTER and not _is_addon_installed(THREAD_SLUG):
+        missing.append("Thread Border Router")
+    if not _is_addon_installed(FRIGATE_SLUG):
+        missing.append("Frigate")
+
+    if missing:
+        warn(f"═══ Configuration INCOMPLÈTE — étapes manquantes : {', '.join(missing)} ═══")
+        warn("SETUP_DONE non écrit — la configuration sera retentée au prochain démarrage de l'add-on.")
+        return
+
     with open(SETUP_DONE, "w") as f:
         f.write("done")
     log("═══ Configuration terminée ✓ ═══")
@@ -4475,10 +4521,23 @@ def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None 
     conditions réelles le 2026-07-25 : 400 puis 502 pour l'appelant, alors que l'état
     final était pourtant correct). Ici, chaque appel passe entièrement l'un après
     l'autre — résultat toujours cohérent avec l'état réel, jamais de faux échec."""
+    # Audit add-on 2026-09-22 : stream_name/rtsp_url finissent tels quels comme
+    # clé/valeur YAML brutes dans _generate_frigate_yaml() (interpolation par
+    # f-string, jamais échappée) — un caractère spécial (notamment un saut de
+    # ligne) pouvait corrompre frigate.yml et couper TOUTES les caméras du
+    # site. stream_name restreint à un identifiant sûr (déjà ce que produit la
+    # dérivation côté web, cf. api/cameras/route.ts) ; rtsp_url seulement
+    # interdit de saut de ligne/retour chariot (reste par ailleurs une URL
+    # libre, schéma/identifiants/port variables selon le matériel).
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", stream_name or ""):
+        raise ValueError("streamName invalide (caractères autorisés : lettres, chiffres, - et _)")
+
     with _camera_configure_lock:
         if action == "add":
             if not rtsp_url:
                 raise ValueError("rtspUrl manquant")
+            if "\n" in rtsp_url or "\r" in rtsp_url:
+                raise ValueError("rtspUrl invalide (retour à la ligne interdit)")
             _cameras[stream_name] = rtsp_url
             _save_cameras()
             write_frigate_config()
