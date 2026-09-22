@@ -9284,6 +9284,18 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         except ValueError:
             return self._reject(400, "Content-Length invalide")
         if length > self.MAX_BODY_BYTES:
+            # Draine le corps avant de répondre, par blocs bornés (jamais chargé
+            # en mémoire d'un coup — justement ce que cette limite doit éviter).
+            # Sans ça, répondre immédiatement ferme la connexion PENDANT que le
+            # client (via le tunnel Cloudflare) est encore en train d'envoyer —
+            # remonté comme un 502 générique côté Cloudflare plutôt que le 413
+            # voulu (trouvé en testant en conditions réelles, pas supposé).
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
             return self._reject(413, "Corps trop volumineux")
         try:
             raw = self.rfile.read(length) if length else b"{}"
