@@ -298,6 +298,15 @@ _camera_masks: dict[str, list[dict]] = {}
 # l'ont jamais pris — Lock aurait provoqué un deadlock immédiat sur le 1er cas.
 _camera_configure_lock = threading.RLock()
 
+# Audit add-on 2026-09-22 : _scan_onvif_cameras()/_subnet_onvif_scan() lancent
+# jusqu'à ~2×254 threads (un scan complet du /24 local, 2 ports par IP) sans
+# aucune protection contre un 2e appel concurrent — deux requêtes /camera/scan
+# simultanées (double-clic, appel automatisé répété) pouvaient cumuler jusqu'à
+# ~1000 threads sur un Raspberry Pi. Lock simple (pas RLock, jamais rappelé
+# depuis l'intérieur d'un scan) : un 2e scan pendant qu'un premier tourne est
+# refusé plutôt que d'empiler les threads.
+_camera_scan_lock = threading.Lock()
+
 # Un seul commissioning Matter à la fois (matter-server ne sait pas gérer 2 sessions
 # PASE simultanées vers le même discriminator — vu en test réel : 2 requêtes à 1s
 # d'intervalle, le device a bien été commissionné mais les 2 connexions WS de l'addon
@@ -2772,7 +2781,14 @@ def _migrate_matter_device_merge(old_node_id, new_node_id, device_name: str):
     # de synchro (jamais oublié tant qu'il n'est pas explicitement retiré du
     # fabric) — recréant un fantôme anonyme au cycle suivant (demande Hicham,
     # 2026-08-01 : "il faudrait le supprimer une fois la fusion faite").
-    _matter_remove_node(int(old_node_id))
+    # Audit add-on 2026-09-22 : le résultat était ignoré — un échec transitoire
+    # (matter-server injoignable, jusqu'à 20s de délai WS) laissait un fantôme
+    # permanent sans qu'aucune trace ne le signale. Toujours pas de retry
+    # automatique ici (fusion rare, pas un chemin chaud) mais au moins visible
+    # dans les logs pour un diagnostic manuel plutôt qu'un silence total.
+    if not _matter_remove_node(int(old_node_id)):
+        warn(f"[matter-merge] Échec du retrait du nœud mort {old_node_id} côté matter-server — "
+             f"risque de fantôme recréé au prochain cycle de synchro, à vérifier manuellement")
 
     # ── Automatisations ──────────────────────────────────────────────────────
     try:
@@ -7329,13 +7345,23 @@ def _validate_ha_action_steps(steps) -> bool:
     return True
 
 
-def _handle_ha_command(payload: bytes):
-    """Exécute une commande ha/command reçue via MQTT."""
+def _handle_ha_command(payload: bytes) -> bool:
+    """Exécute une commande ha/command (appelée en direct depuis Python — cf.
+    docstring de _validate_ha_action_steps, ce topic MQTT lui-même n'existe
+    plus — ET depuis /ha-command, la vraie route HTTP app-facing).
+
+    Retourne True/False (audit add-on 2026-09-22) : jusqu'ici cette fonction
+    ne retournait jamais rien, et _handle_ha_command_route répondait "ok" au
+    client SYSTÉMATIQUEMENT, même quand l'écriture HA échouait réellement
+    (ex: HA temporairement indisponible) — un client pouvait croire une
+    automatisation/scène enregistrée alors qu'elle ne l'était pas. Les autres
+    appelants (Alarmo SOS/clavier, _sync_all_to_ha) ignorent déjà la valeur
+    de retour sans rien casser — ajout rétrocompatible."""
     try:
         data = json.loads(payload.decode())
     except Exception as e:
         warn(f"[ha/command] JSON invalide : {e}")
-        return
+        return False
 
     cmd_type  = data.get("type", "")
     object_id = data.get("object_id", "")
@@ -7344,13 +7370,13 @@ def _handle_ha_command(payload: bytes):
     if cmd_type in ("script_upsert", "script_delete", "automation_upsert", "automation_delete"):
         if not object_id:
             warn(f"[ha/command] object_id manquant pour {cmd_type} : {data}")
-            return
+            return False
 
         if cmd_type == "script_upsert":
             sequence = data.get("sequence", [])
             if not _validate_ha_action_steps(sequence):
                 warn(f"[ha/command] script_upsert refusé (service non autorisé dans sequence) : {object_id}")
-                return
+                return False
             script_cfg = {
                 "alias":    data.get("alias", object_id),
                 "icon":     data.get("icon", "mdi:play"),
@@ -7361,8 +7387,9 @@ def _handle_ha_command(payload: bytes):
             if r.ok:
                 ha_post("/services/script/reload", {})
                 log(f"[ha/command] Script HA créé/mis à jour : {object_id}")
-            else:
-                warn(f"[ha/command] Erreur script {object_id} : {r.status_code} {r.text[:200]}")
+                return True
+            warn(f"[ha/command] Erreur script {object_id} : {r.status_code} {r.text[:200]}")
+            return False
 
         elif cmd_type == "script_delete":
             # (2026-09-03) VRAI BUG trouvé en vérifiant en conditions réelles (web) :
@@ -7382,8 +7409,9 @@ def _handle_ha_command(payload: bytes):
                 time.sleep(2)
                 ha_post("/services/script/reload", {})
                 log(f"[ha/command] Script HA supprimé : {object_id}")
-            else:
-                warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
+                return True
+            warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
+            return False
 
         elif cmd_type == "automation_upsert":
             # "condition" était silencieusement ignoré ici alors que web/src/app/api/
@@ -7398,7 +7426,7 @@ def _handle_ha_command(payload: bytes):
             action = data.get("action", [])
             if not _validate_ha_action_steps(action):
                 warn(f"[ha/command] automation_upsert refusé (service non autorisé dans action) : {object_id}")
-                return
+                return False
             auto_cfg = {
                 "alias":     data.get("alias", object_id),
                 "trigger":   data.get("trigger", []),
@@ -7410,8 +7438,9 @@ def _handle_ha_command(payload: bytes):
             if r.ok:
                 ha_post("/services/automation/reload", {})
                 log(f"[ha/command] Automation HA créée/mise à jour : {object_id}")
-            else:
-                warn(f"[ha/command] Erreur automation {object_id} : {r.status_code} {r.text[:200]}")
+                return True
+            warn(f"[ha/command] Erreur automation {object_id} : {r.status_code} {r.text[:200]}")
+            return False
 
         elif cmd_type == "automation_delete":
             # (2026-09-03) Même course reload/écriture disque que script_delete
@@ -7424,54 +7453,59 @@ def _handle_ha_command(payload: bytes):
                 time.sleep(2)
                 ha_post("/services/automation/reload", {})
                 log(f"[ha/command] Automation HA supprimée : {object_id}")
-            else:
-                warn(f"[ha/command] Erreur suppression automation {object_id} : {r.status_code} {r.text[:200]}")
+                return True
+            warn(f"[ha/command] Erreur suppression automation {object_id} : {r.status_code} {r.text[:200]}")
+            return False
+        return False  # cmd_type dans le groupe mais aucune branche ci-dessus ne l'a traité (ne devrait pas arriver)
 
     # ── Areas (pièces) — WebSocket HA uniquement (pas d'API REST pour area_registry) ──
     elif cmd_type == "create_area":
         name = data.get("name", "")
         if not name:
             warn("[ha/command] create_area: name manquant")
-            return
+            return False
         result = _ha_ws_call("config/area_registry/create", name=name)
         if result and result.get("success"):
             log(f"[ha/command] Area HA créée : '{name}'")
-        else:
-            warn(f"[ha/command] Erreur création area '{name}' : {result}")
+            return True
+        warn(f"[ha/command] Erreur création area '{name}' : {result}")
+        return False
 
     elif cmd_type == "rename_area":
         old_name = data.get("name", "")
         new_name = data.get("new_name", "")
         if not old_name or not new_name:
             warn("[ha/command] rename_area: name et new_name requis")
-            return
+            return False
         areas = _get_ha_areas()
         area  = next((a for a in areas if a.get("name") == old_name), None)
         if not area:
             result = _ha_ws_call("config/area_registry/create", name=new_name)
             log(f"[ha/command] rename_area: '{old_name}' non trouvée — créée sous '{new_name}'")
-            return
+            return bool(result and result.get("success"))
         result = _ha_ws_call("config/area_registry/update", area_id=area["area_id"], name=new_name)
         if result and result.get("success"):
             log(f"[ha/command] Area HA renommée : '{old_name}' → '{new_name}'")
-        else:
-            warn(f"[ha/command] Erreur rename area : {result}")
+            return True
+        warn(f"[ha/command] Erreur rename area : {result}")
+        return False
 
     elif cmd_type == "delete_area":
         name = data.get("name", "")
         if not name:
             warn("[ha/command] delete_area: name manquant")
-            return
+            return False
         areas = _get_ha_areas()
         area  = next((a for a in areas if a.get("name") == name), None)
         if not area:
             log(f"[ha/command] delete_area: area '{name}' non trouvée dans HA")
-            return
+            return True  # déjà absente — état cible déjà atteint, pas un échec
         result = _ha_ws_call("config/area_registry/delete", area_id=area["area_id"])
         if result and result.get("success"):
             log(f"[ha/command] Area HA supprimée : '{name}'")
-        else:
-            warn(f"[ha/command] Erreur suppression area '{name}' : {result}")
+            return True
+        warn(f"[ha/command] Erreur suppression area '{name}' : {result}")
+        return False
 
     elif cmd_type == "set_device_area":
         entity_id      = data.get("entity_id")      or None
@@ -7495,7 +7529,7 @@ def _handle_ha_command(payload: bytes):
         if not device_id:
             warn(f"[ha/command] set_device_area: device non trouvé "
                  f"(entity={entity_id}, ieee={ieee_address}, matter_node_id={matter_node_id})")
-            return
+            return False
 
         # ⚠️ Bug réel trouvé le 2026-09-09 (rencontré en testant un renommage
         # groupé, un device a atterri dans la mauvaise pièce) : `area_id`
@@ -7522,16 +7556,18 @@ def _handle_ha_command(payload: bytes):
             ws_kwargs["name_by_user"] = name
         if len(ws_kwargs) == 1:
             log(f"[ha/command] set_device_area: rien à mettre à jour pour {entity_id or ieee_address} (ni aire ni nom résolus)")
-            return
+            return True  # rien à faire n'est pas un échec
         result = _ha_ws_call("config/device_registry/update", **ws_kwargs)
         if result and result.get("success"):
             log(f"[ha/command] Device mis à jour : {entity_id or ieee_address} → "
                 f"area={area_name or 'aucune'}{f', name={name}' if name else ''}")
-        else:
-            warn(f"[ha/command] Erreur set_device_area : {result}")
+            return True
+        warn(f"[ha/command] Erreur set_device_area : {result}")
+        return False
 
     else:
         warn(f"[ha/command] Type inconnu : {cmd_type}")
+        return False
 
 
 def _detect_device_type(
@@ -9123,6 +9159,18 @@ _PTZ_STEP_SECONDS = 0.2
 
 
 class _CommandHandler(http.server.BaseHTTPRequestHandler):
+    # Audit add-on 2026-09-22 : aucun timeout de connexion, aucune limite de
+    # taille de corps sur ce serveur — un appelant (même sans secret valide,
+    # avant même la vérification d'auth) pouvait garder un thread ouvert
+    # indéfiniment (style slowloris, un thread par connexion via
+    # ThreadingTCPServer, pas de plafond) ou, une fois authentifié, envoyer un
+    # corps de plusieurs centaines de Mo pour épuiser la RAM du Pi. `timeout`
+    # est honoré nativement par socketserver.StreamRequestHandler.setup()
+    # (ferme la connexion proprement si aucune donnée ne circule pendant ce
+    # délai) — pas un correctif maison, un attribut standard jamais renseigné.
+    timeout = 15
+    MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 Mo — largement au-dessus de la plus grosse commande légitime (upsert d'automatisation)
+
     def log_message(self, fmt, *args):
         log(f"[cmd-server] {self.address_string()} — {fmt % args}")
 
@@ -9233,6 +9281,11 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
 
         try:
             length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return self._reject(400, "Content-Length invalide")
+        if length > self.MAX_BODY_BYTES:
+            return self._reject(413, "Corps trop volumineux")
+        try:
             raw = self.rfile.read(length) if length else b"{}"
             data = json.loads(raw.decode() or "{}")
         except Exception:
@@ -9524,8 +9577,15 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         self._ok()
 
     def _handle_ha_command_route(self, data):
-        _handle_ha_command(json.dumps(data).encode())
-        self._ok()
+        # Audit add-on 2026-09-22 : cette route répondait "ok" au client
+        # SYSTÉMATIQUEMENT, même quand _handle_ha_command échouait réellement
+        # (ex: écriture HA en échec) — un client pouvait croire une
+        # automatisation/scène enregistrée alors qu'elle ne l'était pas.
+        ok = _handle_ha_command(json.dumps(data).encode())
+        if ok:
+            self._ok()
+        else:
+            self._reject(502, "Échec de la commande HA — voir les logs de l'add-on")
 
     def _handle_camera_configure_route(self, data):
         action = data.get("action", "add")
@@ -9560,34 +9620,44 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._reject(502, "Échec de mise à jour du masquage — voir les logs de l'add-on")
 
     def _handle_camera_test_route(self, data):
-        rtsp_url = data.get("rtspUrl")
-        if rtsp_url:
-            # Mode "URL manuelle" — l'utilisateur a fourni l'URL exacte, aucune devinette.
-            ok, detail = _go2rtc_test_stream(rtsp_url)
-            try:
-                onvif_ip, onvif_user, onvif_pass = _onvif_credentials_from_rtsp(rtsp_url)
-            except ValueError:
-                onvif_ip, onvif_user, onvif_pass = '', '', ''
-            if not onvif_ip:
-                ip_m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', rtsp_url)
-                onvif_ip = ip_m.group(1) if ip_m else ''
-            caps = _safe_probe_capabilities(onvif_ip, username=onvif_user, password=onvif_pass) if onvif_ip else []
-            return self._ok({"ok": ok, "detail": detail, "correctedUrl": None, "detectedCapabilities": caps})
+        # Audit add-on 2026-09-22 : ce test crée/sonde un flux temporaire côté
+        # go2rtc (_go2rtc_upsert_stream) sans jamais prendre _camera_configure_lock,
+        # contrairement à tous les autres appels qui touchent go2rtc/Frigate —
+        # un test lancé pendant un ajout/suppression/masquage concurrent (qui
+        # redémarre Frigate entièrement) pouvait échouer avec un message
+        # trompeur ("caméra injoignable") alors que la vraie cause est le
+        # redémarrage en cours, pas la caméra elle-même. Sérialisé comme le
+        # reste — un test attend simplement la fin de l'opération en cours au
+        # lieu de donner un faux résultat.
+        with _camera_configure_lock:
+            rtsp_url = data.get("rtspUrl")
+            if rtsp_url:
+                # Mode "URL manuelle" — l'utilisateur a fourni l'URL exacte, aucune devinette.
+                ok, detail = _go2rtc_test_stream(rtsp_url)
+                try:
+                    onvif_ip, onvif_user, onvif_pass = _onvif_credentials_from_rtsp(rtsp_url)
+                except ValueError:
+                    onvif_ip, onvif_user, onvif_pass = '', '', ''
+                if not onvif_ip:
+                    ip_m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', rtsp_url)
+                    onvif_ip = ip_m.group(1) if ip_m else ''
+                caps = _safe_probe_capabilities(onvif_ip, username=onvif_user, password=onvif_pass) if onvif_ip else []
+                return self._ok({"ok": ok, "detail": detail, "correctedUrl": None, "detectedCapabilities": caps})
 
-        ip = data.get("ip")
-        password = data.get("password")
-        if not ip or password is None:
-            return self._reject(400, "ip et password requis (ou rtspUrl)")
-        manufacturer = data.get("manufacturer") or ""
-        ok, detail, url, sub_url = _test_camera_by_brand(ip, password, manufacturer)
-        # username "admin" : convention constante des templates RTSP de toutes les
-        # marques du projet (_RTSP_TEMPLATES) — même hypothèse déjà utilisée ailleurs
-        # pour les commandes ONVIF authentifiées (PTZ, vision nocturne).
-        caps = _safe_probe_capabilities(ip, username="admin", password=password)
-        self._ok({
-            "ok": ok, "detail": detail, "correctedUrl": url, "correctedUrlSub": sub_url,
-            "detectedCapabilities": caps,
-        })
+            ip = data.get("ip")
+            password = data.get("password")
+            if not ip or password is None:
+                return self._reject(400, "ip et password requis (ou rtspUrl)")
+            manufacturer = data.get("manufacturer") or ""
+            ok, detail, url, sub_url = _test_camera_by_brand(ip, password, manufacturer)
+            # username "admin" : convention constante des templates RTSP de toutes les
+            # marques du projet (_RTSP_TEMPLATES) — même hypothèse déjà utilisée ailleurs
+            # pour les commandes ONVIF authentifiées (PTZ, vision nocturne).
+            caps = _safe_probe_capabilities(ip, username="admin", password=password)
+            self._ok({
+                "ok": ok, "detail": detail, "correctedUrl": url, "correctedUrlSub": sub_url,
+                "detectedCapabilities": caps,
+            })
 
     def _handle_camera_ptz_route(self, data):
         """Relaie la commande au contrôleur ONVIF PTZ natif de Frigate (topic MQTT
@@ -9777,12 +9847,16 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._reject(404, "Route inconnue")
 
     def _handle_camera_scan(self):
+        if not _camera_scan_lock.acquire(blocking=False):
+            return self._reject(409, "Un scan caméras est déjà en cours — réessaie dans quelques secondes")
         try:
             cameras = _scan_onvif_cameras(timeout=7.0)
             self._ok({"cameras": cameras})
         except Exception as e:
             warn(f"[camera-scan] {e}")
             self._reject(500, str(e))
+        finally:
+            _camera_scan_lock.release()
 
     def _handle_local_devices_route(self):
         try:
