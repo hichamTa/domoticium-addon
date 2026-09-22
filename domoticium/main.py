@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, io, json, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
+import base64, hashlib, hmac, http.server, io, json, logging, logging.handlers, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
 from datetime import datetime, date
 import paho.mqtt.client as mqtt
 import requests
@@ -338,6 +338,35 @@ def _log_ts() -> str:
 
 def log(msg):  print(f"[domoticium] {_log_ts()} {msg}", flush=True)
 def warn(msg): print(f"[domoticium] {_log_ts()} ⚠ {msg}", file=sys.stderr, flush=True)
+
+
+# Audit add-on 2026-09-22 : jusqu'ici, les commandes reçues par _CommandHandler
+# (serveur HTTP local, seul point d'entrée cloud → Pi) n'étaient tracées que dans
+# le log général de l'add-on — capturé par HA sous forme de ring buffer éphémère
+# (perdu au redémarrage, aucun moyen de retrouver "qu'est-ce qui a été exécuté sur
+# ce site hier"). Fichier dédié, tournant (jamais illimité), séparé du log
+# général — délibérément SANS le corps de la requête (route + adresse + verdict
+# seulement) : plusieurs routes transportent des secrets en clair dans leur payload
+# (delegatedRefreshToken, rtspUrl, codes PIN Alarmo…) — même prudence que
+# _redact_rtsp_credentials pour _go2rtc_upsert_stream, mais ici on évite carrément
+# de capturer la donnée sensible plutôt que de la rédiger après coup.
+_COMMAND_AUDIT_LOG = "/data/command_audit.log"
+_command_audit_logger = logging.getLogger("domoticium.command_audit")
+_command_audit_logger.setLevel(logging.INFO)
+_command_audit_logger.propagate = False
+_command_audit_handler = logging.handlers.RotatingFileHandler(
+    _COMMAND_AUDIT_LOG, maxBytes=1_000_000, backupCount=2,
+)
+_command_audit_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+_command_audit_logger.addHandler(_command_audit_handler)
+
+
+def _audit_command(route: str, remote_addr: str, verdict: str):
+    """verdict : 'ok' (traitée), 'rejected:<raison>' (auth/route/format)."""
+    try:
+        _command_audit_logger.info(f"{remote_addr} {route} {verdict}")
+    except Exception:
+        pass  # l'audit ne doit jamais faire échouer une commande légitime
 
 
 def _local_ipv4() -> str:
@@ -9381,6 +9410,8 @@ font-family:sans-serif;display:flex;align-items:center;justify-content:center;
 height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></html>"""
 
     def do_POST(self):
+        remote_addr = self.client_address[0]
+        route_for_audit = self.path.split("?", 1)[0]
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
         # hmac.compare_digest (pas !=) : comparaison en temps constant, évite une
@@ -9388,6 +9419,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         # 2026-09-18) — risque théorique faible (HTTPS + secret long) mais correctif
         # d'une ligne.
         if not hmac.compare_digest(self.headers.get("X-Site-Secret") or "", INGEST_SECRET):
+            _audit_command(route_for_audit, remote_addr, "rejected:unauthorized")
             return self._reject(401, "Non autorisé")
 
         try:
@@ -9407,11 +9439,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 if not chunk:
                     break
                 remaining -= len(chunk)
+            _audit_command(route_for_audit, remote_addr, "rejected:body_too_large")
             return self._reject(413, "Corps trop volumineux")
         try:
             raw = self.rfile.read(length) if length else b"{}"
             data = json.loads(raw.decode() or "{}")
         except Exception:
+            _audit_command(route_for_audit, remote_addr, "rejected:invalid_json")
             return self._reject(400, "JSON invalide")
 
         try:
@@ -9447,10 +9481,17 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             }
             handler = handlers.get(route)
             if not handler:
+                _audit_command(route, remote_addr, "rejected:unknown_route")
                 return self._reject(404, "Route inconnue")
             handler(data)
+            # "ok" = dispatchée sans exception, pas forcément un succès métier
+            # (un handler peut répondre son propre code d'erreur sans lever) —
+            # suffisant pour l'objectif de cet audit (quelles commandes ont été
+            # REÇUES et traitées vs. rejetées au niveau transport/auth).
+            _audit_command(route, remote_addr, "ok")
         except Exception as e:
             warn(f"[cmd-server] {self.path}: {e}")
+            _audit_command(route_for_audit, remote_addr, f"rejected:error:{type(e).__name__}")
             self._reject(500, str(e))
 
     def _handle_ha_session_token_create(self, data):
