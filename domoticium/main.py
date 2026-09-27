@@ -6697,6 +6697,23 @@ _alarm_state_batch: dict = {}
 _SENSOR_REPORT_MIN_INTERVAL_S = 20
 _sensor_report_last_sent: dict[str, float] = {}
 
+# Filtre "rien de nouveau" (2026-09-27, chantier consommation de données — quota
+# Supabase/Vercel proche de la limite) : mesuré en direct sur 90 s, UN SEUL
+# lecteur média (télé) représentait 91 % des `state_changed` de tout le site
+# (~2 par seconde), alors que seuls `media_position`/`media_position_updated_at`
+# changeaient — un simple compteur de lecture, sans valeur pour l'app. Chaque
+# événement déclenchait pourtant un appel Supabase complet. Règle GÉNÉRALE (par
+# nom d'attribut, jamais par équipement : tout lecteur média d'un futur client,
+# Sonos/Chromecast/TV, se comporte pareil) : si l'état ET tous les attributs
+# HORS de cette liste sont identiques au dernier envoi réussi de cette entité,
+# on n'appelle pas Supabase. `_DEDUPE_REFRESH_S` : renvoi forcé au bout de 5 min
+# même sans changement, pour garder `last_seen` de l'entité raisonnablement
+# frais. Ne concerne que des attributs "horloge" — un vrai changement d'état ou
+# d'un autre attribut (batterie, sabotage, valeur…) passe toujours.
+_DEDUPE_IGNORED_ATTRS = frozenset({"media_position", "media_position_updated_at", "last_seen"})
+_DEDUPE_REFRESH_S = 300
+_last_reported_signature: dict[str, tuple[str, float]] = {}
+
 # ── Watchdog caméras ─────────────────────────────────────────────────────────
 # Sonde go2rtc toutes les 60s, envoie les deltas dans le même flush que les états.
 _cam_watch_online: dict[str, bool] = {}   # streamName → dernière valeur connue
@@ -6848,6 +6865,17 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
     est écoulé, jamais une perte silencieuse — même garantie que
     maximum_report_interval côté Zigbee."""
     domain = entity_id.split(".")[0] if "." in entity_id else ""
+    try:
+        signature = state + "\x00" + json.dumps(
+            {k: v for k, v in attributes.items() if k not in _DEDUPE_IGNORED_ATTRS},
+            sort_keys=True, default=str,
+        )
+    except Exception:
+        signature = ""
+    if signature:
+        prev = _last_reported_signature.get(entity_id)
+        if prev and prev[0] == signature and time.time() - prev[1] < _DEDUPE_REFRESH_S:
+            return True
     if domain == "sensor":
         now = time.time()
         last_sent = _sensor_report_last_sent.get(entity_id, 0.0)
@@ -6871,6 +6899,8 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
         if r.status_code >= 300:
             warn(f"[supabase] pi_report_device_state({entity_id}) {r.status_code}: {r.text[:120]}")
             return False
+        if signature:
+            _last_reported_signature[entity_id] = (signature, time.time())
         return True
     except Exception as e:
         warn(f"[supabase] pi_report_device_state({entity_id}): {e}")
