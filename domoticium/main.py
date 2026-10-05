@@ -82,6 +82,7 @@ HDRS = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "applicat
 SETUP_DONE   = "/data/.setup_done"
 CAMERAS_FILE = "/data/cameras.json"
 CAMERA_MASKS_FILE = "/data/camera_masks.json"
+ROOM_TYPES_FILE = "/data/room_types.json"
 
 
 def _pi_sign(message: str) -> str:
@@ -7433,12 +7434,31 @@ def handle_local_devices() -> dict:
         area_id = dev.get("areaId")
         rooms.setdefault(area_id, []).append(dev)
 
+    room_types = _load_room_types()
     return {
         "rooms": [
-            {"id": area_id, "name": area_names.get(area_id) or "Sans pièce", "devices": devs}
+            {
+                "id": area_id,
+                "name": area_names.get(area_id) or "Sans pièce",
+                "roomType": room_types.get(area_id) if area_id else None,
+                "devices": devs,
+            }
             for area_id, devs in rooms.items()
         ]
     }
+
+
+def _load_room_types() -> dict:
+    try:
+        with open(ROOM_TYPES_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_room_types(room_types: dict) -> None:
+    with open(ROOM_TYPES_FILE, "w") as f:
+        json.dump(room_types, f)
 
 
 def _get_ha_device_id(entity_id=None, ieee_address=None, matter_node_id=None):
@@ -7636,6 +7656,12 @@ def _handle_ha_command(payload: bytes) -> bool:
             return False
         result = _ha_ws_call("config/area_registry/create", name=name)
         if result and result.get("success"):
+            area_id = (result.get("result") or {}).get("area_id")
+            room_type = data.get("room_type")
+            if area_id and room_type:
+                room_types = _load_room_types()
+                room_types[area_id] = room_type
+                _save_room_types(room_types)
             log(f"[ha/command] Area HA créée : '{name}'")
             return True
         warn(f"[ha/command] Erreur création area '{name}' : {result}")
@@ -7672,6 +7698,9 @@ def _handle_ha_command(payload: bytes) -> bool:
             return True  # déjà absente — état cible déjà atteint, pas un échec
         result = _ha_ws_call("config/area_registry/delete", area_id=area["area_id"])
         if result and result.get("success"):
+            room_types = _load_room_types()
+            if room_types.pop(area["area_id"], None) is not None:
+                _save_room_types(room_types)
             log(f"[ha/command] Area HA supprimée : '{name}'")
             return True
         warn(f"[ha/command] Erreur suppression area '{name}' : {result}")
