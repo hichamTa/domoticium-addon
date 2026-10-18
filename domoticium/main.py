@@ -3426,45 +3426,49 @@ def handle_list_ha_automations() -> dict:
     return {"ok": True, "automations": automations}
 
 
-def handle_list_ha_scripts() -> dict:
-    """Énumère les scripts HA (GET /states filtré sur script.*) — mode local
-    uniquement, chantier "vraie intégration locale" v7 (2026-09-08, cf.
+def handle_list_ha_scenes() -> dict:
+    """Énumère les scènes HA natives (GET /states filtré sur scene.*) — mode
+    local uniquement, chantier "vraie intégration locale" v7 (2026-09-08, cf.
     HANDOFF.md côté web). Les scènes Domoticium sont poussées vers HA comme
-    des scripts (domoticium_scene_<local_id>, cf. script_upsert dans
-    _handle_ha_command) — en local, sans Supabase pour stocker leurs
-    métadonnées (nom/icône/steps structurés), ce sont CES scripts eux-mêmes
-    qui deviennent la seule source de vérité côté web (icon lu depuis
-    l'attribut natif HA, steps redécompilés depuis `sequence` via
-    haSequenceToSteps, cf. lib/scenes.ts). Même limitation assumée que
-    handle_list_ha_automations : pas d'endpoint REST "lister toutes les
-    configs", lecture unitaire par script derrière /states — best-effort, un
-    script illisible ne fait pas échouer les autres."""
+    de VRAIES scènes natives (domoticium_scene_<local_id>, domaine scene.*,
+    cf. scene_upsert dans _handle_ha_command — avant le 2026-10-18 c'était des
+    scripts, migré après avoir trouvé que mqtt.publish (nécessaire pour le
+    Zigbee) n'a jamais été ajouté à ALLOWED_SERVICES lors de l'audit de
+    sécurité du 2026-09-22, cassant silencieusement toute scène Zigbee) — en
+    local, sans Supabase pour stocker leurs métadonnées (nom/icône/steps
+    structurés), ce sont CES scènes elles-mêmes qui deviennent la seule
+    source de vérité côté web (icon lu depuis l'attribut natif HA, steps
+    redécompilés depuis `entities` via haSceneEntitiesToSteps, cf.
+    lib/scenes.ts). Même limitation assumée que handle_list_ha_automations :
+    pas d'endpoint REST "lister toutes les configs", lecture unitaire par
+    scène derrière /states — best-effort, une scène illisible ne fait pas
+    échouer les autres."""
     try:
         r = ha_get("/states")
         if not r.ok:
-            return {"ok": False, "scripts": []}
+            return {"ok": False, "scenes": []}
         states = r.json()
     except Exception as e:
-        warn(f"[scripts-ha] lecture /states: {e}")
-        return {"ok": False, "scripts": []}
+        warn(f"[scenes-ha] lecture /states: {e}")
+        return {"ok": False, "scenes": []}
 
-    scripts = []
+    scenes = []
     for s in states:
         entity_id = s.get("entity_id", "")
-        if not entity_id.startswith("script."):
+        if not entity_id.startswith("scene."):
             continue
         object_id = entity_id.split(".", 1)[1]
         attrs = s.get("attributes") or {}
 
         config = None
         try:
-            cr = ha_get(f"/config/script/config/{object_id}")
+            cr = ha_get(f"/config/scene/config/{object_id}")
             if cr.ok:
                 config = cr.json()
         except Exception as e:
-            warn(f"[scripts-ha] lecture config {object_id}: {e}")
+            warn(f"[scenes-ha] lecture config {object_id}: {e}")
 
-        scripts.append({
+        scenes.append({
             "object_id": object_id,
             "entity_id": entity_id,
             "alias": attrs.get("friendly_name", entity_id),
@@ -3472,7 +3476,7 @@ def handle_list_ha_scripts() -> dict:
             "config": config,
         })
 
-    return {"ok": True, "scripts": scripts}
+    return {"ok": True, "scenes": scenes}
 
 
 def handle_get_device_triggers(ieee_address: str | None, matter_node_id: int | None) -> dict:
@@ -3658,16 +3662,22 @@ def handle_alarmo_set_automation(
         # création d'une action avec un mode coché).
         mode_map = {"away": "armed_away", "home": "armed_home", "night": "armed_night"}
         trigger["modes"] = [mode_map.get(m, m) for m in modes]
-    # Les scènes (script.*) et automatisations (automation.*) n'ont pas de
-    # notion d'allumer/éteindre — les exposer avec le toggle Allumer/Éteindre
-    # n'aurait aucun sens (une scène s'active, une automatisation se déclenche,
-    # point). Demande Hicham 2026-08-09 : ces cibles sont forcées sur leur seul
-    # service pertinent, quel que soit service_verb ; tout le reste (lumières,
-    # prises, sirènes…) garde le comportement historique.
+    # Les scènes (scene.*, scripts HA bruts éventuels en script.*) et
+    # automatisations (automation.*) n'ont pas de notion d'allumer/éteindre —
+    # les exposer avec le toggle Allumer/Éteindre n'aurait aucun sens (une
+    # scène s'active, une automatisation se déclenche, point). Demande Hicham
+    # 2026-08-09 : ces cibles sont forcées sur leur seul service pertinent,
+    # quel que soit service_verb ; tout le reste (lumières, prises,
+    # sirènes…) garde le comportement historique. "scene" ajouté 2026-10-18 :
+    # les scènes Domoticium sont maintenant des scènes HA natives (scene.*),
+    # plus des scripts — même raisonnement, scene.turn_on est le seul service
+    # valide pour une scène.
     def _action_service(entity_id: str) -> str:
         domain = entity_id.split(".", 1)[0]
         if domain == "script":
             return "script.turn_on"
+        if domain == "scene":
+            return "scene.turn_on"
         if domain == "automation":
             return "automation.trigger"
         return f"{domain}.{service_verb}"
@@ -7556,8 +7566,12 @@ def _handle_ha_command(payload: bytes) -> bool:
     cmd_type  = data.get("type", "")
     object_id = data.get("object_id", "")
 
-    # ── Scripts / Automations (nécessitent object_id) ────────────────────────
-    if cmd_type in ("script_upsert", "script_delete", "automation_upsert", "automation_delete"):
+    # ── Scripts / Scènes / Automations (nécessitent object_id) ───────────────
+    if cmd_type in (
+        "script_upsert", "script_delete",
+        "scene_upsert", "scene_delete",
+        "automation_upsert", "automation_delete",
+    ):
         if not object_id:
             warn(f"[ha/command] object_id manquant pour {cmd_type} : {data}")
             return False
@@ -7601,6 +7615,48 @@ def _handle_ha_command(payload: bytes) -> bool:
                 log(f"[ha/command] Script HA supprimé : {object_id}")
                 return True
             warn(f"[ha/command] Erreur suppression script {object_id} : {r.status_code} {r.text[:200]}")
+            return False
+
+        elif cmd_type == "scene_upsert":
+            # (2026-10-18) Scènes Domoticium RECONSTRUITES en vraies scènes HA
+            # natives (scene.*, même storage que l'éditeur de scènes natif de
+            # HA) — remplacent script_upsert+mqtt.publish pour cet usage.
+            # Trouvé en auditant les scènes à la demande de Hicham : une scène
+            # touchant un équipement Zigbee échouait silencieusement depuis
+            # l'audit de sécurité du 2026-09-22 (_validate_ha_action_steps,
+            # ALLOWED_SERVICES) — mqtt n'y a jamais été ajouté, et l'ajouter
+            # aurait rouvert un vrai risque (mqtt.publish non restreint =
+            # service HA arbitraire exécutable). Une scène HA native est un
+            # INSTANTANÉ {entity_id: {attributs}}, jamais un appel de service —
+            # rien à valider via _validate_ha_action_steps, structurellement
+            # plus sûr que l'ancien mécanisme (pas de surface d'exécution).
+            entities = data.get("entities", {})
+            if not isinstance(entities, dict):
+                warn(f"[ha/command] scene_upsert refusé (entities invalide) : {object_id}")
+                return False
+            scene_cfg = {
+                "id":       object_id,
+                "name":     data.get("name", object_id),
+                "entities": entities,
+            }
+            r = ha_post(f"/config/scene/config/{object_id}", scene_cfg)
+            if r.ok:
+                ha_post("/services/scene/reload", {})
+                log(f"[ha/command] Scène HA créée/mise à jour : {object_id}")
+                return True
+            warn(f"[ha/command] Erreur scène {object_id} : {r.status_code} {r.text[:200]}")
+            return False
+
+        elif cmd_type == "scene_delete":
+            # Même course reload/écriture disque que script_delete/automation_delete
+            # ci-dessus — cf. leurs commentaires pour le détail complet.
+            r = requests.delete(f"{API}/config/scene/config/{object_id}", headers=HDRS, timeout=10)
+            if r.ok:
+                time.sleep(2)
+                ha_post("/services/scene/reload", {})
+                log(f"[ha/command] Scène HA supprimée : {object_id}")
+                return True
+            warn(f"[ha/command] Erreur suppression scène {object_id} : {r.status_code} {r.text[:200]}")
             return False
 
         elif cmd_type == "automation_upsert":
@@ -8715,12 +8771,18 @@ ALLOWED_SERVICES = {
     "select":        {"select_option"},
     "media_player":  {"turn_on", "turn_off", "volume_set", "media_play", "media_pause"},
     "homeassistant": {"turn_on", "turn_off", "toggle"},
+    # Les "scènes" de l'app sont implémentées côté HA comme de vraies scènes
+    # natives (scene.domoticium_scene_..., cf. api/scenes/[id]/activate côté
+    # web) depuis le 2026-10-18 — avant cette date, c'était des scripts
+    # (script.domoticium_scene_...), d'où l'entrée "script" ci-dessous, gardée
+    # pour les scripts HA bruts qu'un client peut cibler directement (pas
+    # Domoticium) depuis une action d'alarme/automatisation.
     "scene":         {"turn_on"},
-    # Les "scènes" de l'app sont implémentées côté HA comme des scripts
-    # (script.domoticium_scene_..., cf. api/scenes/[id]/activate côté web) — pas des
-    # scene.* natives. "script" était absent de cette liste blanche, donc chaque
-    # activation était rejetée en 403 (trouvé en conditions réelles le 2026-07-26,
-    # après un signalement d'Hicham : le bouton "Activer" ne faisait rien).
+    # "script" était absent de cette liste blanche à l'origine, donc chaque
+    # activation de scène (alors un script) était rejetée en 403 (trouvé en
+    # conditions réelles le 2026-07-26, après un signalement d'Hicham : le
+    # bouton "Activer" ne faisait rien) — gardé depuis pour les scripts HA
+    # bruts (pas seulement l'ancien mécanisme de scène).
     "script":        {"turn_on", "turn_off", "toggle"},
     # alarm_control_panel RETIRÉ le 2026-09-22 (audit add-on) : cette entrée
     # permettait de contourner ENTIÈREMENT handle_alarmo_set_panel_state() via
@@ -10099,8 +10161,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_alarmo_sensor_groups_route()
         elif route == "/automations/ha":
             self._handle_ha_automations_route()
-        elif route == "/scripts/ha":
-            self._handle_ha_scripts_route()
+        elif route == "/scenes/ha":
+            self._handle_ha_scenes_route()
         elif route == "/devices/triggers":
             self._handle_device_triggers_route()
         elif route == "/automations/calendars":
@@ -10173,11 +10235,11 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             warn(f"[automations-ha] {e}")
             self._reject(500, str(e))
 
-    def _handle_ha_scripts_route(self):
+    def _handle_ha_scenes_route(self):
         try:
-            self._ok(handle_list_ha_scripts())
+            self._ok(handle_list_ha_scenes())
         except Exception as e:
-            warn(f"[scripts-ha] {e}")
+            warn(f"[scenes-ha] {e}")
             self._reject(500, str(e))
 
     def _handle_device_triggers_route(self):
