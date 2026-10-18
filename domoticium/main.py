@@ -7050,7 +7050,7 @@ def _entity_registry_entry(entity_id: str) -> dict | None:
     return None
 
 
-def _entity_id_by_unique_id(unique_id: str) -> str | None:
+def _entity_id_by_unique_id(unique_id: str, domain: str = "scene") -> str | None:
     """Résout l'entity_id RÉEL d'une entité HA à partir de son unique_id (= notre
     object_id de config, stocké tel quel par HA dans l'entity registry) — nécessaire
     pour scene.* dont l'entity_id réel est dérivé du NOM (slugifié) au moment de la
@@ -7060,13 +7060,22 @@ def _entity_id_by_unique_id(unique_id: str) -> str | None:
     scènes avaient jusqu'ici un calcul qui prétendait le contraire). Confirmé en
     conditions réelles (2026-10-18) : une scène nommée "allumage lumieres", créée
     avec l'id de config "domoticium_scene_<uuid>", a pour entity_id réel
-    scene.allumage_lumieres — PAS scene.domoticium_scene_<uuid>."""
+    scene.allumage_lumieres — PAS scene.domoticium_scene_<uuid>.
+
+    `domain` (défaut "scene") est OBLIGATOIRE en pratique, pas cosmétique : une
+    scène migrée depuis l'ancien mécanisme (script_upsert, avant le 2026-10-18)
+    garde le même object_id de config que son ancien script.domoticium_scene_<uuid>
+    JAMAIS supprimé — son unique_id entre donc en collision avec celui de la
+    NOUVELLE entité scene.*. Confirmé en conditions réelles : sans ce filtre, la
+    1ère entrée trouvée dans l'entity registry était systématiquement l'ancien
+    script, jamais la scène — exactement le même bug qu'on corrige, mais déplacé."""
     result = _ha_ws_call("config/entity_registry/list")
     if not result or not result.get("success"):
         return None
     for e in result.get("result", []):
-        if e.get("unique_id") == unique_id:
-            return e.get("entity_id")
+        entity_id = e.get("entity_id", "")
+        if e.get("unique_id") == unique_id and entity_id.startswith(f"{domain}."):
+            return entity_id
     return None
 
 
