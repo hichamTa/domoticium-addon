@@ -3457,8 +3457,18 @@ def handle_list_ha_scenes() -> dict:
         entity_id = s.get("entity_id", "")
         if not entity_id.startswith("scene."):
             continue
-        object_id = entity_id.split(".", 1)[1]
         attrs = s.get("attributes") or {}
+
+        # (2026-10-18) VRAI BUG trouvé en auditant ce fichier : l'object_id de
+        # CONFIG (= unique_id entity registry) n'est PAS le suffixe de
+        # l'entity_id pour scene.* — HA le dérive du NOM, slugifié (cf.
+        # _entity_id_by_unique_id). Ce code faisait donc TOUJOURS
+        # /config/scene/config/{suffixe_du_nom}, qui ne matche jamais le
+        # VRAI id de config (domoticium_scene_<uuid>) — `config` restait
+        # silencieusement null pour CHAQUE scène en mode local, jamais
+        # détecté sans relire la vraie entity registry.
+        entry = _entity_registry_entry(entity_id)
+        object_id = entry.get("unique_id") if entry else entity_id.split(".", 1)[1]
 
         config = None
         try:
@@ -7040,6 +7050,26 @@ def _entity_registry_entry(entity_id: str) -> dict | None:
     return None
 
 
+def _entity_id_by_unique_id(unique_id: str) -> str | None:
+    """Résout l'entity_id RÉEL d'une entité HA à partir de son unique_id (= notre
+    object_id de config, stocké tel quel par HA dans l'entity registry) — nécessaire
+    pour scene.* dont l'entity_id réel est dérivé du NOM (slugifié) au moment de la
+    première sauvegarde, jamais de l'id de config qu'on choisit (contrairement à
+    script.*/automation.*... qui ont en réalité le MÊME problème, cf. le commentaire
+    historique de automationEntityId côté web/lib/automationBuilder.ts — seules les
+    scènes avaient jusqu'ici un calcul qui prétendait le contraire). Confirmé en
+    conditions réelles (2026-10-18) : une scène nommée "allumage lumieres", créée
+    avec l'id de config "domoticium_scene_<uuid>", a pour entity_id réel
+    scene.allumage_lumieres — PAS scene.domoticium_scene_<uuid>."""
+    result = _ha_ws_call("config/entity_registry/list")
+    if not result or not result.get("success"):
+        return None
+    for e in result.get("result", []):
+        if e.get("unique_id") == unique_id:
+            return e.get("entity_id")
+    return None
+
+
 def _matter_node_id_from_unique_id(unique_id: str | None) -> int | None:
     """Retrouve le node_id Matter (int) d'une entité HA via son unique_id.
     None si l'entité n'est pas Matter ou introuvable."""
@@ -7545,7 +7575,7 @@ def _validate_ha_action_steps(steps) -> bool:
     return True
 
 
-def _handle_ha_command(payload: bytes) -> bool:
+def _handle_ha_command(payload: bytes) -> bool | dict:
     """Exécute une commande ha/command (appelée en direct depuis Python — cf.
     docstring de _validate_ha_action_steps, ce topic MQTT lui-même n'existe
     plus — ET depuis /ha-command, la vraie route HTTP app-facing).
@@ -7556,7 +7586,14 @@ def _handle_ha_command(payload: bytes) -> bool:
     (ex: HA temporairement indisponible) — un client pouvait croire une
     automatisation/scène enregistrée alors qu'elle ne l'était pas. Les autres
     appelants (Alarmo SOS/clavier, _sync_all_to_ha) ignorent déjà la valeur
-    de retour sans rien casser — ajout rétrocompatible."""
+    de retour sans rien casser — ajout rétrocompatible.
+
+    (2026-10-18) scene_upsert renvoie désormais {"ok": True, "entity_id": ...}
+    au lieu de True nu — un dict non vide reste "truthy" en Python, donc tous
+    les appelants existants (if ok / if not ok, jamais de `is True`) continuent
+    de fonctionner sans changement ; seul _handle_ha_command_route lit le
+    détail pour le transmettre au web, qui en a besoin pour activer la scène
+    plus tard (cf. _entity_id_by_unique_id)."""
     try:
         data = json.loads(payload.decode())
     except Exception as e:
@@ -7642,8 +7679,22 @@ def _handle_ha_command(payload: bytes) -> bool:
             r = ha_post(f"/config/scene/config/{object_id}", scene_cfg)
             if r.ok:
                 ha_post("/services/scene/reload", {})
-                log(f"[ha/command] Scène HA créée/mise à jour : {object_id}")
-                return True
+                # L'entity_id réel (scene.<nom_slugifié>) n'est JAMAIS celui qu'on
+                # devinerait depuis object_id (cf. _entity_id_by_unique_id) — résolu
+                # ici et renvoyé au client (web) pour qu'il le stocke, plutôt que de
+                # laisser chaque appelant deviner un entity_id potentiellement faux
+                # (bug réel trouvé en auditant les scènes à la demande de Hicham,
+                # 2026-10-18 : scene.turn_on ciblant l'ancien entity_id calculé
+                # échouait silencieusement, HA n'erreure pas sur une cible
+                # inexistante). Petite marge de retry : le reload venant de
+                # s'exécuter, l'entity registry peut mettre un instant à refléter
+                # le changement.
+                entity_id = _entity_id_by_unique_id(object_id)
+                if not entity_id:
+                    time.sleep(0.5)
+                    entity_id = _entity_id_by_unique_id(object_id)
+                log(f"[ha/command] Scène HA créée/mise à jour : {object_id} → {entity_id or '?'}")
+                return {"ok": True, "entity_id": entity_id}
             warn(f"[ha/command] Erreur scène {object_id} : {r.status_code} {r.text[:200]}")
             return False
 
@@ -9912,9 +9963,12 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         # SYSTÉMATIQUEMENT, même quand _handle_ha_command échouait réellement
         # (ex: écriture HA en échec) — un client pouvait croire une
         # automatisation/scène enregistrée alors qu'elle ne l'était pas.
-        ok = _handle_ha_command(json.dumps(data).encode())
-        if ok:
-            self._ok()
+        result = _handle_ha_command(json.dumps(data).encode())
+        if result:
+            # scene_upsert renvoie un dict ({"ok":True,"entity_id":...}) — transmis
+            # tel quel au web, qui en a besoin pour activer la scène plus tard
+            # (cf. _entity_id_by_unique_id). Tout le reste renvoie True nu.
+            self._ok(result if isinstance(result, dict) else None)
         else:
             self._reject(502, "Échec de la commande HA — voir les logs de l'add-on")
 
