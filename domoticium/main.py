@@ -13,7 +13,7 @@ Phase 2 (service permanent) :
   • Commissionnement Matter
 """
 import base64, hashlib, hmac, http.server, io, json, logging, logging.handlers, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 import paho.mqtt.client as mqtt
 import requests
 
@@ -3517,6 +3517,37 @@ def handle_get_device_triggers(ieee_address: str | None, matter_node_id: int | N
         if isinstance(t, dict) and t.get("domain") and t.get("type")
     ]
     return {"ok": True, "device_found": True, "triggers": triggers}
+
+
+def handle_device_history(entity_id: str, hours: int) -> dict:
+    """Historique d'une entité HA via l'API REST History native de HA — jamais
+    utilisée par l'addon jusqu'ici (confirmé par recherche exhaustive), mais le
+    Recorder HAOS est déjà actif par défaut (~10 jours de rétention). Chantier
+    du 2026-10-24 : lire cet historique local au lieu de le dupliquer dans
+    Supabase (cf. device_states, HANDOFF)."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+    start_iso = start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    end_iso = end.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    query = urllib.parse.urlencode({
+        "filter_entity_id": entity_id,
+        "end_time": end_iso,
+        "minimal_response": "",
+    })
+    r = ha_get(f"/history/period/{urllib.parse.quote(start_iso)}?{query}")
+    if not r.ok:
+        warn(f"[device-history] HA {r.status_code} pour {entity_id}: {r.text[:200]}")
+        return {"ok": False, "points": []}
+
+    raw = r.json()
+    # Un seul filter_entity_id ⇒ au plus une sous-liste dans le résultat.
+    series = raw[0] if raw else []
+    points = [
+        {"ts": p.get("last_changed"), "state": p.get("state")}
+        for p in series
+        if isinstance(p, dict) and p.get("state") not in (None, "unknown", "unavailable")
+    ]
+    return {"ok": True, "points": points}
 
 
 def handle_list_calendars() -> dict:
@@ -10228,6 +10259,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_ha_scenes_route()
         elif route == "/devices/triggers":
             self._handle_device_triggers_route()
+        elif route == "/devices/history":
+            self._handle_device_history_route()
         elif route == "/automations/calendars":
             self._handle_calendars_route()
         elif route == "/automations/areas":
@@ -10322,6 +10355,25 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_get_device_triggers(ieee_address, matter_node_id))
         except Exception as e:
             warn(f"[device-triggers] {e}")
+            self._reject(500, str(e))
+
+    def _handle_device_history_route(self):
+        """Historique d'une entité (ex: capteur d'énergie cumulative) sur les
+        dernières N heures — entity_id déjà résolu côté cloud (device_entities),
+        l'addon reste dumb et se contente de relayer l'API History native de HA.
+        hours en query string, défaut 24 (graphique énergie 24h, seul appelant
+        actuel)."""
+        try:
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = urllib.parse.parse_qs(query)
+            entity_id = (params.get("entity_id") or [None])[0]
+            if not entity_id:
+                return self._reject(400, "entity_id requis")
+            hours_raw = (params.get("hours") or ["24"])[0]
+            hours = int(hours_raw)
+            self._ok(handle_device_history(entity_id, hours))
+        except Exception as e:
+            warn(f"[device-history] {e}")
             self._reject(500, str(e))
 
     def _handle_calendars_route(self):
