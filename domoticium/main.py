@@ -3519,35 +3519,41 @@ def handle_get_device_triggers(ieee_address: str | None, matter_node_id: int | N
     return {"ok": True, "device_found": True, "triggers": triggers}
 
 
-def handle_device_history(entity_id: str, hours: int) -> dict:
-    """Historique d'une entité HA via l'API REST History native de HA — jamais
-    utilisée par l'addon jusqu'ici (confirmé par recherche exhaustive), mais le
-    Recorder HAOS est déjà actif par défaut (~10 jours de rétention). Chantier
-    du 2026-10-24 : lire cet historique local au lieu de le dupliquer dans
-    Supabase (cf. device_states, HANDOFF)."""
+def handle_energy_history(entity_id: str, hours: int) -> dict:
+    """Consommation horaire d'une entité énergie cumulative (ex: "prise salon
+    > Énergie") via le système de STATISTIQUES long terme de HA
+    (`recorder/statistics_during_period`), PAS l'historique brut d'états.
+    Corrige un vrai bug trouvé par Hicham (2026-10-24, en comparant avec le
+    graphe natif HA d'une prise connectée) : notre 1ère version lisait
+    l'historique brut (/history/period) et calculait "dernier point - premier
+    point" nous-mêmes — faux dès qu'un compteur se réinitialise (reboot du
+    device) pendant la fenêtre, le delta devient alors négatif/aberrant. Le champ
+    "change" des statistiques HA est déjà calculé par le Recorder en compensant
+    ces remises à zéro (même mécanisme que les graphes HA natifs "Historique" et
+    le tableau de bord "Énergie") — zéro logique de delta à réinventer ici."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=hours)
     start_iso = start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     end_iso = end.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    query = urllib.parse.urlencode({
-        "filter_entity_id": entity_id,
-        "end_time": end_iso,
-        "minimal_response": "",
-    })
-    r = ha_get(f"/history/period/{urllib.parse.quote(start_iso)}?{query}")
-    if not r.ok:
-        warn(f"[device-history] HA {r.status_code} pour {entity_id}: {r.text[:200]}")
-        return {"ok": False, "points": []}
+    result = _ha_ws_call(
+        "recorder/statistics_during_period",
+        start_time=start_iso,
+        end_time=end_iso,
+        statistic_ids=[entity_id],
+        period="hour",
+        types=["change"],
+    )
+    if not result or not result.get("success"):
+        warn(f"[energy-history] statistics_during_period a échoué pour {entity_id}: {result}")
+        return {"ok": False, "hourly": []}
 
-    raw = r.json()
-    # Un seul filter_entity_id ⇒ au plus une sous-liste dans le résultat.
-    series = raw[0] if raw else []
-    points = [
-        {"ts": p.get("last_changed"), "state": p.get("state")}
-        for p in series
-        if isinstance(p, dict) and p.get("state") not in (None, "unknown", "unavailable")
+    series = result.get("result", {}).get(entity_id, [])
+    hourly = [
+        {"start": s.get("start"), "kwh": round(s.get("change") or 0.0, 3)}
+        for s in series
+        if isinstance(s, dict)
     ]
-    return {"ok": True, "points": points}
+    return {"ok": True, "hourly": hourly}
 
 
 def handle_list_calendars() -> dict:
@@ -10259,8 +10265,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_ha_scenes_route()
         elif route == "/devices/triggers":
             self._handle_device_triggers_route()
-        elif route == "/devices/history":
-            self._handle_device_history_route()
+        elif route == "/devices/energy-history":
+            self._handle_energy_history_route()
         elif route == "/automations/calendars":
             self._handle_calendars_route()
         elif route == "/automations/areas":
@@ -10357,12 +10363,12 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             warn(f"[device-triggers] {e}")
             self._reject(500, str(e))
 
-    def _handle_device_history_route(self):
-        """Historique d'une entité (ex: capteur d'énergie cumulative) sur les
-        dernières N heures — entity_id déjà résolu côté cloud (device_entities),
-        l'addon reste dumb et se contente de relayer l'API History native de HA.
-        hours en query string, défaut 24 (graphique énergie 24h, seul appelant
-        actuel)."""
+    def _handle_energy_history_route(self):
+        """Consommation horaire d'une entité énergie cumulative sur les dernières
+        N heures — entity_id déjà résolu côté cloud (device_entities), l'addon
+        reste dumb et relaie les statistiques long terme de HA (pas l'historique
+        brut, cf. handle_energy_history). hours en query string, défaut 24
+        (graphique énergie 24h, seul appelant actuel)."""
         try:
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
             params = urllib.parse.parse_qs(query)
@@ -10371,9 +10377,9 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 return self._reject(400, "entity_id requis")
             hours_raw = (params.get("hours") or ["24"])[0]
             hours = int(hours_raw)
-            self._ok(handle_device_history(entity_id, hours))
+            self._ok(handle_energy_history(entity_id, hours))
         except Exception as e:
-            warn(f"[device-history] {e}")
+            warn(f"[energy-history] {e}")
             self._reject(500, str(e))
 
     def _handle_calendars_route(self):
