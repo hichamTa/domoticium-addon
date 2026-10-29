@@ -391,11 +391,34 @@ def _local_ipv4() -> str:
         pass
     return ''
 
-def sup_get(path):
-    return requests.get(f"{SUP}{path}", headers=HDRS, timeout=15)
+# Point 4 (audit add-on 2026-09-22) : _setup_step() ne retry que les ÉTAPES de
+# run_setup() (la fonction entière, via check_fn) — un hoquet réseau transitoire
+# (timeout/connexion refusée) sur UN appel Supervisor fait hors de run_setup()
+# (watchdog, restart_frigate, bascule BLE Matter, logs…) remontait tel quel et
+# plantait la fonction appelante, sans aucun filet. Retry ici, au niveau des
+# primitives elles-mêmes, plutôt qu'à chaque site d'appel (~40 occurrences,
+# logiques de contrôle différentes selon le site) : ne retry QUE les erreurs
+# réseau/connexion (requests.exceptions.RequestException), jamais sur la base
+# d'un code HTTP — de nombreux appelants testent déjà `r.ok`/`r.status_code`
+# pour de la vraie logique métier (ex: "addon pas encore installé"), jamais une
+# erreur transitoire. _setup_step() continue d'apporter sa propre couche
+# (ré-essayer toute l'étape, idempotente) par-dessus, sans conflit.
+def _sup_request_with_retry(method, url, retries, **kwargs):
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return method(url, **kwargs)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(2)
+    raise last_exc
 
-def sup_post(path, data=None, timeout=60):
-    return requests.post(f"{SUP}{path}", headers=HDRS, json=data or {}, timeout=timeout)
+def sup_get(path, retries=2):
+    return _sup_request_with_retry(requests.get, f"{SUP}{path}", retries, headers=HDRS, timeout=15)
+
+def sup_post(path, data=None, timeout=60, retries=2):
+    return _sup_request_with_retry(requests.post, f"{SUP}{path}", retries, headers=HDRS, json=data or {}, timeout=timeout)
 
 def ha_post(path, data=None):
     return requests.post(f"{API}{path}", headers=HDRS, json=data or {}, timeout=15)
@@ -1620,6 +1643,21 @@ def _fetch_turn_ice_servers() -> list[dict] | None:
         return None
 
 
+def _yaml_dq(value: str) -> str:
+    """Échappe une valeur pour un scalaire YAML entre guillemets doubles (point 1,
+    audit add-on 2026-09-22) — ce fichier construit son YAML par concaténation de
+    f-strings, jamais via une bibliothèque YAML. handle_camera_configure() interdit
+    déjà \\n/\\r dans rtsp_url (seule injection de CLÉ possible dans ce générateur,
+    déjà fermée), mais un `"` dans une valeur non sous notre contrôle (identifiants
+    ONVIF extraits de rtsp_url, eux-mêmes saisis par le client à l'ajout d'une
+    caméra) casserait le scalaire et invaliderait tout frigate.yml — pas une
+    injection de clé (les guillemets ouvrants/fermants interdisent déjà toute
+    syntaxe YAML de mapping sur une même ligne physique), mais un déni de service
+    du parsing qui couperait TOUTES les caméras du site, pas seulement celle en
+    cause."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _webrtc_config_yaml_lines() -> list[str]:
     """Section go2rtc.webrtc — go2rtc ne charge ice_servers qu'au démarrage (pas de
     rechargement à chaud), d'où le restart Frigate après chaque rafraîchissement
@@ -1710,9 +1748,9 @@ def _webrtc_config_yaml_lines() -> list[str]:
         for u in urls:
             lines.append(f'          - "{u}"')
         if server.get("username"):
-            lines.append(f"        username: \"{server['username']}\"")
+            lines.append(f'        username: "{_yaml_dq(server["username"])}"')
         if server.get("credential"):
-            lines.append(f"        credential: \"{server['credential']}\"")
+            lines.append(f'        credential: "{_yaml_dq(server["credential"])}"')
     return lines
 
 
@@ -1757,8 +1795,8 @@ def _generate_frigate_yaml() -> str:
         "  enabled: true",
         "  host: core-mosquitto",
         "  port: 1883",
-        f'  user: "{MOSQUITTO_USER}"',
-        f'  password: "{MOSQUITTO_PASS}"',
+        f'  user: "{_yaml_dq(MOSQUITTO_USER)}"',
+        f'  password: "{_yaml_dq(MOSQUITTO_PASS)}"',
         "",
         # ⚠️ TEST TEMPORAIRE (2026-09-09, demande explicite Hicham) — chantier
         # "reconnaissance de plaques" (cf. HANDOFF.md, encore au stade design) :
@@ -1934,9 +1972,9 @@ def _generate_frigate_yaml() -> str:
             if onvif_ip:
                 lines += [
                     "    onvif:",
-                    f'      host: "{onvif_ip}"',
-                    f'      user: "{onvif_user}"',
-                    f'      password: "{onvif_pass}"',
+                    f'      host: "{_yaml_dq(onvif_ip)}"',
+                    f'      user: "{_yaml_dq(onvif_user)}"',
+                    f'      password: "{_yaml_dq(onvif_pass)}"',
                 ]
     else:
         lines.append("cameras: {}")
@@ -6095,6 +6133,7 @@ def _sync_all_to_ha():
     _backfill_ha_entity_links()
     _backfill_camera_entity_links()
     _reconcile_device_states()
+    _reconcile_alarm_state()
 
     log("[sync] ✓ Terminé")
 
@@ -6963,6 +7002,57 @@ def _report_device_state_direct(entity_id: str, state: str, attributes: dict) ->
     except Exception as e:
         warn(f"[supabase] pi_report_device_state({entity_id}): {e}")
         return False
+
+
+def _reconcile_alarm_state():
+    """Sécurité add-on, point 12 (audit 2026-09-22, resté ouvert jusqu'ici) : l'état
+    alarme (armé/désarmé) ne remonte QUE via le bridge événementiel (state_changed
+    sur alarm_control_panel.*, cf. run_ha_ws_bridge). Si l'add-on redémarre pile
+    pendant un changement d'état, ou si HA était déjà dans un état donné avant que
+    le bridge WebSocket ne se (re)connecte, aucun state_changed n'est émis pour le
+    rattraper — même raisonnement déjà établi pour les devices (_reconcile_device_states,
+    0104/0105/0111) : HA ne republie jamais le même état en boucle une fois émis.
+
+    Comparé à _reconcile_device_states, on ne peut pas simplement repousser l'état
+    HA à chaque cycle sans condition : pi_report_alarm_state (0116) insère une ligne
+    alarm_events ET déclenche la notification push "alarme déclenchée" quand
+    state='triggered' — un push inconditionnel toutes les 60s dupliquerait
+    l'historique et réenverrait cette alerte en boucle. On ne corrige donc QUE s'il
+    y a un vrai écart avec ce que l'app a stocké (pi_get_alarm_state, lecture
+    seule) — jamais un resync aveugle."""
+    area_id, _ = _alarmo_get_sole_area()
+    if not area_id:
+        return
+    entity_id = _alarmo_panel_entity_id(area_id)
+    if not entity_id:
+        return
+    r = ha_get(f"/states/{entity_id}")
+    if not r.ok:
+        return
+    try:
+        payload = r.json()
+    except Exception:
+        return
+    real_state = payload.get("state")
+    if not real_state or real_state in ("unavailable", "unknown"):
+        return
+
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:get_alarm_state"
+        resp = _supabase_rpc("pi_get_alarm_state", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+        })
+        rows = resp.json() if resp.ok else []
+        stored_state = rows[0].get("alarm_state") if rows else None
+    except Exception as e:
+        warn(f"[reconcile] pi_get_alarm_state échoué : {e}")
+        return
+
+    if stored_state == real_state:
+        return
+    if _report_alarm_state_direct(entity_id, real_state, payload.get("attributes") or {}):
+        log(f"[reconcile] alarme resynchronisée : {stored_state!r} → {real_state!r} (filet périodique)")
 
 
 def _report_alarm_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
@@ -9540,6 +9630,37 @@ _PTZ_STEP_SECONDS = 0.2
 _COMMAND_AUTH_WINDOW_SECONDS = 60
 
 
+# Point 7 (audit add-on 2026-09-22, resté ouvert jusqu'ici) : timeout (15s, cf.
+# _CommandHandler.timeout) et plafond de corps (MAX_BODY_BYTES) existaient déjà,
+# mais rien ne bornait le DÉBIT de requêtes — légitimes en forme (avec ou sans
+# secret valide) ou non. Seau à jetons GLOBAL, pas par IP : ce serveur n'a
+# structurellement qu'UN SEUL appelant légitime, le backend Vercel relayé par le
+# tunnel Cloudflare dédié au site — `self.client_address[0]` vu ici est toujours
+# celui de cloudflared en loopback (127.0.0.1), jamais l'IP réelle de l'appelant
+# distant (aucun header CF-Connecting-IP/X-Forwarded-For relayé par le tunnel) ;
+# un plafond par IP n'aurait donc qu'un seul compteur de toute façon. Verrouillé
+# (ThreadingTCPServer = un thread par requête).
+_rate_limit_lock = threading.Lock()
+_rate_limit_tokens = 40.0
+_rate_limit_last_refill = time.time()
+_RATE_LIMIT_MAX_TOKENS = 40.0       # rafale autorisée (ex: sync-now + plusieurs commandes groupées)
+_RATE_LIMIT_REFILL_PER_SEC = 4.0    # ~240/min en régime continu — largement au-dessus du trafic légitime observé
+
+
+def _rate_limit_check() -> bool:
+    """True si la requête est autorisée, False si elle doit être rejetée (429)."""
+    global _rate_limit_tokens, _rate_limit_last_refill
+    with _rate_limit_lock:
+        now = time.time()
+        elapsed = now - _rate_limit_last_refill
+        _rate_limit_last_refill = now
+        _rate_limit_tokens = min(_RATE_LIMIT_MAX_TOKENS, _rate_limit_tokens + elapsed * _RATE_LIMIT_REFILL_PER_SEC)
+        if _rate_limit_tokens < 1.0:
+            return False
+        _rate_limit_tokens -= 1.0
+        return True
+
+
 def _verify_site_secret_header(header_value: str, method: str, route: str, body: bytes) -> bool:
     if not header_value or "." not in header_value:
         return False
@@ -9677,6 +9798,9 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         # qui est un détail de routage du tunnel, pas connu tel quel par l'appelant.
         route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
         route = route.split("?", 1)[0]
+        if not _rate_limit_check():
+            _audit_command(route, remote_addr, "rejected:rate_limited")
+            return self._reject(429, "Trop de requêtes")
         if not INGEST_SECRET:
             return self._reject(503, "ingest_secret non configuré")
 
@@ -10224,6 +10348,10 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
     def do_GET(self):
         route = self.path[len("/addon"):] if self.path.startswith("/addon") else self.path
         route = route.split("?")[0]
+
+        if not _rate_limit_check():
+            _audit_command(route, self.client_address[0], "rejected:rate_limited")
+            return self._reject(429, "Trop de requêtes")
 
         # SEULE route accessible sans X-Site-Secret : conçue pour être ouverte
         # directement par le navigateur d'un technicien (qui ne peut évidemment pas
