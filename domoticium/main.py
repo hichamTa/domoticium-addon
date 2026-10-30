@@ -5313,7 +5313,30 @@ def _sync_wifi_devices_to_app():
         state = states_by_entity.get(primary_id) or {}
         attrs = state.get("attributes") or {}
         device_class = attrs.get("device_class") or primary.get("device_class") or primary.get("original_device_class")
-        device_type = _detect_wifi_device_type(domain, device_class) or "sensor-generic"
+
+        # Compteur général (2026-10-31, Hicham : un Shelly EM/3EM en Wi-Fi natif
+        # sera systématiquement installé chez tout client sans Linky) : un device
+        # dont UNE de ses entités est device_class "energy" est un compteur
+        # général, peu importe l'entité choisie "principale" ci-dessus par la
+        # priorité de domaine générique — un Shelly EM n'a aucun light/switch/
+        # cover, seulement des capteurs puissance/énergie/tension/courant par
+        # phase, dont l'ordre de retour HA n'a aucune raison de placer l'énergie
+        # cumulée en premier. L'entité ENERGY elle-même est de toute façon déjà
+        # reliée séparément via _backfill_ha_entity_links() (toutes les entités
+        # du device, pas que la "principale") — seul le TYPE du device avait
+        # besoin de cette correction pour que energy-breakdown/getSiteMonthlyEnergyRecap
+        # (web) le reconnaissent comme compteur général. PAS ENCORE VÉRIFIÉ SUR
+        # DU MATÉRIEL RÉEL (même réserve que _detect_wifi_device_type ci-dessus,
+        # aucun Shelly physique disponible au moment de l'écriture) — basé sur
+        # la doc officielle HA de l'intégration Shelly (device_class "energy"
+        # garanti par l'intégration native). À revalider dès qu'un vrai Shelly
+        # EM/3EM est disponible ; type se rafraîchit à chaque sync (upsert_wifi_device,
+        # migration 0108), donc une correction ultérieure se propagera automatiquement.
+        has_energy_entity = any(
+            (states_by_entity.get(e.get("entity_id")) or {}).get("attributes", {}).get("device_class") == "energy"
+            for e in entities
+        )
+        device_type = "energy-meter" if has_energy_entity else (_detect_wifi_device_type(domain, device_class) or "sensor-generic")
 
         devices_payload.append({
             "wifi_id": info["wifi_id"],
@@ -7503,7 +7526,14 @@ def _build_local_devices() -> list[dict]:
             primary_state0 = states_by_entity.get(primary["entity_id"]) or {}
             primary_attrs0 = primary_state0.get("attributes") or {}
             device_class = primary_attrs0.get("device_class") or primary.get("device_class") or primary.get("original_device_class")
-            device_type = _detect_wifi_device_type(primary_domain, device_class) or "sensor-generic"
+            # Compteur général — même correction, même raison que _sync_wifi_devices_to_app()
+            # (2026-10-31) : un Shelly EM/3EM n'a aucun light/switch/cover, la priorité de
+            # domaine ne suffit pas à le reconnaître comme compteur général.
+            has_energy_entity = any(
+                (states_by_entity.get(e.get("entity_id")) or {}).get("attributes", {}).get("device_class") == "energy"
+                for e in usable
+            )
+            device_type = "energy-meter" if has_energy_entity else (_detect_wifi_device_type(primary_domain, device_class) or "sensor-generic")
             vendor, model = wifi_info["vendor"], wifi_info["model"]
         elif identity:
             device_type = identity["type"]
