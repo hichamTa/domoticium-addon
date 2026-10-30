@@ -3557,9 +3557,9 @@ def handle_get_device_triggers(ieee_address: str | None, matter_node_id: int | N
     return {"ok": True, "device_found": True, "triggers": triggers}
 
 
-def handle_energy_history(entity_id: str, hours: int) -> dict:
-    """Consommation horaire d'une entité énergie cumulative (ex: "prise salon
-    > Énergie") via le système de STATISTIQUES long terme de HA
+def handle_energy_history(entity_id: str, hours: int, period: str = "hour") -> dict:
+    """Consommation d'une entité énergie cumulative (ex: "prise salon >
+    Énergie") via le système de STATISTIQUES long terme de HA
     (`recorder/statistics_during_period`), PAS l'historique brut d'états.
     Corrige un vrai bug trouvé par Hicham (2026-10-24, en comparant avec le
     graphe natif HA d'une prise connectée) : notre 1ère version lisait
@@ -3568,7 +3568,15 @@ def handle_energy_history(entity_id: str, hours: int) -> dict:
     device) pendant la fenêtre, le delta devient alors négatif/aberrant. Le champ
     "change" des statistiques HA est déjà calculé par le Recorder en compensant
     ces remises à zéro (même mécanisme que les graphes HA natifs "Historique" et
-    le tableau de bord "Énergie") — zéro logique de delta à réinventer ici."""
+    le tableau de bord "Énergie") — zéro logique de delta à réinventer ici.
+
+    `period` (2026-10-30, chantier email de clôture de compte) : `"hour"` par
+    défaut (seul appelant jusqu'ici, graphique 24h du dashboard) — passé tel
+    quel à `recorder/statistics_during_period`, qui sait nativement agréger
+    par `"day"`/`"week"`/`"month"`. Demander `"month"` directement à HA (6
+    points sur 6 mois) plutôt que resommer nous-mêmes des centaines de points
+    horaires : plus simple, et c'est exactement ce que fait déjà le Recorder
+    pour les graphes HA natifs en vue longue durée."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=hours)
     start_iso = start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
@@ -3578,7 +3586,7 @@ def handle_energy_history(entity_id: str, hours: int) -> dict:
         start_time=start_iso,
         end_time=end_iso,
         statistic_ids=[entity_id],
-        period="hour",
+        period=period,
         types=["change"],
     )
     if not result or not result.get("success"):
@@ -10492,11 +10500,15 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._reject(500, str(e))
 
     def _handle_energy_history_route(self):
-        """Consommation horaire d'une entité énergie cumulative sur les dernières
-        N heures — entity_id déjà résolu côté cloud (device_entities), l'addon
-        reste dumb et relaie les statistiques long terme de HA (pas l'historique
-        brut, cf. handle_energy_history). hours en query string, défaut 24
-        (graphique énergie 24h, seul appelant actuel)."""
+        """Consommation d'une entité énergie cumulative sur les dernières N
+        heures, agrégée par `period` — entity_id déjà résolu côté cloud
+        (device_entities), l'addon reste dumb et relaie les statistiques long
+        terme de HA (pas l'historique brut, cf. handle_energy_history). hours
+        en query string, défaut 24 (graphique énergie 24h, appelant d'origine).
+        `period` (2026-10-30, email de clôture de compte — récap mensuel sur 6
+        mois) : optionnel, défaut "hour", whitelist stricte des valeurs
+        acceptées par recorder/statistics_during_period — jamais transmis tel
+        quel à HA sans validation."""
         try:
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
             params = urllib.parse.parse_qs(query)
@@ -10505,7 +10517,10 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 return self._reject(400, "entity_id requis")
             hours_raw = (params.get("hours") or ["24"])[0]
             hours = int(hours_raw)
-            self._ok(handle_energy_history(entity_id, hours))
+            period = (params.get("period") or ["hour"])[0]
+            if period not in ("5minute", "hour", "day", "week", "month"):
+                return self._reject(400, "period invalide")
+            self._ok(handle_energy_history(entity_id, hours, period))
         except Exception as e:
             warn(f"[energy-history] {e}")
             self._reject(500, str(e))
