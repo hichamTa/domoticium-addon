@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, io, json, logging, logging.handlers, os, re, secrets, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
+import base64, hashlib, hmac, http.server, io, json, logging, logging.handlers, os, re, secrets, socket, socketserver, ssl, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
 from datetime import datetime, date, timedelta, timezone
 import paho.mqtt.client as mqtt
 import requests
@@ -70,6 +70,15 @@ COMMAND_PORT = 8098
 # go2rtc — voir _Go2rtcProxyHandler. L'ingress Cloudflare du tunnel pour /cameras doit
 # pointer ici plutôt que directement sur 1984.
 GO2RTC_PROXY_PORT = 8099
+
+# Relais HTTPS local (0.0.0.0, pas 127.0.0.1 — doit être joignable depuis le LAN
+# du client) — chantier pastille de statut 3 couleurs (2026-10-31). Écoute avec le
+# certificat du site (cf. _fetch_local_cert) et relaie en clair vers 127.0.0.1:8100
+# (l'add-on "Domoticium — Accès local", même réseau host_network) — UNIQUEMENT ce
+# port : confirmé par un agent Explore dédié qu'en mode local le navigateur ne parle
+# jamais directement à 8098/8099, seulement à 8100, qui relaie lui-même en interne
+# côté serveur vers 8098/1984 (go2rtc) — pas de routage par chemin à faire ici.
+LOCAL_TLS_PORT = 8443
 
 # Mode réseau (PoE) ou USB
 NETWORK_MODE = bool(COORDINATOR_HOST)
@@ -6166,6 +6175,7 @@ def _sync_all_to_ha():
     _reconcile_device_states()
     _reconcile_alarm_state()
     _report_local_ip()
+    _fetch_local_cert()
 
     log("[sync] ✓ Terminé")
 
@@ -7100,9 +7110,10 @@ def _report_local_ip():
     pastille de statut 3 couleurs (2026-10-31) : le web a besoin de savoir à
     quelle adresse joindre le boîtier en direct sur le réseau local (le nom
     `pi-{slug}.local` en mDNS ne peut jamais avoir de certificat HTTPS valide
-    — remplacé par un vrai sous-domaine `{slug}.local.domoticium.fr` dont
-    l'enregistrement DNS doit suivre l'IP réelle du boîtier, qui peut changer
-    au gré du bail DHCP). Volontairement HORS de la boucle heartbeat (60s,
+    — remplacé par un vrai enregistrement DNS A `local-{mqtt_prefix}.
+    domoticium.fr` — même zone que les tunnels, zone déléguée séparée
+    abandonnée le 2026-10-31, cf. tunnel.ts — qui doit suivre l'IP réelle du
+    boîtier, pouvant changer au gré du bail DHCP). Volontairement HORS de la boucle heartbeat (60s,
     trop fréquent pour une valeur qui ne bouge presque jamais) — même cadence
     que le reste de la réconciliation périodique (_sync_all_to_ha, 5 min).
     Best-effort : un échec ici ne doit jamais interrompre le reste du cycle
@@ -7125,6 +7136,57 @@ def _report_local_ip():
         log(f"[sync] ✓ IP locale signalée : {ip}")
     except Exception as e:
         warn(f"[supabase] pi_report_local_ip: {e}")
+
+
+# Dernière valeur expires_at vraiment appliquée — comme _last_reported_local_ip,
+# évite de réécrire les fichiers /data/ et de recréer le contexte TLS à chaque
+# cycle de sync (5 min) quand le certificat n'a pas changé (cas normal, un
+# renouvellement n'arrive qu'environ tous les 60 jours).
+_last_local_cert_expires_at: str | None = None
+_local_tls_context: "ssl.SSLContext | None" = None
+
+_LOCAL_CERT_FILE = "/data/local_cert.pem"
+_LOCAL_KEY_FILE = "/data/local_key.pem"
+
+
+def _fetch_local_cert():
+    """Récupère le certificat HTTPS local du site (émis côté cloud — DNS-01 via
+    acme-client/Vercel cron, jamais sur le Pi, cf. web/src/lib/acme/issueCert.ts)
+    et recharge le contexte TLS du relais local (run_local_tls_relay) si la
+    valeur a changé (1ère émission ou renouvellement). Lecture seule, même
+    cadence que _report_local_ip (5 min, cf. _sync_all_to_ha) — un cycle en
+    plus après un renouvellement (tous les ~60 jours) est sans conséquence."""
+    global _last_local_cert_expires_at, _local_tls_context
+    if not INGEST_SECRET:
+        return
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:get_local_cert"
+        r = _supabase_rpc("pi_get_local_cert", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+        })
+        if not r.ok:
+            warn(f"[local-tls] pi_get_local_cert {r.status_code}: {r.text[:120]}")
+            return
+        rows = r.json()
+        if not rows:
+            return  # pas encore émis côté cloud (nouveau site, cron pas encore passé)
+        row = rows[0]
+        expires_at = row.get("expires_at")
+        if not expires_at or expires_at == _last_local_cert_expires_at:
+            return
+        with open(_LOCAL_CERT_FILE, "w") as f:
+            f.write(row["cert_pem"])
+        with open(_LOCAL_KEY_FILE, "w") as f:
+            f.write(row["key_pem"])
+        os.chmod(_LOCAL_KEY_FILE, 0o600)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(_LOCAL_CERT_FILE, _LOCAL_KEY_FILE)
+        _local_tls_context = context
+        _last_local_cert_expires_at = expires_at
+        log(f"[local-tls] ✓ Certificat local chargé (expire {expires_at})")
+    except Exception as e:
+        warn(f"[local-tls] {e}")
 
 
 def _report_alarm_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
@@ -10883,6 +10945,77 @@ def run_go2rtc_prefix_proxy():
         warn(f"[go2rtc-proxy] Erreur fatale : {e}")
 
 
+_LOCAL_WEB_UPSTREAM_ADDR = ("127.0.0.1", 8100)
+
+
+class _LocalTlsRelayHandler(socketserver.BaseRequestHandler):
+    """Relaie tel quel (aucune réécriture de chemin, contrairement à
+    _Go2rtcProxyHandler) vers l'add-on « Domoticium — Accès local » (port 8100,
+    même code source que web/, build local). Pas de vérification applicative
+    ici — l'app locale gère sa propre session (même mécanisme qu'un accès
+    direct non-TLS à 8100 aujourd'hui), ce relais ne fait que terminer le TLS."""
+
+    def handle(self):
+        client_sock = self.request  # déjà un ssl.SSLSocket, cf. _LocalTlsRelayServer.get_request
+        upstream = None
+        try:
+            client_sock.settimeout(10)
+            upstream = socket.create_connection(_LOCAL_WEB_UPSTREAM_ADDR, timeout=10)
+            client_sock.settimeout(None)
+            upstream.settimeout(None)
+            t = threading.Thread(target=_pipe_bytes, args=(client_sock, upstream), daemon=True)
+            t.start()
+            _pipe_bytes(upstream, client_sock)
+            t.join(timeout=5)
+        except OSError:
+            pass
+        except Exception as e:
+            warn(f"[local-tls] {e}")
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+
+class _LocalTlsRelayServer(_ReusableTCPServer):
+    """Enveloppe chaque connexion acceptée avec le contexte TLS COURANT
+    (relu à chaque accept(), jamais figé à la création du serveur) — permet à
+    _fetch_local_cert() de faire tourner un certificat renouvelé sans jamais
+    redémarrer ce serveur ni couper les connexions déjà en cours."""
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        if _local_tls_context is None:
+            sock.close()
+            raise OSError("Aucun certificat local disponible pour l'instant")
+        # Le handshake TLS se fait ici, de façon synchrone, dans la boucle
+        # d'accept() du serveur (pas dans le thread par connexion) — un délai
+        # borné évite qu'une connexion qui traîne (lenteur réseau ou abus)
+        # ne bloque l'acceptation des connexions suivantes indéfiniment.
+        sock.settimeout(10)
+        wrapped = _local_tls_context.wrap_socket(sock, server_side=True)
+        wrapped.settimeout(None)
+        return wrapped, addr
+
+
+def run_local_tls_relay():
+    """Relais HTTPS local (0.0.0.0:LOCAL_TLS_PORT → 127.0.0.1:8100) — attend qu'un
+    1er certificat soit chargé (_fetch_local_cert, cycle de sync 5 min) avant de
+    se lier : un site tout juste créé n'a pas encore de certificat émis côté
+    cloud (cron quotidien), ce n'est jamais une erreur à signaler en boucle."""
+    while _local_tls_context is None:
+        time.sleep(15)
+    try:
+        server = _LocalTlsRelayServer(("0.0.0.0", LOCAL_TLS_PORT), _LocalTlsRelayHandler)
+        server.daemon_threads = True
+        log(f"[local-tls] ✓ Relais HTTPS actif sur 0.0.0.0:{LOCAL_TLS_PORT} → 127.0.0.1:8100")
+        server.serve_forever()
+    except Exception as e:
+        warn(f"[local-tls] Erreur fatale : {e}")
+
+
 def _turn_refresh_loop():
     """Rafraîchit les identifiants TURN Cloudflare avant leur expiration (48h max) et
     redémarre Frigate pour que go2rtc les recharge. Nouvel essai dans 5 min si le
@@ -10938,6 +11071,8 @@ def run_bridge():
     threading.Thread(target=_run_camera_watchdog,    daemon=True).start()
     # Proxy /cameras → go2rtc (retire le préfixe imposé par le tunnel Cloudflare)
     threading.Thread(target=run_go2rtc_prefix_proxy, daemon=True).start()
+    # Relais HTTPS local (pastille 3 couleurs) → add-on "Domoticium — Accès local" (8100)
+    threading.Thread(target=run_local_tls_relay, daemon=True).start()
 
     # Serveur de commandes — bloquant, tourne dans le thread principal
     run_command_server()
