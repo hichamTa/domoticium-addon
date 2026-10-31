@@ -6165,6 +6165,7 @@ def _sync_all_to_ha():
     _backfill_camera_entity_links()
     _reconcile_device_states()
     _reconcile_alarm_state()
+    _report_local_ip()
 
     log("[sync] ✓ Terminé")
 
@@ -7084,6 +7085,46 @@ def _reconcile_alarm_state():
         return
     if _report_alarm_state_direct(entity_id, real_state, payload.get("attributes") or {}):
         log(f"[reconcile] alarme resynchronisée : {stored_state!r} → {real_state!r} (filet périodique)")
+
+
+# Dernière IP locale réellement signalée — évite un appel RPC à chaque cycle
+# de sync (5 min) quand rien n'a changé (cas normal, l'IP ne bouge presque
+# jamais une fois le bail DHCP établi). Pas besoin de persister across un
+# redémarrage de l'add-on : un rapport en plus après un redémarrage est sans
+# conséquence (idempotent côté SQL), juste évité ici pour le bruit des logs.
+_last_reported_local_ip: str | None = None
+
+
+def _report_local_ip():
+    """Signale l'IP locale (LAN) actuelle du boîtier à Supabase — chantier
+    pastille de statut 3 couleurs (2026-10-31) : le web a besoin de savoir à
+    quelle adresse joindre le boîtier en direct sur le réseau local (le nom
+    `pi-{slug}.local` en mDNS ne peut jamais avoir de certificat HTTPS valide
+    — remplacé par un vrai sous-domaine `{slug}.local.domoticium.fr` dont
+    l'enregistrement DNS doit suivre l'IP réelle du boîtier, qui peut changer
+    au gré du bail DHCP). Volontairement HORS de la boucle heartbeat (60s,
+    trop fréquent pour une valeur qui ne bouge presque jamais) — même cadence
+    que le reste de la réconciliation périodique (_sync_all_to_ha, 5 min).
+    Best-effort : un échec ici ne doit jamais interrompre le reste du cycle
+    de sync (cohérent avec tous les autres appels de cette fonction)."""
+    global _last_reported_local_ip
+    ip = _local_ipv4()
+    if not ip or ip == _last_reported_local_ip:
+        return
+    try:
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:local_ip:{ip}"
+        r = _supabase_rpc("pi_report_local_ip", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
+            "p_local_ip": ip,
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_local_ip {r.status_code}: {r.text[:120]}")
+            return
+        _last_reported_local_ip = ip
+        log(f"[sync] ✓ IP locale signalée : {ip}")
+    except Exception as e:
+        warn(f"[supabase] pi_report_local_ip: {e}")
 
 
 def _report_alarm_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
