@@ -2125,8 +2125,24 @@ def install_hacs() -> bool:
     # Étape 1 : formulaire "disclaimer" HACS — 4 cases à cocher obligatoires pour
     # continuer (acc_logs/acc_addons/acc_untested/acc_disable), fixes pour tout
     # utilisateur, cf. _show_config_form() officiel — aucun jugement à faire.
-    flow_resp = ha_post("/config/config_entries/flow", {"handler": "hacs"})
-    if not flow_resp.ok:
+    #
+    # Retry courte sur CET appel précis — bug réel trouvé en install réelle
+    # (2026-11-08) : juste après wait_for_ha() (qui ne vérifie QUE que l'API HTTP
+    # de base réponde, cf. son corps), le handler "hacs" n'était pas encore
+    # enregistré — 404 "Invalid handler specified". `custom_components/hacs`
+    # vient d'être chargé par le redémarrage HA Core qui précède cet appel ;
+    # son config_flow peut finir de s'enregistrer quelques secondes après que
+    # l'API elle-même répond déjà. Sans retry, tout le cycle échouait
+    # silencieusement et attendait le PROCHAIN redémarrage complet de l'add-on.
+    flow_resp = None
+    for attempt in range(1, 6):
+        flow_resp = ha_post("/config/config_entries/flow", {"handler": "hacs"})
+        if flow_resp.ok:
+            break
+        if flow_resp.status_code == 404 and attempt < 5:
+            warn(f"[hacs] Handler pas encore enregistré (tentative {attempt}/5) — nouvelle tentative dans 5s")
+            time.sleep(5)
+            continue
         warn(f"[hacs] Flow impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
         return False
     flow = _unwrap(flow_resp.json())
@@ -3861,6 +3877,60 @@ def _mqtt_is_done(result):
     return False
 
 
+def _default_for_required_field(field: dict):
+    """Valeur par défaut raisonnable pour UN champ de schéma HA marqué "required"
+    sans valeur déjà connue (connexion broker) — cf. `_fill_required_schema_defaults`.
+    Ne couvre QUE ce qui peut apparaître dans une section "avancé" repliée (booléens,
+    listes déroulantes) ; un champ required d'un autre type (texte/fichier libre sans
+    défaut évident) n'est pas deviné, laissé de côté (HA renverra une erreur explicite
+    plutôt qu'une valeur inventée silencieusement)."""
+    if "default" in field:
+        return field["default"]
+    selector = field.get("selector") or {}
+    if "boolean" in selector:
+        return False
+    if "select" in selector:
+        options = (selector["select"] or {}).get("options") or []
+        # Options = liste de strings ("off"/"tcp"/...) OU de {"value","label"} —
+        # les deux formes apparaissent dans le même schéma HA (ex: set_ca_cert vs transport).
+        values = [o if isinstance(o, str) else o.get("value") for o in options]
+        for preferred in ("off", "tcp", "none", "disabled"):
+            if preferred in values:
+                return preferred
+        return values[0] if values else None
+    return None
+
+
+def _fill_required_schema_defaults(schema: list, known: dict) -> dict:
+    """Parcourt un schéma de formulaire HA et complète, pour chaque champ "required"
+    PAS déjà couvert par `known` (connexion broker), une valeur par défaut sûre —
+    y compris récursivement dans les sections "expandable" (repliées dans l'UI,
+    mais dont Postgres... pardon, HA valide quand même les champs required à
+    l'intérieur). Bug réel trouvé en install réelle (2026-11-08) : le schéma MQTT HA
+    a gagné un groupe "other_settings" (TLS/transport avancés) marqué required — le
+    payload ne le fournissant jamais, HA refusait tout le formulaire ("other_settings:
+    required key not provided"), MQTT ne se configurait jamais, et l'add-on se
+    déclarait "Configuration INCOMPLÈTE" en boucle à chaque démarrage. Générique
+    plutôt que spécifique à `other_settings` : protège aussi contre un futur champ
+    required supplémentaire du même genre, sans dépendre d'un nom figé."""
+    extra = {}
+    for field in schema:
+        name = field.get("name")
+        if not name or name in known:
+            continue
+        if field.get("type") == "expandable":
+            sub = _fill_required_schema_defaults(field.get("schema") or [], {})
+            if field.get("required") or sub:
+                extra[name] = sub
+            continue
+        if not field.get("required"):
+            continue
+        value = _default_for_required_field(field)
+        if value is not None:
+            extra[name] = value
+    return extra
+
+
 def _build_mqtt_broker_payload(schema: list) -> dict:
     """Construit le payload du flow MQTT HA pour Mosquitto local (core-mosquitto:1883, pas de TLS).
     Si schema vide → étape de confirmation sans champ → payload {}."""
@@ -3885,6 +3955,8 @@ def _build_mqtt_broker_payload(schema: list) -> dict:
         if k in schema_names:
             payload[k] = MOSQUITTO_PASS
             break
+
+    payload.update(_fill_required_schema_defaults(schema, payload))
 
     return payload
 
