@@ -3116,7 +3116,12 @@ def _ensure_alarmo_sos_automation(devices_list):
             "target": {"entity_id": panel_entity_id},
         }],
     }
-    _handle_ha_command(json.dumps(auto_cfg).encode())
+    # (2026-11-09) Retour vérifié — avant ça, un rejet de _validate_ha_action_steps
+    # (ex: alarm_control_panel non trusted) logguait quand même "✓ câblé" en-dessous,
+    # cf. _TRUSTED_WIRING_SERVICES pour le détail du bug réel trouvé ainsi.
+    if not _handle_ha_command(json.dumps(auto_cfg).encode(), trusted_wiring=True):
+        warn(f"[alarmo] Échec câblage SOS sur '{friendly_name}' — voir le warn [ha/command] ci-dessus")
+        return
     _sos_wired_for = friendly_name
     log(f"[alarmo] ✓ SOS câblé sur le clavier '{friendly_name}' → {panel_entity_id}")
 
@@ -3228,7 +3233,9 @@ def _ensure_alarmo_keypad_control(devices_list):
             ],
         }],
     }
-    _handle_ha_command(json.dumps(arm_cfg).encode())
+    # (2026-11-09) Retours vérifiés — cf. commentaire équivalent dans
+    # _ensure_alarmo_sos_automation pour le détail du bug réel trouvé ainsi.
+    arm_ok = _handle_ha_command(json.dumps(arm_cfg).encode(), trusted_wiring=True)
 
     feedback_cfg = {
         "type": "automation_upsert",
@@ -3251,8 +3258,11 @@ def _ensure_alarmo_keypad_control(devices_list):
             ],
         }],
     }
-    _handle_ha_command(json.dumps(feedback_cfg).encode())
+    feedback_ok = _handle_ha_command(json.dumps(feedback_cfg).encode(), trusted_wiring=True)
 
+    if not (arm_ok and feedback_ok):
+        warn(f"[alarmo] Échec câblage clavier sur '{friendly_name}' (arm={bool(arm_ok)}, feedback={bool(feedback_ok)}) — voir le warn [ha/command] ci-dessus")
+        return
     _keypad_wired_for = friendly_name
     log(f"[alarmo] ✓ Armement/désarmement clavier câblé sur '{friendly_name}' ↔ {panel_entity_id}")
 
@@ -7765,7 +7775,7 @@ def _get_ha_device_id(entity_id=None, ieee_address=None, matter_node_id=None):
     return None
 
 
-def _validate_ha_action_steps(steps) -> bool:
+def _validate_ha_action_steps(steps, trusted: bool = False) -> bool:
     """Vérifie récursivement que chaque appel de service d'une séquence
     d'actions HA respecte ALLOWED_SERVICES. Audit add-on 2026-09-22 :
     script_upsert/automation_upsert (ci-dessous) construisaient un script/
@@ -7779,6 +7789,11 @@ def _validate_ha_action_steps(steps) -> bool:
     toute autre forme (wait_for_trigger, if/then, parallel, event…) est
     refusée par défaut plutôt que de maintenir une liste blanche de clés de
     contrôle qui pourrait devenir incomplète.
+
+    `trusted=True` (2026-11-09) : réservé aux 2 automatisations internes de
+    câblage clavier/SOS Alarmo, jamais à un appel app-facing — cf.
+    _TRUSTED_WIRING_SERVICES pour le détail de pourquoi c'est sûr pour ces
+    2 cas précis uniquement.
     """
     if not isinstance(steps, list):
         return False
@@ -7790,30 +7805,37 @@ def _validate_ha_action_steps(steps) -> bool:
             if not isinstance(svc, str) or "." not in svc:
                 return False
             domain, _, verb = svc.partition(".")
-            if verb not in ALLOWED_SERVICES.get(domain, set()):
-                return False
-            continue
+            if verb in ALLOWED_SERVICES.get(domain, set()):
+                continue
+            if trusted and verb in _TRUSTED_WIRING_SERVICES.get(domain, set()):
+                continue
+            return False
         if "delay" in step:
             continue
         if "repeat" in step and isinstance(step["repeat"], dict):
-            if not _validate_ha_action_steps(step["repeat"].get("sequence", [])):
+            if not _validate_ha_action_steps(step["repeat"].get("sequence", []), trusted=trusted):
                 return False
             continue
         if "choose" in step and isinstance(step["choose"], list):
             for branch in step["choose"]:
-                if not isinstance(branch, dict) or not _validate_ha_action_steps(branch.get("sequence", [])):
+                if not isinstance(branch, dict) or not _validate_ha_action_steps(branch.get("sequence", []), trusted=trusted):
                     return False
-            if "default" in step and not _validate_ha_action_steps(step.get("default", [])):
+            if "default" in step and not _validate_ha_action_steps(step.get("default", []), trusted=trusted):
                 return False
             continue
         return False
     return True
 
 
-def _handle_ha_command(payload: bytes) -> bool | dict:
+def _handle_ha_command(payload: bytes, trusted_wiring: bool = False) -> bool | dict:
     """Exécute une commande ha/command (appelée en direct depuis Python — cf.
     docstring de _validate_ha_action_steps, ce topic MQTT lui-même n'existe
     plus — ET depuis /ha-command, la vraie route HTTP app-facing).
+
+    `trusted_wiring=True` (2026-11-09) : réservé aux 2 appelants internes
+    Alarmo SOS/clavier (cf. _TRUSTED_WIRING_SERVICES) — jamais passé par
+    _handle_ha_command_route (route app-facing), qui garde la valeur par
+    défaut False et donc la whitelist stricte ALLOWED_SERVICES seule.
 
     Retourne True/False (audit add-on 2026-09-22) : jusqu'ici cette fonction
     ne retournait jamais rien, et _handle_ha_command_route répondait "ok" au
@@ -7956,7 +7978,7 @@ def _handle_ha_command(payload: bytes) -> bool | dict:
             # web n'aurait donc jamais atteint HA, quelle que soit la valeur envoyée.
             # Repris depuis data (repli "single", comportement historique préservé).
             action = data.get("action", [])
-            if not _validate_ha_action_steps(action):
+            if not _validate_ha_action_steps(action, trusted=trusted_wiring):
                 warn(f"[ha/command] automation_upsert refusé (service non autorisé dans action) : {object_id}")
                 return False
             auto_cfg = {
@@ -9086,6 +9108,26 @@ ALLOWED_SERVICES = {
     # plus haut) — absent jusqu'ici, un appel automation.turn_on/turn_off était
     # rejeté en 403.
     "automation":    {"turn_on", "turn_off", "toggle"},
+}
+
+# (2026-11-09) Services supplémentaires autorisés UNIQUEMENT pour les 2 automatisations
+# internes de câblage clavier/SOS Alarmo (_ensure_alarmo_sos_automation,
+# _ensure_alarmo_keypad_control) — JAMAIS pour la route /ha-command app-facing ni pour
+# aucun autre appelant. Bug réel trouvé en conditions réelles (2026-11-09, clavier Frient
+# réappairé) : alarm_control_panel avait été retiré d'ALLOWED_SERVICES le 2026-09-22 pour
+# fermer un vrai trou de sécurité côté route générique /command (cf. son commentaire) —
+# mais _validate_ha_action_steps() est la MÊME fonction utilisée pour automation_upsert,
+# donc ce retrait bloquait AUSSI ces 2 automatisations internes, légitimes et sûres
+# (action/payload 100% construits en Python ici, jamais depuis une requête web/client —
+# alarm_control_panel.alarm_* passe le code tapé à Alarmo qui reste seul juge, exactement
+# la méthode officiellement recommandée par Alarmo pour un clavier physique ; mqtt.publish
+# cible un topic et un payload entièrement fixés par ce code, jamais une valeur entrée par
+# l'appelant). Le rejet silencieux (retour False jamais vérifié par ces 2 appelants, cf.
+# docstring _handle_ha_command) a fait croire pendant toute une session de debug à un
+# problème de détection Zigbee/Z2M, alors que la détection était correcte du début à la fin.
+_TRUSTED_WIRING_SERVICES = {
+    "alarm_control_panel": {"alarm_disarm", "alarm_arm_home", "alarm_arm_night", "alarm_arm_away", "alarm_trigger"},
+    "mqtt": {"publish"},
 }
 
 
