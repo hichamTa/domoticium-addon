@@ -3035,6 +3035,7 @@ def _find_ias_ace_keypad(devices_list, required_actions: set[str]) -> str | None
 
 _SOS_AUTOMATION_OBJECT_ID = "domoticium_sos_trigger"
 _sos_wired_for: str | None = None  # friendly_name du clavier déjà câblé — évite de republier l'automation à chaque cycle bridge/devices si rien n'a changé
+_sos_no_match_logged = False  # (2026-11-09) évite de spammer les logs toutes les ~5min pour un site sans clavier — log une seule fois par transition, cf. commentaire sur son utilisation plus bas
 
 
 def _ensure_alarmo_sos_automation(devices_list):
@@ -3056,9 +3057,14 @@ def _ensure_alarmo_sos_automation(devices_list):
     le rapporte correctement), mais un test réel sur le clavier physique est
     nécessaire pour confirmer la fiabilité réelle du bouton lui-même, pas garanti
     par ce fix seul."""
-    global _sos_wired_for
+    global _sos_wired_for, _sos_no_match_logged
     area_id, _ = _alarmo_get_sole_area()
     if not area_id:
+        # (2026-11-09) Diagnostic ajouté après un cas réel où ce retour silencieux
+        # a été pris, à tort, pour un problème de détection du clavier (alors
+        # qu'Alarmo/sa zone n'étaient en fait pas la cause) — ce cas est rare
+        # (avant/juste après l'installation d'Alarmo) donc pas de risque de spam.
+        log(f"[alarmo] SOS: zone Alarmo introuvable ({len(devices_list)} devices reçus) — rien câblé pour l'instant")
         return  # Alarmo pas encore installé/configuré
 
     friendly_name = _find_ias_ace_keypad(devices_list, {"emergency"})
@@ -3074,12 +3080,19 @@ def _ensure_alarmo_sos_automation(devices_list):
             }).encode())
             log(f"[alarmo] SOS retiré (plus de clavier compatible appairé, était câblé sur '{_sos_wired_for}')")
             _sos_wired_for = None
+        # (2026-11-09) Une seule fois par transition vers "aucun match" — sinon
+        # spam toutes les ~5min pour n'importe quel site sans clavier SOS.
+        if not _sos_no_match_logged:
+            log(f"[alarmo] SOS: aucun clavier IAS ACE (action='emergency') parmi {len(devices_list)} devices Zigbee reçus")
+            _sos_no_match_logged = True
         return
+    _sos_no_match_logged = False
     if friendly_name == _sos_wired_for:
         return  # déjà câblé sans changement
 
     panel_entity_id = _alarmo_panel_entity_id(area_id)
     if not panel_entity_id:
+        log(f"[alarmo] SOS: clavier '{friendly_name}' détecté mais panel_entity_id introuvable pour la zone '{area_id}' — rien câblé")
         return
 
     auto_cfg = {
@@ -3111,6 +3124,7 @@ def _ensure_alarmo_sos_automation(devices_list):
 _KEYPAD_ARM_OBJECT_ID = "domoticium_keypad_arm"
 _KEYPAD_FEEDBACK_OBJECT_ID = "domoticium_keypad_feedback"
 _keypad_wired_for: str | None = None  # friendly_name du clavier déjà câblé (arm/disarm + retour LED)
+_keypad_no_match_logged = False  # (2026-11-09) même principe anti-spam que _sos_no_match_logged
 
 # mode clavier (ZCL IAS ACE) → service Alarmo à appeler, avec le code tapé
 _KEYPAD_ACTION_TO_SERVICE = {
@@ -3154,9 +3168,10 @@ def _ensure_alarmo_keypad_control(devices_list):
     Même précondition et même détection générique que _ensure_alarmo_sos_automation
     (cf. _find_ias_ace_keypad) — n'importe quel clavier conforme au cluster Zigbee
     standard IAS ACE, pas un modèle figé."""
-    global _keypad_wired_for
+    global _keypad_wired_for, _keypad_no_match_logged
     area_id, _ = _alarmo_get_sole_area()
     if not area_id:
+        log(f"[alarmo] Clavier: zone Alarmo introuvable ({len(devices_list)} devices reçus) — rien câblé pour l'instant")
         return  # Alarmo pas encore installé/configuré
 
     friendly_name = _find_ias_ace_keypad(devices_list, {"disarm", "arm_all_zones"})
@@ -3173,12 +3188,17 @@ def _ensure_alarmo_keypad_control(devices_list):
             }).encode())
             log(f"[alarmo] Armement/désarmement clavier retiré (plus de clavier compatible appairé, était câblé sur '{_keypad_wired_for}')")
             _keypad_wired_for = None
+        if not _keypad_no_match_logged:
+            log(f"[alarmo] Clavier: aucun clavier IAS ACE (action avec disarm+arm_all_zones) parmi {len(devices_list)} devices Zigbee reçus")
+            _keypad_no_match_logged = True
         return
+    _keypad_no_match_logged = False
     if friendly_name == _keypad_wired_for:
         return
 
     panel_entity_id = _alarmo_panel_entity_id(area_id)
     if not panel_entity_id:
+        log(f"[alarmo] Clavier: '{friendly_name}' détecté mais panel_entity_id introuvable pour la zone '{area_id}' — rien câblé")
         return
 
     keypad_topic = f"zigbee2mqtt/{friendly_name}"
