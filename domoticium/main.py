@@ -4073,23 +4073,32 @@ def _sync_site_location():
         warn(f"[site-location] écriture marker : {e}")
 
 
-_WATCHDOG_ENABLED_MARKER = "/data/.watchdog_enabled"
+_WATCHDOG_ENABLED_MARKER = "/data/.watchdog_enabled_v2"
 
 
 def _enable_watchdogs_once():
     """Active le redémarrage automatique du Supervisor ("Watchdog", visible dans
-    Paramètres → Modules complémentaires → [add-on] → interrupteur Watchdog) pour
-    Domoticium et les add-ons dont il dépend, si installés. Ne protège que contre un
-    add-on qui CRASHE (process qui meurt) — pas contre un service interne qui reste
-    bloqué sans faire planter le container (ex: incident cmd-server du 2026-07-22,
-    déjà corrigé par ailleurs) : le Watchdog Supervisor n'a pas de sonde applicative,
-    juste "le process tourne-t-il encore ?". Complémentaire, pas un remplacement, des
-    correctifs ciblés. `/addons/self/options` = API Supervisor dédiée pour qu'un
-    add-on se configure lui-même sans connaître son propre slug installé (qui varie
-    selon le dépôt d'installation). Idempotent via marker, retente à chaque démarrage
-    tant qu'un appel a échoué. Frigate inclus délibérément (demande explicite
-    d'Hicham, 2026-08-01 — aucun problème observé en pratique malgré un risque
-    théorique de faux positif documenté ailleurs, jugé acceptable)."""
+    Paramètres → Applications → [add-on] → interrupteur Watchdog) pour Domoticium
+    et TOUS les add-ons installés par Domoticium, si présents sur ce site. Ne
+    protège que contre un add-on qui CRASHE (process qui meurt) — pas contre un
+    service interne qui reste bloqué sans faire planter le container (ex: incident
+    cmd-server du 2026-07-22, déjà corrigé par ailleurs) : le Watchdog Supervisor
+    n'a pas de sonde applicative, juste "le process tourne-t-il encore ?".
+    Complémentaire, pas un remplacement, des correctifs ciblés. `/addons/self/options`
+    = API Supervisor dédiée pour qu'un add-on se configure lui-même sans connaître
+    son propre slug installé (qui varie selon le dépôt d'installation). Idempotent
+    via marker, retente à chaque démarrage tant qu'un appel a échoué. Frigate inclus
+    délibérément (demande explicite d'Hicham, 2026-08-01 — aucun problème observé en
+    pratique malgré un risque théorique de faux positif documenté ailleurs, jugé
+    acceptable). `LOCAL_WEB_SLUG` ("Domoticium — Accès local") ajouté le 2026-11-09
+    (demande Hicham : activer le Watchdog sur TOUTES les apps installées, il
+    manquait à la liste d'origine) — marker renommé en `_v2` pour que les sites déjà
+    déployés (ancien marker déjà écrit) repassent une fois par cette fonction et
+    couvrent ce nouvel add-on. cloudflared tourne en sous-processus DANS le
+    container Domoticium lui-même (pas un add-on Supervisor séparé) — déjà couvert
+    par le Watchdog "self" ci-dessus, pas d'entrée Watchdog propre possible côté
+    Supervisor. Alarmo est un composant HA natif (Marketplace), pas un add-on — la
+    notion de Watchdog Supervisor ne s'applique pas à lui non plus."""
     if os.path.exists(_WATCHDOG_ENABLED_MARKER):
         return
     ok = True
@@ -4104,7 +4113,7 @@ def _enable_watchdogs_once():
         warn(f"[watchdog] Domoticium : {e}")
         ok = False
 
-    for slug in (MOSQUITTO_SLUG, FRIGATE_SLUG, MATTER_SLUG, Z2M_SLUG, THREAD_SLUG):
+    for slug in (MOSQUITTO_SLUG, FRIGATE_SLUG, MATTER_SLUG, Z2M_SLUG, THREAD_SLUG, LOCAL_WEB_SLUG):
         if not _is_addon_installed(slug):
             continue
         try:
