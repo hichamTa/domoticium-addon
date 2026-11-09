@@ -2005,7 +2005,27 @@ def _hacs_installed_version() -> str | None:
     try:
         with open(os.path.join(HACS_DIR, "manifest.json")) as f:
             return json.load(f).get("version")
-    except Exception:
+    except Exception as e:
+        # ⚠️ DIAGNOSTIC TEMPORAIRE (2026-11-09) — bug réel trouvé en install réelle :
+        # _hacs_deploy_files() loggait "✓ HACS déployé" (aucune exception levée),
+        # mais au redémarrage suivant de l'add-on ce check ne retrouvait plus rien
+        # ("Non déployé — dépôt des fichiers…" relancé). L'exception était jusqu'ici
+        # avalée en silence (`except Exception: return None`) — aucun moyen de savoir
+        # SI le fichier est absent, SI le dossier est absent, ou SI c'est une erreur
+        # de lecture/permission différente. Loggé une seule fois (pas à chaque appel,
+        # cette fonction tourne souvent) pour ne pas noyer le journal. À retirer une
+        # fois la cause réelle trouvée.
+        if not getattr(_hacs_installed_version, "_logged_once", False):
+            _hacs_installed_version._logged_once = True
+            exists = os.path.exists(HACS_DIR)
+            listing = None
+            if exists:
+                try:
+                    listing = os.listdir(HACS_DIR)
+                except Exception as le:
+                    listing = f"<listdir impossible: {le}>"
+            warn(f"[hacs][diag] manifest.json illisible ({type(e).__name__}: {e}) — "
+                 f"HACS_DIR={HACS_DIR!r} existe={exists} contenu={listing}")
         return None
 
 
@@ -2049,6 +2069,15 @@ def _hacs_deploy_files() -> bool:
                     continue
                 zf.extract(member, HACS_DIR)
         log(f"✓ HACS {release.get('tag_name', '?')} déployé → {HACS_DIR}")
+        # ⚠️ DIAGNOSTIC TEMPORAIRE (2026-11-09, cf. _hacs_installed_version) — vérifie
+        # IMMÉDIATEMENT après extraction que manifest.json est bien là et lisible,
+        # pour savoir si le problème est l'extraction elle-même ou autre chose
+        # (persistance du volume, scan HA Core) qui se passe APRÈS ce point.
+        manifest_path = os.path.join(HACS_DIR, "manifest.json")
+        if os.path.exists(manifest_path):
+            log(f"[hacs][diag] manifest.json présent juste après extraction ({os.path.getsize(manifest_path)} octets)")
+        else:
+            warn(f"[hacs][diag] manifest.json ABSENT juste après extraction (dossier : {os.listdir(HACS_DIR) if os.path.isdir(HACS_DIR) else '<dossier absent>'})")
         return True
     except Exception as e:
         warn(f"[hacs] Téléchargement/installation impossible : {e}")
