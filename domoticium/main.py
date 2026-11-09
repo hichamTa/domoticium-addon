@@ -4464,6 +4464,48 @@ def _ensure_ha_trusted_proxy():
     return True
 
 
+# ⚠️ DIAGNOSTIC TEMPORAIRE (2026-11-09) — bug HACS "Cannot find integration hacs"
+# toujours pas expliqué malgré un manifest.json confirmé présent et lisible juste
+# après extraction (cf. _hacs_installed_version/_hacs_deploy_files). Le journal HA
+# accessible à distance (/api/hassio/core/logs) est trop tronqué pour voir le détail
+# du scan de custom_components au démarrage — on passe homeassistant.loader/
+# config_entries/setup en debug pour la PROCHAINE investigation, le temps de
+# comprendre la vraie cause. À retirer une fois résolu (ou laisser si Hicham préfère
+# garder ce niveau de détail en permanence sur le site de test).
+_HA_DEBUG_LOGGER_MARKER = "# domoticium-diag-logger-2026-11-09"
+
+
+def _ensure_ha_debug_logger_once():
+    main_cfg = "/homeassistant/configuration.yaml"
+    try:
+        with open(main_cfg) as f:
+            content = f.read()
+    except FileNotFoundError:
+        return False
+
+    if _HA_DEBUG_LOGGER_MARKER in content:
+        return False  # déjà fait
+
+    if re.search(r"(?m)^logger:\s*$", content):
+        warn("[diag-logger] Un bloc 'logger:' existe déjà dans configuration.yaml — "
+             "pas touché, ajouter homeassistant.loader/config_entries/setup en debug à la main si besoin.")
+        return False
+
+    block = (
+        f"\n{_HA_DEBUG_LOGGER_MARKER} — diagnostic temporaire bug HACS, à retirer une fois résolu\n"
+        "logger:\n"
+        "  default: info\n"
+        "  logs:\n"
+        "    homeassistant.loader: debug\n"
+        "    homeassistant.config_entries: debug\n"
+        "    homeassistant.setup: debug\n"
+    )
+    with open(main_cfg, "a") as f:
+        f.write(block)
+    log("✓ configuration.yaml : logger debug temporaire ajouté (diagnostic bug HACS)")
+    return True
+
+
 def _setup_step(label: str, fn, check_fn, attempts: int = 3, backoff=(5, 15)) -> bool:
     """Exécute une étape de run_setup() avec retry — audit add-on 2026-09-22 :
     aucune des fonctions install_*/setup_* ne lève d'exception proprement
@@ -11219,13 +11261,15 @@ if __name__ == "__main__":
     # (appairage Zigbee/Matter en cours plus loin dans l'installation) plutôt que de
     # risquer de tomber en plein milieu.
     wait_for_ha()
-    if _ensure_ha_trusted_proxy():
-        log("[trusted-proxy] Redémarrage HA Core pour appliquer le nouveau réglage…")
+    _needs_ha_restart = _ensure_ha_trusted_proxy()
+    _needs_ha_restart = _ensure_ha_debug_logger_once() or _needs_ha_restart
+    if _needs_ha_restart:
+        log("[setup] Redémarrage HA Core pour appliquer configuration.yaml…")
         try:
             requests.post(f"{SUP}/homeassistant/restart",
                           headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}, timeout=60)
         except Exception as e:
-            warn(f"[trusted-proxy] Erreur restart HA : {e}")
+            warn(f"[setup] Erreur restart HA : {e}")
         wait_for_ha()
 
     # Écrire la config Frigate AVANT tout le reste.
