@@ -6401,6 +6401,39 @@ def _relay_ha_state(entity_id: str, state_val: str, attributes: dict):
         _state_batch[entity_id] = (state_val, attributes)
 
 
+def _push_initial_entity_state(entity_id: str):
+    """Pousse l'état ACTUEL d'une entité tout juste créée dans HA — comble un vrai
+    trou trouvé en conditions réelles (2026-11-10) : un appareil Matter fraîchement
+    commissionné (ampoule KAJPLATS) restait avec `state: {}` indéfiniment côté app
+    alors que HA le montrait bien allumé. Cause : `state` n'est alimenté QUE par un
+    `state_changed` relayé (run_ha_ws_bridge) — pour une entité qu'on vient de créer,
+    HA émet en général UN SEUL `state_changed` (sa toute première valeur), souvent
+    AVANT que `entity_registry_updated(create)` lui-même n'arrive, ou avant que ce
+    thread ne soit prêt à le traiter — l'app ne le voit jamais, et comme ce n'est
+    pas "unavailable"/"unknown", _reconcile_device_states() (filet existant,
+    2026-09-02) ne le rattrape pas non plus : il ne corrige QUE `online`, pas un
+    `state` resté vide. Un Zigbee tout juste appairé n'a jamais ce trou car Z2M
+    republie son état complet dès l'appairage (indépendant de ce mécanisme HA).
+
+    Petit délai avant lecture : juste après sa création, l'entité peut encore être
+    à "unknown" le temps que HA lise sa 1ère valeur réelle (Matter en particulier,
+    qui interroge le device juste après commissioning) — lire tout de suite
+    pousserait "unknown" au lieu du vrai état, revu seulement au state_changed
+    suivant (qui peut ne jamais arriver si l'état n'évolue plus ensuite)."""
+    time.sleep(3)
+    r = ha_get(f"/states/{entity_id}")
+    if not r.ok:
+        return
+    try:
+        s = r.json()
+    except Exception:
+        return
+    state_val = s.get("state", "")
+    if state_val in ("", "unknown"):
+        return  # pas encore prêt — un futur state_changed réel le rattrapera
+    _relay_ha_state(entity_id, state_val, s.get("attributes") or {})
+
+
 def run_ha_ws_bridge():
     """Thread permanent : écoute HA WebSocket → persiste état + registre vers Supabase (ingest).
     Seul canal d'état événementiel — remplace entièrement EMQX et les automations HA
@@ -6449,6 +6482,12 @@ def run_ha_ws_bridge():
                             target=_post_ingest_registry,
                             args=(entity_id, ha_action, data),
                             daemon=True,
+                        ).start()
+                    # (2026-11-10) cf. docstring _push_initial_entity_state — comble le
+                    # trou "state: {}" pour un device Matter/natif tout juste créé.
+                    if entity_id and action == "create":
+                        threading.Thread(
+                            target=_push_initial_entity_state, args=(entity_id,), daemon=True,
                         ).start()
                     # Une entité créée/retirée dans HA (Matter ou natif — Zigbee est
                     # déjà instantané via zigbee2mqtt/bridge/devices, cf. on_local_message)
