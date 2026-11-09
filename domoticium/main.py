@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, io, json, logging, logging.handlers, os, re, secrets, socket, socketserver, ssl, struct, subprocess, sys, threading, time, urllib.parse, uuid, zipfile
+import base64, hashlib, hmac, http.server, json, logging, logging.handlers, os, re, secrets, socket, socketserver, ssl, struct, subprocess, sys, threading, time, urllib.parse, uuid
 from datetime import datetime, date, timedelta, timezone
 import paho.mqtt.client as mqtt
 import requests
@@ -178,12 +178,6 @@ Z2M_SLUG       = "45df7312_zigbee2mqtt"
 MATTER_SLUG    = "core_matter_server"
 THREAD_SLUG    = "core_openthread_border_router"
 FRIGATE_REPO   = "https://github.com/hichamTa/frigate-hass-addons"
-# HACS : intégrations HA classiques (custom_component) installées via HACS plutôt
-# qu'en add-on Supervisor — cf. install_hacs(). Zip de release GitHub, pas de
-# script bash interactif. Repo public, vérifié manuellement (2026-07-27).
-HACS_GH_REPO     = "hacs/integration"
-HACS_DIR         = "/homeassistant/custom_components/hacs"
-ALARMO_FULL_NAME = "nielsfaber/alarmo"
 FRIGATE_SLUG   = "582436be_frigate"
 # Ancien dépôt Frigate (officiel, upstream) — Frigate n'y lit JAMAIS notre frigate.yml
 # (CONFIG_FILE non défini dans son config.yaml, donc find_config_file() résout vers son
@@ -2001,249 +1995,47 @@ def _setup_frigate_auth_once():
     log("[frigate] ✓ Auth gérée via YAML (auth.enabled: false dans frigate.yml)")
 
 
-def _hacs_installed_version() -> str | None:
-    try:
-        with open(os.path.join(HACS_DIR, "manifest.json")) as f:
-            return json.load(f).get("version")
-    except Exception as e:
-        # ⚠️ DIAGNOSTIC TEMPORAIRE (2026-11-09) — bug réel trouvé en install réelle :
-        # _hacs_deploy_files() loggait "✓ HACS déployé" (aucune exception levée),
-        # mais au redémarrage suivant de l'add-on ce check ne retrouvait plus rien
-        # ("Non déployé — dépôt des fichiers…" relancé). L'exception était jusqu'ici
-        # avalée en silence (`except Exception: return None`) — aucun moyen de savoir
-        # SI le fichier est absent, SI le dossier est absent, ou SI c'est une erreur
-        # de lecture/permission différente. Loggé une seule fois (pas à chaque appel,
-        # cette fonction tourne souvent) pour ne pas noyer le journal. À retirer une
-        # fois la cause réelle trouvée.
-        if not getattr(_hacs_installed_version, "_logged_once", False):
-            _hacs_installed_version._logged_once = True
-            exists = os.path.exists(HACS_DIR)
-            listing = None
-            if exists:
-                try:
-                    listing = os.listdir(HACS_DIR)
-                except Exception as le:
-                    listing = f"<listdir impossible: {le}>"
-            warn(f"[hacs][diag] manifest.json illisible ({type(e).__name__}: {e}) — "
-                 f"HACS_DIR={HACS_DIR!r} existe={exists} contenu={listing}")
+def _marketplace_find_repository(domain: str) -> dict | None:
+    """Retourne le dict repo Marketplace (id/installed/available_version…) pour un
+    domain d'intégration donné. Remplace l'ancien mécanisme HACS autonome : depuis
+    Home Assistant 2026.11, HACS est intégré nativement à HA sous le nom
+    "Marketplace" (confirmé par la doc officielle hacs.xyz : "HACS is built into
+    Home Assistant as the Marketplace starting with 2026.11") — plus besoin de
+    déployer/autoriser quoi que ce soit séparément, le composant `marketplace` est
+    déjà chargé par défaut. API découverte en direct le 2026-11-09 (aucune doc
+    publique trouvée au moment d'écrire ceci) via le WebSocket HA :
+    `marketplace/repositories/list` (aucun paramètre, retourne tout le catalogue)
+    et `marketplace/repository/info` (`repository_id`) pour un item précis."""
+    result = _ha_ws_call("marketplace/repositories/list")
+    if not result or not result.get("success"):
+        warn(f"[marketplace] Liste des dépôts impossible : {result}")
         return None
-
-
-def _hacs_config_entry_exists() -> bool:
-    try:
-        with open("/homeassistant/.storage/core.config_entries") as f:
-            storage = json.load(f)
-        entries = storage.get("data", {}).get("entries", [])
-        return any(e.get("domain") == "hacs" for e in entries)
-    except Exception as e:
-        warn(f"[hacs] Lecture core.config_entries impossible : {e}")
-        return False
-
-
-def _hacs_deploy_files() -> bool:
-    try:
-        r = requests.get(f"https://api.github.com/repos/{HACS_GH_REPO}/releases/latest", timeout=15)
-        r.raise_for_status()
-        release = r.json()
-        asset = next((a for a in release.get("assets", []) if a.get("name") == "hacs.zip"), None)
-        if not asset:
-            warn("[hacs] Aucun asset hacs.zip trouvé sur la dernière release GitHub — abandon")
-            return False
-        zip_resp = requests.get(asset["browser_download_url"], timeout=30)
-        zip_resp.raise_for_status()
-        os.makedirs(HACS_DIR, exist_ok=True)
-        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
-            # Protection zip-slip (audit add-on 2026-09-22) : extractall() sans
-            # validation suit tel quel un chemin membre du zip du genre
-            # "../../etc/cron.d/x" et écrirait hors de HACS_DIR — risque faible
-            # en pratique (dépôt officiel hacs/integration, HTTPS, upstream de
-            # confiance) mais un vrai point de confiance supply-chain : si ce
-            # compte GitHub était un jour compromis, le zip s'exécuterait avec
-            # les mêmes droits que l'add-on sur chaque site client. Chaque
-            # membre est résolu et vérifié rester sous HACS_DIR avant extraction.
-            hacs_dir_real = os.path.realpath(HACS_DIR)
-            for member in zf.namelist():
-                dest = os.path.realpath(os.path.join(HACS_DIR, member))
-                if not (dest == hacs_dir_real or dest.startswith(hacs_dir_real + os.sep)):
-                    warn(f"[hacs] Membre zip suspect ignoré (hors de {HACS_DIR}) : {member!r}")
-                    continue
-                zf.extract(member, HACS_DIR)
-        log(f"✓ HACS {release.get('tag_name', '?')} déployé → {HACS_DIR}")
-        # ⚠️ DIAGNOSTIC TEMPORAIRE (2026-11-09, cf. _hacs_installed_version) — vérifie
-        # IMMÉDIATEMENT après extraction que manifest.json est bien là et lisible,
-        # pour savoir si le problème est l'extraction elle-même ou autre chose
-        # (persistance du volume, scan HA Core) qui se passe APRÈS ce point.
-        manifest_path = os.path.join(HACS_DIR, "manifest.json")
-        if os.path.exists(manifest_path):
-            log(f"[hacs][diag] manifest.json présent juste après extraction ({os.path.getsize(manifest_path)} octets)")
-        else:
-            warn(f"[hacs][diag] manifest.json ABSENT juste après extraction (dossier : {os.listdir(HACS_DIR) if os.path.isdir(HACS_DIR) else '<dossier absent>'})")
-        return True
-    except Exception as e:
-        warn(f"[hacs] Téléchargement/installation impossible : {e}")
-        return False
-
-
-def _hacs_poll_device_flow(flow_id: str):
-    """Thread de fond : re-soumet le flow HACS toutes les 5s jusqu'à ce que Hicham
-    ait validé le code sur github.com/login/device (ou abandon après 10 min — le
-    prochain démarrage de l'addon relancera alors un nouveau code). Mécanisme HA
-    standard pour les steps "show_progress" : re-soumettre le même flow_id force
-    HA à revérifier l'état de la tâche d'activation asynchrone côté intégration
-    (cf. async_step_device officiel de HACS — activation_task.done())."""
-    deadline = time.time() + 600
-    while time.time() < deadline:
-        time.sleep(5)
-        resp = ha_post(f"/config/config_entries/flow/{flow_id}", {})
-        if not resp.ok:
-            continue
-        step = _unwrap(resp.json())
-        step_type = step.get("type")
-        if step_type == "create_entry":
-            log("✓ [hacs] Autorisation GitHub validée — HACS configuré")
-            # install_alarmo() a déjà tourné au démarrage AVANT que cette
-            # autorisation soit validée (install_hacs() avait renvoyé False) —
-            # sans cet appel, Alarmo ne serait installé qu'au prochain redémarrage.
-            install_alarmo()
-            return
-        if step_type == "abort":
-            warn(f"[hacs] Flow d'autorisation abandonné : {step.get('reason')}")
-            return
-        # sinon (progress toujours en cours) → on reboucle
-    warn("[hacs] Autorisation GitHub non complétée dans les 10 minutes — le prochain "
-         "démarrage de l'addon relancera un nouveau code.")
-
-
-def install_hacs() -> bool:
-    """Dépose et autorise HACS — nécessaire une seule fois par site, réutilisable
-    par toute future intégration installée via HACS (Frigate notamment, cf.
-    HANDOFF — bootstrap générique, pas dupliqué par intégration).
-
-    Retourne True si HACS est installé ET déjà autorisé (config entry présente).
-    Retourne False si l'installation est en cours, ou si l'autorisation GitHub est
-    en attente — dans ce 2e cas un code vient d'être loggé (ACTION REQUISE), à
-    saisir une fois sur github.com/login/device ; le thread de fond ou le prochain
-    démarrage de l'addon complètera automatiquement le flow ensuite.
-
-    Séquence vérifiée directement dans le code source réel de HACS (config_flow.py,
-    websocket/*.py de hacs/integration) — pas devinée — mais jamais exécutée contre
-    une vraie instance HA depuis cette session (2026-07-27)."""
-    if _hacs_installed_version() is None:
-        log("── HACS ──────────────────────────────────────")
-        log("[hacs] Non déployé — dépôt des fichiers…")
-        if not _hacs_deploy_files():
-            return False
-        log("[hacs] Restart HA Core pour charger HACS…")
-        try:
-            requests.post(
-                f"{SUP}/homeassistant/restart",
-                headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
-                timeout=60,
-            )
-        except Exception as e:
-            warn(f"[hacs] Erreur restart HA : {e}")
-            return False
-        wait_for_ha()
-
-    if _hacs_config_entry_exists():
-        log("[hacs] ✓ Déjà installé et autorisé — rien à faire")
-        return True
-
-    log("[hacs] Fichiers déployés mais autorisation GitHub absente — lancement du flow")
-
-    # Étape 1 : formulaire "disclaimer" HACS — 4 cases à cocher obligatoires pour
-    # continuer (acc_logs/acc_addons/acc_untested/acc_disable), fixes pour tout
-    # utilisateur, cf. _show_config_form() officiel — aucun jugement à faire.
-    #
-    # Retry courte sur CET appel précis — bug réel trouvé en install réelle
-    # (2026-11-08) : juste après wait_for_ha() (qui ne vérifie QUE que l'API HTTP
-    # de base réponde, cf. son corps), le handler "hacs" n'était pas encore
-    # enregistré — 404 "Invalid handler specified". `custom_components/hacs`
-    # vient d'être chargé par le redémarrage HA Core qui précède cet appel ;
-    # son config_flow peut finir de s'enregistrer quelques secondes après que
-    # l'API elle-même répond déjà. Sans retry, tout le cycle échouait
-    # silencieusement et attendait le PROCHAIN redémarrage complet de l'add-on.
-    flow_resp = None
-    for attempt in range(1, 6):
-        flow_resp = ha_post("/config/config_entries/flow", {"handler": "hacs"})
-        if flow_resp.ok:
-            break
-        if flow_resp.status_code == 404 and attempt < 5:
-            warn(f"[hacs] Handler pas encore enregistré (tentative {attempt}/5) — nouvelle tentative dans 5s")
-            time.sleep(5)
-            continue
-        warn(f"[hacs] Flow impossible ({flow_resp.status_code}): {flow_resp.text[:200]}")
-        return False
-    flow = _unwrap(flow_resp.json())
-    flow_id = flow.get("flow_id")
-    if not flow_id:
-        warn(f"[hacs] Pas de flow_id : {flow}")
-        return False
-
-    step_resp = ha_post(
-        f"/config/config_entries/flow/{flow_id}",
-        {"acc_logs": True, "acc_addons": True, "acc_untested": True, "acc_disable": True},
-    )
-    if not step_resp.ok:
-        warn(f"[hacs] Étape disclaimer impossible ({step_resp.status_code}): {step_resp.text[:200]}")
-        return False
-    step = _unwrap(step_resp.json())
-
-    # Étape 2 : device flow GitHub — le code apparaît directement dans cette
-    # réponse (description_placeholders), cf. async_step_device officiel.
-    placeholders = step.get("description_placeholders", {}) or {}
-    code = placeholders.get("code")
-    url  = placeholders.get("url", "https://github.com/login/device")
-    if code:
-        log(f"⚠ [hacs] ACTION REQUISE (une seule fois pour ce site) — va sur {url} et entre le code : {code}")
-        log("[hacs] Sert aussi à toute future intégration installée via HACS (Frigate).")
-        threading.Thread(target=_hacs_poll_device_flow, args=(flow_id,), daemon=True).start()
-    else:
-        warn(f"[hacs] Pas de code d'autorisation détecté dans la réponse : {step}")
-    return False  # pas encore autorisé sur ce cycle — le poller ou le prochain boot s'en chargeront
-
-
-def _hacs_get_repository(full_name: str, category: str = "integration") -> dict | None:
-    """Retourne le dict repo HACS (id/installed/pending_upgrade…) pour full_name,
-    en l'ajoutant comme dépôt custom si HACS ne le connaît pas encore par défaut
-    (cas d'un dépôt absent de la liste curatée) — cf. hacs/repositories/add côté
-    websocket/repositories.py officiel."""
-    result = _ha_ws_call("hacs/repositories/list", categories=[category])
-    if result and result.get("success"):
-        for repo in result.get("result", []):
-            if repo.get("full_name", "").lower() == full_name.lower():
-                return repo
-
-    add_result = _ha_ws_call("hacs/repositories/add", repository=full_name, category=category)
-    if not add_result or not add_result.get("success"):
-        warn(f"[hacs] Impossible d'ajouter le dépôt {full_name} : {add_result}")
-        return None
-    time.sleep(3)  # laisse HACS récupérer les métadonnées du dépôt fraîchement ajouté
-    result = _ha_ws_call("hacs/repositories/list", categories=[category])
-    if result and result.get("success"):
-        for repo in result.get("result", []):
-            if repo.get("full_name", "").lower() == full_name.lower():
-                return repo
-    warn(f"[hacs] Dépôt {full_name} ajouté mais introuvable ensuite dans la liste HACS")
+    for repo in result.get("result", []):
+        if repo.get("domain") == domain:
+            return repo
     return None
 
 
-def _hacs_ensure_installed(full_name: str, category: str = "integration") -> bool:
-    """Installe/actualise full_name via HACS (hacs/repository/download — même
-    endpoint utilisé par le bouton "Download" du panneau HACS). Retourne True si
+def _marketplace_ensure_installed(domain: str) -> bool:
+    """Installe/actualise une intégration via le Marketplace natif. Retourne True si
     un redémarrage HA est nécessaire (fichiers déposés/modifiés), False si déjà à
-    jour ou en cas d'échec."""
-    repo = _hacs_get_repository(full_name, category)
+    jour ou en cas d'échec. Pas d'autorisation GitHub séparée nécessaire pour un
+    dépôt du catalogue par défaut (vérifié : `marketplace/info` renvoie
+    `github_connected: false`, et l'installation réussit quand même)."""
+    repo = _marketplace_find_repository(domain)
     if repo is None:
+        warn(f"[marketplace] Dépôt introuvable pour le domain {domain!r}")
         return False
     if repo.get("installed") and not repo.get("pending_upgrade"):
         return False  # déjà installé et à jour
 
-    result = _ha_ws_call("hacs/repository/download", repository=repo["id"])
+    # Le paramètre s'appelle "repository" (pas "repository_id") pour cette commande
+    # précise — vérifié en direct, HA renvoie `invalid_format` sinon.
+    result = _ha_ws_call("marketplace/repository/install", repository=repo["id"])
     if not result or not result.get("success"):
-        warn(f"[hacs] Échec du téléchargement de {full_name} via HACS : {result}")
+        warn(f"[marketplace] Échec de l'installation de {domain} : {result}")
         return False
-    log(f"✓ {full_name} {'mis à jour' if repo.get('installed') else 'installé'} via HACS")
+    log(f"✓ {domain} {'mis à jour' if repo.get('installed') else 'installé'} via le Marketplace")
     return True
 
 
@@ -2261,16 +2053,25 @@ def _alarmo_config_entry_exists() -> bool:
 
 
 def install_alarmo():
-    """Installe ET met à jour Alarmo via HACS. Idempotent — appelé à chaque
-    démarrage de l'addon (volontairement hors run_setup(), pour s'activer sur
-    un site déjà provisionné sans réinitialiser toute la config).
+    """Installe ET met à jour Alarmo via le Marketplace natif HA. Idempotent —
+    appelé à chaque démarrage de l'addon (volontairement hors run_setup(), pour
+    s'activer sur un site déjà provisionné sans réinitialiser toute la config).
 
-    Séquence : install_hacs() d'abord (bootstrap HACS + autorisation GitHub,
-    une seule fois par site) → _hacs_ensure_installed(ALARMO_FULL_NAME) →
-    restart HA Core si Alarmo vient d'être téléchargé → création de l'entry
-    de config Alarmo via son flow zéro-input (config_flow.py d'Alarmo appelle
-    async_create_entry() dès la première étape, sans saisie utilisateur —
-    vérifié dans le code source de la release, 2026-07-27)."""
+    Réécrit le 2026-11-09 — l'ancienne version passait par une installation HACS
+    manuelle (téléchargement direct du zip GitHub + autorisation OAuth device-code)
+    qui a échoué de façon reproductible en conditions réelles sur ce site de test
+    ("Cannot find integration hacs" côté HA, malgré des fichiers confirmés présents
+    et valides — cause jamais élucidée). Hicham a découvert entre-temps que HACS
+    est désormais intégré nativement à HA sous le nom "Marketplace" à partir de la
+    version 2026.11 (cf. hacs.xyz/docs/use/download/download/) — toute cette
+    mécanique de téléchargement/autorisation devient obsolète, Alarmo s'installe
+    directement via `_marketplace_ensure_installed()`.
+
+    Séquence : _marketplace_ensure_installed("alarmo") → restart HA Core si Alarmo
+    vient d'être installé → création de l'entry de config Alarmo via son flow
+    zéro-input (config_flow.py d'Alarmo appelle async_create_entry() dès la
+    première étape, sans saisie utilisateur — vérifié dans le code source de la
+    release, 2026-07-27)."""
     # Sortie rapide : dossier custom_component ET config entry présents → déjà installé
     if os.path.isdir("/homeassistant/custom_components/alarmo"):
         if _alarmo_config_entry_exists():
@@ -2278,15 +2079,12 @@ def install_alarmo():
             return
         log("[alarmo] Dossier présent mais config entry absente — création de l'entry")
     else:
-        log("[alarmo] Dossier absent — installation via HACS")
-
-    if not install_hacs():
-        return  # HACS pas encore prêt (installation ou autorisation GitHub en cours)
+        log("[alarmo] Dossier absent — installation via le Marketplace")
 
     log("── Alarmo (alarme) ──────────────────────────")
     wait_for_ha()
 
-    if _hacs_ensure_installed(ALARMO_FULL_NAME):
+    if _marketplace_ensure_installed("alarmo"):
         log("[alarmo] Restart HA Core pour charger Alarmo…")
         try:
             requests.post(
@@ -4464,18 +4262,15 @@ def _ensure_ha_trusted_proxy():
     return True
 
 
-# ⚠️ DIAGNOSTIC TEMPORAIRE (2026-11-09) — bug HACS "Cannot find integration hacs"
-# toujours pas expliqué malgré un manifest.json confirmé présent et lisible juste
-# après extraction (cf. _hacs_installed_version/_hacs_deploy_files). Le journal HA
-# accessible à distance (/api/hassio/core/logs) est trop tronqué pour voir le détail
-# du scan de custom_components au démarrage — on passe homeassistant.loader/
-# config_entries/setup en debug pour la PROCHAINE investigation, le temps de
-# comprendre la vraie cause. À retirer une fois résolu (ou laisser si Hicham préfère
-# garder ce niveau de détail en permanence sur le site de test).
+# Nettoyage du diagnostic temporaire posé en v2.9.226 (logger debug loader/
+# config_entries/setup, pour traquer "Cannot find integration hacs") — cause
+# réelle trouvée le 2026-11-09 (HACS obsolète depuis HA 2026.11, remplacé par le
+# Marketplace natif, cf. install_alarmo()) : plus besoin de ce niveau de détail.
+# Retire le bloc entier (marqueur + les 5 lignes qui suivent) si présent, idempotent.
 _HA_DEBUG_LOGGER_MARKER = "# domoticium-diag-logger-2026-11-09"
 
 
-def _ensure_ha_debug_logger_once():
+def _remove_ha_debug_logger_once():
     main_cfg = "/homeassistant/configuration.yaml"
     try:
         with open(main_cfg) as f:
@@ -4483,26 +4278,17 @@ def _ensure_ha_debug_logger_once():
     except FileNotFoundError:
         return False
 
-    if _HA_DEBUG_LOGGER_MARKER in content:
-        return False  # déjà fait
+    if _HA_DEBUG_LOGGER_MARKER not in content:
+        return False  # jamais posé (nouveau site) ou déjà retiré
 
-    if re.search(r"(?m)^logger:\s*$", content):
-        warn("[diag-logger] Un bloc 'logger:' existe déjà dans configuration.yaml — "
-             "pas touché, ajouter homeassistant.loader/config_entries/setup en debug à la main si besoin.")
+    pattern = re.escape(_HA_DEBUG_LOGGER_MARKER) + r"[^\n]*\n(?:logger:\n(?:  [^\n]*\n)*)"
+    new_content, n = re.subn(pattern, "", content, count=1)
+    if n == 0:
+        warn("[diag-logger] Marqueur trouvé mais bloc non reconnu — pas touché, à retirer manuellement si besoin.")
         return False
-
-    block = (
-        f"\n{_HA_DEBUG_LOGGER_MARKER} — diagnostic temporaire bug HACS, à retirer une fois résolu\n"
-        "logger:\n"
-        "  default: info\n"
-        "  logs:\n"
-        "    homeassistant.loader: debug\n"
-        "    homeassistant.config_entries: debug\n"
-        "    homeassistant.setup: debug\n"
-    )
-    with open(main_cfg, "a") as f:
-        f.write(block)
-    log("✓ configuration.yaml : logger debug temporaire ajouté (diagnostic bug HACS)")
+    with open(main_cfg, "w") as f:
+        f.write(new_content)
+    log("✓ configuration.yaml : logger debug temporaire retiré (diagnostic HACS clos)")
     return True
 
 
@@ -11262,7 +11048,7 @@ if __name__ == "__main__":
     # risquer de tomber en plein milieu.
     wait_for_ha()
     _needs_ha_restart = _ensure_ha_trusted_proxy()
-    _needs_ha_restart = _ensure_ha_debug_logger_once() or _needs_ha_restart
+    _needs_ha_restart = _remove_ha_debug_logger_once() or _needs_ha_restart
     if _needs_ha_restart:
         log("[setup] Redémarrage HA Core pour appliquer configuration.yaml…")
         try:
