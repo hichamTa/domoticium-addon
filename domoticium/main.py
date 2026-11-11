@@ -5707,6 +5707,72 @@ def _boost_device_reporting(ieee: str, exposes: list, power_source: str | None,
         else:
             results[prop] = {"status": resp.get("status"), "error": resp.get("error")}
     return results
+
+
+# (2026-11-11) Suivi des réponses à zigbee2mqtt/bridge/request/device/options —
+# même mécanisme request/réponse corrélée que _reporting_configure_* ci-dessus,
+# mais clé = ieee seul (une option par device, pas par attribut).
+_options_configure_lock = threading.Lock()
+_options_configure_events: dict[str, threading.Event] = {}
+_options_configure_results: dict[str, dict] = {}
+
+# ieee déjà configurés (cf. _configure_zlinky_tic_polling) DEPUIS LE DÉMARRAGE de
+# ce process — même logique que _boosted_ieees, idempotent côté Z2M de toute
+# façon (republier la même option ne fait rien de plus).
+_tic_poll_configured: set[str] = set()
+
+
+def _configure_zlinky_tic_polling(ieee: str) -> dict:
+    """Bug réel trouvé en conditions réelles (Hicham, 2026-11-11) : le module
+    LiXee ZLinky_TIC (lecture Linky) ne remontait presque plus aucune mise à
+    jour de ses mesures cumulées (EAST, EASF01…) après le tout premier appairage
+    — `measurement_poll_interval` (option PROPRE à ce convertisseur Z2M, PAS
+    une config de reporting Zigbee standard comme _boost_device_reporting
+    ci-dessus, car ce module publie en partie des attributs en lecture seule
+    non-"reportable", lus par Z2M via polling actif plutôt que par push du
+    device) vaut 600s (10 min) par défaut d'après la doc officielle
+    (zigbee2mqtt.io/devices/ZLinky_TIC.html) — et un bug connu en amont a pu le
+    laisser bloqué/inopérant pour de bon tant qu'il n'est jamais explicitement
+    redéfini (cf. Koenkk/zigbee-herdsman-converters#10485). Confirmé en
+    conditions réelles : capture du panneau "Paramètres de l'appareil" Z2M de
+    Hicham montrant le champ vide (= défaut jamais forcé), et l'historique HA
+    de `sensor..._east` figé ~24h malgré une vraie conso ailleurs dans le
+    logement. Fixé ici à 60s (valeur qui a résolu le même symptôme pour
+    plusieurs utilisateurs tiers, cf. recherche faite avant ce fix) — demandé
+    UNE FOIS via l'API Z2M dédiée (bridge/request/device/options, DISTINCTE de
+    device/reporting/configure), au tout premier appairage de CE module
+    précis, sans aucune action manuelle de l'installateur ni du client."""
+    if not _local_client:
+        return {"error": "Mosquitto local non connecté"}
+    ev = threading.Event()
+    with _options_configure_lock:
+        _options_configure_events[ieee] = ev
+        _options_configure_results.pop(ieee, None)
+    _local_client.publish(
+        "zigbee2mqtt/bridge/request/device/options",
+        json.dumps({"id": ieee, "options": {"measurement_poll_interval": 60}}),
+        qos=1,
+    )
+    got = ev.wait(timeout=10)
+    with _options_configure_lock:
+        resp = _options_configure_results.pop(ieee, None)
+        _options_configure_events.pop(ieee, None)
+    if not got or not resp:
+        return {"status": "timeout"}
+    return {"status": resp.get("status"), "error": resp.get("error")}
+
+
+def _configure_zlinky_tic_polling_logged(ieee: str) -> None:
+    """Wrapper loggué de _configure_zlinky_tic_polling() — appelé en thread
+    séparé depuis _sync_zigbee_devices_direct(), son retour serait sinon
+    silencieusement perdu (pas de code appelant pour le lire)."""
+    result = _configure_zlinky_tic_polling(ieee)
+    if result.get("status") == "ok":
+        log(f"[zlinky-tic] ✓ measurement_poll_interval=60s configuré pour {ieee}")
+    else:
+        warn(f"[zlinky-tic] échec configuration polling pour {ieee} : {result}")
+
+
 # friendly_name → online, messages availability arrivés AVANT que le cache ci-dessus
 # ne soit peuplé (ex: juste après un redémarrage addon — Mosquitto souscrit
 # quasi instantanément, alors que le 1er cycle de sync qui peuple le cache ci-dessus
@@ -8414,6 +8480,21 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
                         daemon=True,
                     ).start()
 
+            # Module LiXee ZLinky_TIC (lecture Linky) : certaines de ses mesures
+            # sont en lecture seule/non-"reportable" côté Zigbee et dépendent
+            # du polling ACTIF de Z2M (measurement_poll_interval, 600s par
+            # défaut, cf. _configure_zlinky_tic_polling) — hors du mécanisme
+            # _boost_device_reporting ci-dessus (reporting Zigbee standard,
+            # jamais applicable ici). Une seule fois par ieee, même logique
+            # d'idempotence que _boosted_ieees.
+            if (ieee not in _tic_poll_configured
+                    and definition.get("vendor") == "LiXee"
+                    and definition.get("model") == "ZLinky_TIC"):
+                _tic_poll_configured.add(ieee)
+                threading.Thread(
+                    target=_configure_zlinky_tic_polling_logged, args=(ieee,), daemon=True,
+                ).start()
+
         # Reconstruit entièrement à chaque synchro plutôt qu'un merge — gère
         # naturellement les renommages/suppressions sans entrée périmée.
         _z2m_friendly_to_ieee = friendly_to_ieee
@@ -8577,6 +8658,21 @@ def on_local_message(client, userdata, msg):
                 ev.set()
         except Exception as exc:
             warn(f"[zigbee-reporting] parse error: {exc}")
+        return
+
+    # ── Réponse à une demande d'options device (cf. _configure_zlinky_tic_polling)
+    if topic == "zigbee2mqtt/bridge/response/device/options":
+        try:
+            resp = json.loads(payload.decode())
+            rdata = resp.get("data") or {}
+            ieee = rdata.get("id")
+            with _options_configure_lock:
+                _options_configure_results[ieee] = resp
+                ev = _options_configure_events.get(ieee)
+            if ev:
+                ev.set()
+        except Exception as exc:
+            warn(f"[zigbee-options] parse error: {exc}")
         return
 
     # ── Z2M bridge/devices → auto-registration dans Supabase ─────────────────
