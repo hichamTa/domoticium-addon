@@ -7186,6 +7186,32 @@ def _run_camera_watchdog():
         time.sleep(60)
 
 
+# Mêmes tolérances que _ZB_DEADBAND, appliquées aux capteurs Matter/Wi-Fi (entités HA
+# sensor.* — ils n'ont pas de message Zigbee brut). (device_class, unité) → (relatif, absolu).
+# Les compteurs d'énergie (kWh) n'ont volontairement aucune tolérance.
+_HA_SENSOR_DEADBAND = {
+    ("power", "W"): (0.05, 2.0), ("apparent_power", "VA"): (0.05, 2.0),
+    ("voltage", "V"): (0.0, 2.0), ("current", "A"): (0.05, 0.02),
+}
+
+
+def _ha_sensor_within_deadband(prev_signature: str, state: str, attributes: dict, signature: str) -> bool:
+    """True si seule la VALEUR numérique d'un capteur de puissance/tension/courant
+    a bougé, et de moins que sa tolérance, depuis le dernier envoi réussi (les
+    attributs hors état doivent être strictement identiques)."""
+    tol = _HA_SENSOR_DEADBAND.get((attributes.get("device_class"), attributes.get("unit_of_measurement")))
+    if not tol or "\x00" not in prev_signature or "\x00" not in signature:
+        return False
+    prev_state, prev_attrs = prev_signature.split("\x00", 1)
+    if prev_attrs != signature.split("\x00", 1)[1]:
+        return False
+    try:
+        old, new = float(prev_state), float(state)
+    except ValueError:
+        return False
+    return abs(new - old) < max(tol[1], tol[0] * abs(old))
+
+
 def _prepare_ha_state_item(entity_id: str, state: str, attributes: dict):
     """Même décision que le début de _report_device_state_direct (dédoublonnage,
     frein des capteurs), mais SANS appel réseau : renvoie ("skip"|"defer"|"send",
@@ -7202,6 +7228,9 @@ def _prepare_ha_state_item(entity_id: str, state: str, attributes: dict):
     if signature:
         prev = _last_reported_signature.get(entity_id)
         if prev and prev[0] == signature and time.time() - prev[1] < _DEDUPE_REFRESH_S:
+            return "skip", None, signature
+        if prev and domain == "sensor" and time.time() - prev[1] < _DEDUPE_REFRESH_S \
+                and _ha_sensor_within_deadband(prev[0], state, attributes, signature):
             return "skip", None, signature
     if domain == "sensor":
         now = time.time()
