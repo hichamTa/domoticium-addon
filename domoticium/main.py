@@ -111,19 +111,60 @@ def _jwt_payload(token: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(padded))
 
 
+# Pause progressive après un refus/une panne Supabase (2026-11-13). Constaté en
+# conditions réelles : quota egress dépassé → chaque appel renvoyait 402, et
+# l'add-on réinjectait les mêmes ~15 éléments toutes les 2,5 s sans jamais
+# attendre — 537 000 requêtes refusées en 24 h (6/s) pour rien. Désormais, après
+# un 402/429/5xx ou une erreur réseau, plus AUCUN appel pendant 30 s, puis 60,
+# 120, 240, plafonné à 300 s ; remis à zéro dès le premier succès. Les appelants
+# voient un statut 503 factice (déjà traité comme un échec → retenté plus tard).
+_SUPABASE_BACKOFF_STEPS_S = (30, 60, 120, 240, 300)
+_supabase_block_until = 0.0
+_supabase_fail_count = 0
+_supabase_backoff_lock = threading.Lock()
+
+
+def _supabase_is_backing_off() -> bool:
+    return time.time() < _supabase_block_until
+
+
+def _supabase_note_result(ok: bool) -> None:
+    global _supabase_block_until, _supabase_fail_count
+    with _supabase_backoff_lock:
+        if ok:
+            _supabase_fail_count = 0
+            return
+        step = _SUPABASE_BACKOFF_STEPS_S[min(_supabase_fail_count, len(_SUPABASE_BACKOFF_STEPS_S) - 1)]
+        _supabase_fail_count += 1
+        _supabase_block_until = time.time() + step
+        if _supabase_fail_count == 1:
+            warn(f"[supabase] indisponible/refusé — pause {step}s avant de réessayer (pauses croissantes jusqu'à 300s)")
+
+
 def _supabase_rpc(fn_name: str, payload: dict, timeout: float = 10.0) -> requests.Response:
     """Appelle une fonction Postgres pi_* via PostgREST (clé publique anon — la vraie
     autorisation vient de la signature HMAC incluse dans payload, vérifiée côté DB)."""
-    return requests.post(
-        f"{SUPABASE_URL}/rest/v1/rpc/{fn_name}",
-        json=payload,
-        headers={
-            "apikey": SUPABASE_ANON_KEY,
-            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            "Content-Type": "application/json",
-        },
-        timeout=timeout,
-    )
+    if _supabase_is_backing_off():
+        stub = requests.Response()
+        stub.status_code = 503
+        stub._content = b'{"message":"pause locale apres echec Supabase"}'
+        return stub
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/{fn_name}",
+            json=payload,
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+        )
+    except Exception:
+        _supabase_note_result(False)
+        raise
+    _supabase_note_result(not (r.status_code in (402, 429) or r.status_code >= 500))
+    return r
 
 def _normalize_device(
     protocol: str, *, external_id, name: str, type_: str,
@@ -6926,6 +6967,96 @@ _DEDUPE_IGNORED_ATTRS = frozenset({"media_position", "media_position_updated_at"
 _DEDUPE_REFRESH_S = 300
 _last_reported_signature: dict[str, tuple[str, float]] = {}
 
+# ── Envoi groupé + filtre des états Zigbee bruts (2026-11-13) ────────────────
+# 3e dépassement du quota egress Supabase. Cause mesurée : un appel HTTP par
+# entité/message (même pour une valeur identique), alors que le coût par appel
+# (en-têtes, vérification HMAC, lecture du secret) dépasse celui de la donnée.
+# Désormais :
+#  - changement "discret" (interrupteur, contact, mouvement, bouton, batterie,
+#    luminosité…) → part au prochain cycle (2,5 s) ;
+#  - simples mesures (puissance, courant, tension, énergie…) → ramassées et
+#    envoyées toutes les _MEASURE_FLUSH_S secondes ;
+#  - TOUT (les deux voies, HA + Zigbee brut) part dans UN SEUL appel
+#    pi_report_states_batch par cycle, signé une fois ;
+#  - une mesure n'est renvoyée que si elle a bougé au-delà d'une tolérance
+#    (_ZB_DEADBAND) par rapport à la dernière valeur ENVOYÉE (pas reçue —
+#    sinon une dérive lente ne dépasserait jamais le seuil) ; le bruit pur
+#    (qualité du signal, date du Linky…) est ignoré ;
+#  - rien de nouveau → un envoi de rafraîchissement toutes les 5 min seulement.
+_MEASURE_FLUSH_S = 10
+_ZB_REFRESH_S = 300
+_BATCH_MAX_ITEMS = 100
+_ZB_NOISE_KEYS = frozenset({"linkquality", "update", "update_available", "last_seen", "current_date"})
+# clé Z2M → (seuil relatif, seuil absolu) : changement significatif si |Δ| ≥ max(abs, rel×|ancienne|)
+_ZB_DEADBAND = {
+    "voltage": (0.0, 2.0), "rms_voltage": (0.0, 2.0), "average_rms_voltage_meas_period": (0.0, 2.0),
+    "power": (0.05, 2.0), "active_power": (0.05, 2.0), "apparent_power": (0.05, 2.0),
+    "current": (0.05, 0.02), "rms_current": (0.05, 0.02),
+}
+_ZB_MEASURE_PREFIXES = (
+    "active_power", "apparent_power", "reactive_power", "power", "voltage", "current", "rms_",
+    "energy", "current_summ", "current_tier", "active_energy", "drawn_v_a", "average_rms",
+)
+_zb_last_sent: dict[str, tuple[dict, float]] = {}
+_zb_pending: dict[str, dict] = {}
+_zb_pending_urgent: set[str] = set()
+_last_measure_flush = 0.0
+_batch_rpc_disabled_until = 0.0
+
+
+def _zb_is_measure(key: str, old, new) -> bool:
+    numeric = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    return (numeric(old) or old is None) and numeric(new) and key.startswith(_ZB_MEASURE_PREFIXES)
+
+
+def _zb_measure_changed(key: str, old, new) -> bool:
+    if old is None:
+        return True
+    rel, absolute = _ZB_DEADBAND.get(key, (0.0, 0.0))
+    return abs(new - old) >= max(absolute, rel * abs(old)) and new != old
+
+
+def _zb_classify(prev: dict | None, new: dict) -> str | None:
+    """Compare l'état Z2M reçu à la dernière version ENVOYÉE : "urgent" (un champ
+    discret a changé), "measure" (seules des mesures ont bougé au-delà de leur
+    tolérance) ou None (rien de significatif)."""
+    if prev is None:
+        return "urgent"
+    measure_changed = False
+    for key in set(prev) | set(new):
+        if key in _ZB_NOISE_KEYS:
+            continue
+        old_v, new_v = prev.get(key), new.get(key)
+        if old_v == new_v:
+            continue
+        if _zb_is_measure(key, old_v, new_v):
+            if _zb_measure_changed(key, old_v, new_v):
+                measure_changed = True
+        else:
+            return "urgent"
+    return "measure" if measure_changed else None
+
+
+def _zb_enqueue(ieee: str, raw_state: dict) -> None:
+    now = time.time()
+    sent = _zb_last_sent.get(ieee)
+    kind = _zb_classify(sent[0] if sent else None, raw_state)
+    if kind is None:
+        if sent and now - sent[1] < _ZB_REFRESH_S:
+            with _state_batch_lock:
+                if ieee in _zb_pending:
+                    _zb_pending[ieee] = raw_state
+            return
+        kind = "measure"
+    with _state_batch_lock:
+        _zb_pending[ieee] = raw_state
+        if kind == "urgent":
+            _zb_pending_urgent.add(ieee)
+
+
+def _ha_item_is_urgent(entity_id: str) -> bool:
+    return not entity_id.startswith("sensor.")
+
 # ── Watchdog caméras ─────────────────────────────────────────────────────────
 # Sonde go2rtc toutes les 60s, envoie les deltas dans le même flush que les états.
 _cam_watch_online: dict[str, bool] = {}   # streamName → dernière valeur connue
@@ -7053,6 +7184,67 @@ def _run_camera_watchdog():
         except Exception as e:
             warn(f"[watchdog] cycle échoué (poursuite au prochain) : {e}")
         time.sleep(60)
+
+
+def _prepare_ha_state_item(entity_id: str, state: str, attributes: dict):
+    """Même décision que le début de _report_device_state_direct (dédoublonnage,
+    frein des capteurs), mais SANS appel réseau : renvoie ("skip"|"defer"|"send",
+    item pour pi_report_states_batch, signature de dédoublonnage). "skip" = rien
+    de nouveau (considéré réussi), "defer" = trop tôt, à retenter plus tard."""
+    domain = entity_id.split(".")[0] if "." in entity_id else ""
+    try:
+        signature = state + "\x00" + json.dumps(
+            {k: v for k, v in attributes.items() if k not in _DEDUPE_IGNORED_ATTRS},
+            sort_keys=True, default=str,
+        )
+    except Exception:
+        signature = ""
+    if signature:
+        prev = _last_reported_signature.get(entity_id)
+        if prev and prev[0] == signature and time.time() - prev[1] < _DEDUPE_REFRESH_S:
+            return "skip", None, signature
+    if domain == "sensor":
+        now = time.time()
+        if now - _sensor_report_last_sent.get(entity_id, 0.0) < _SENSOR_REPORT_MIN_INTERVAL_S:
+            return "defer", None, signature
+        _sensor_report_last_sent[entity_id] = now
+    item = {
+        "k": "ha", "id": entity_id, "state": state,
+        "patch": _ha_entity_to_normalized_patch(entity_id, state, attributes),
+        "cap": _ha_attributes_to_capabilities(entity_id, attributes),
+        "attrs": attributes,
+    }
+    return "send", item, signature
+
+
+def _send_states_batch(items: list) -> bool:
+    """UN appel pi_report_states_batch (par paquets de _BATCH_MAX_ITEMS). True si
+    tous les paquets ont réussi. Fonction absente côté base (404, ex. migration
+    pas encore appliquée) : désactive le mode groupé 10 min et signale l'échec —
+    l'appelant retombe sur l'envoi par élément."""
+    global _batch_rpc_disabled_until
+    for start in range(0, len(items), _BATCH_MAX_ITEMS):
+        chunk = items[start:start + _BATCH_MAX_ITEMS]
+        ids = ",".join(sorted(f"{it['k']}:{it['id']}" for it in chunk))
+        ts = int(time.time())
+        try:
+            r = _supabase_rpc("pi_report_states_batch", {
+                "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts,
+                "p_signature": _pi_sign(f"{SITE_PREFIX}:{ts}:states_batch:{ids}"),
+                "p_items": chunk,
+            }, timeout=20.0)
+        except Exception as e:
+            warn(f"[supabase] pi_report_states_batch : {e}")
+            return False
+        if r.status_code == 404:
+            _batch_rpc_disabled_until = time.time() + 600
+            warn("[supabase] pi_report_states_batch absente côté base — envoi par élément pendant 10 min")
+            return False
+        if r.status_code >= 300:
+            if r.status_code != 503:
+                warn(f"[supabase] pi_report_states_batch {r.status_code}: {r.text[:160]}")
+            return False
+    return True
 
 
 def _report_device_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
@@ -7309,26 +7501,51 @@ def _report_camera_status_direct(stream_name: str, online: bool) -> bool:
 
 
 def _flush_state_batch():
-    """Thread de fond : envoie états devices + statuts caméras + retries d'état
-    alarme (cf. _alarm_state_batch, audit add-on 2026-09-22) toutes les 2.5s via
-    Supabase direct (un appel HMAC par item). Un item qui échoue (réseau, Supabase
-    indisponible) est réintégré au batch pour être retenté au prochain cycle — pas
-    de repli Vercel, aucune donnée perdue silencieusement.
+    """Thread de fond (cycle 2,5 s) : envoie états devices (HA + Zigbee brut),
+    statuts caméras et retries d'état alarme vers Supabase direct.
+
+    Depuis 2026-11-13 les états partent GROUPÉS : un seul appel
+    pi_report_states_batch par cycle (cf. bloc "Envoi groupé" plus haut) au lieu
+    d'un appel HMAC par élément. Changement discret (interrupteur, contact…) →
+    envoyé au prochain cycle ; simples mesures → ramassées et envoyées toutes les
+    _MEASURE_FLUSH_S secondes. Un élément non envoyé (réseau, Supabase refuse)
+    est réintégré pour être retenté — jamais perdu silencieusement ; après un
+    refus Supabase, pause croissante (cf. _supabase_rpc) au lieu de réessayer
+    toutes les 2,5 s.
 
     Blindé (§97) par cohérence avec _run_camera_watchdog() : une exception non
     prévue ici tuerait ce thread silencieusement, plus jamais aucun état ni
     heartbeat rapporté ensuite — désormais journalisée, la boucle continue."""
+    global _last_measure_flush
     while True:
         time.sleep(2.5)
         try:
             if not INGEST_SECRET:
                 continue
+            if _supabase_is_backing_off():
+                continue
 
+            now = time.time()
+            measure_due = now - _last_measure_flush >= _MEASURE_FLUSH_S
             with _state_batch_lock:
-                batch = dict(_state_batch)
-                _state_batch.clear()
+                ha_take = {
+                    eid: v for eid, v in _state_batch.items()
+                    if measure_due or _ha_item_is_urgent(eid)
+                }
+                for eid in ha_take:
+                    del _state_batch[eid]
+                zb_take = {
+                    ieee: raw for ieee, raw in _zb_pending.items()
+                    if measure_due or ieee in _zb_pending_urgent
+                }
+                zb_urgent = {ieee for ieee in zb_take if ieee in _zb_pending_urgent}
+                for ieee in zb_take:
+                    del _zb_pending[ieee]
+                    _zb_pending_urgent.discard(ieee)
                 alarm_batch = dict(_alarm_state_batch)
                 _alarm_state_batch.clear()
+            if measure_due:
+                _last_measure_flush = now
 
             with _cam_watch_lock:
                 cam_batch = {
@@ -7338,10 +7555,53 @@ def _flush_state_batch():
                 }
                 _cam_watch_dirty.clear()
 
-            failed_states = {
-                eid: (st, attrs) for eid, (st, attrs) in batch.items()
-                if not _report_device_state_direct(eid, st, attrs)
-            }
+            items, meta, deferred_ha = [], [], {}
+            for eid, (st, attrs) in ha_take.items():
+                status, item, sig = _prepare_ha_state_item(eid, st, attrs)
+                if status == "defer":
+                    deferred_ha[eid] = (st, attrs)
+                elif status == "send":
+                    items.append(item)
+                    meta.append(("ha", eid, sig))
+            for ieee, raw in zb_take.items():
+                items.append({"k": "zb", "id": ieee, "raw": raw})
+                meta.append(("zb", ieee, raw))
+
+            failed_ha, failed_zb = dict(deferred_ha), {}
+            if items:
+                if time.time() < _batch_rpc_disabled_until:
+                    # Repli (fonction groupée absente côté base) : un appel par élément.
+                    ok_flags = []
+                    for it in items:
+                        if it["k"] == "ha":
+                            ok_flags.append(_report_device_state_direct(it["id"], it["state"], it["attrs"]))
+                        else:
+                            ok_flags.append(_report_zigbee_state_direct(it["id"], it["raw"]))
+                    results = ok_flags
+                else:
+                    batch_ok = _send_states_batch(items)
+                    if not batch_ok and time.time() < _batch_rpc_disabled_until:
+                        results = [
+                            (_report_device_state_direct(it["id"], it["state"], it["attrs"]) if it["k"] == "ha"
+                             else _report_zigbee_state_direct(it["id"], it["raw"]))
+                            for it in items
+                        ]
+                    else:
+                        results = [batch_ok] * len(items)
+                sent_at = time.time()
+                for (kind, key, extra), ok in zip(meta, results):
+                    if kind == "ha":
+                        if ok:
+                            if extra:
+                                _last_reported_signature[key] = (extra, sent_at)
+                        else:
+                            failed_ha[key] = ha_take[key]
+                    else:
+                        if ok:
+                            _zb_last_sent[key] = (dict(extra), sent_at)
+                        else:
+                            failed_zb[key] = extra
+
             failed_alarm = {
                 eid: (st, attrs) for eid, (st, attrs) in alarm_batch.items()
                 if not _report_alarm_state_direct(eid, st, attrs)
@@ -7351,12 +7611,14 @@ def _flush_state_batch():
                 if not _report_camera_status_direct(name, online)
             }
 
-            if failed_states:
+            if failed_ha or failed_zb or failed_alarm:
                 with _state_batch_lock:
-                    for eid, v in failed_states.items():
+                    for eid, v in failed_ha.items():
                         _state_batch.setdefault(eid, v)
-            if failed_alarm:
-                with _state_batch_lock:
+                    for ieee, raw in failed_zb.items():
+                        _zb_pending.setdefault(ieee, raw)
+                        if ieee in zb_urgent:
+                            _zb_pending_urgent.add(ieee)
                     for eid, v in failed_alarm.items():
                         _alarm_state_batch.setdefault(eid, v)
             if failed_cams:
@@ -8733,9 +8995,9 @@ def on_local_message(client, userdata, msg):
                     # source disponible pour _build_local_devices(), qui n'a
                     # aucun Supabase à lire.
                     _last_z2m_raw_state[ieee] = raw_state
-                    threading.Thread(
-                        target=_report_zigbee_state_direct, args=(ieee, raw_state), daemon=True
-                    ).start()
+                    # Plus un thread + un appel par message (2026-11-13) : filtré
+                    # (tolérances) puis envoyé groupé par _flush_state_batch.
+                    _zb_enqueue(ieee, raw_state)
             except Exception as exc:
                 warn(f"[zigbee-state] parse error ({friendly_name}): {exc}")
         return
