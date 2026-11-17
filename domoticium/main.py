@@ -1744,32 +1744,39 @@ def _gateway_get_pass(force: bool = False) -> str | None:
         return st["pass"] if (valid and not force) else None
 
 
-def _gateway_get(route: str, params: dict | None = None, timeout: int = 15) -> dict | None:
-    """GET JSON sur la passerelle ; None si indisponible (pas de laissez-passer, réseau, refus, panne).
-    Un 401 (laissez-passer périmé ou clé de signature renouvelée) déclenche UN nouveau laissez-passer puis
-    un nouvel essai."""
+def _gateway_request(method: str, route: str, params: dict | None = None, body: dict | None = None,
+                     timeout: int = 15) -> tuple[int, dict | None]:
+    """Requête JSON sur la passerelle → (code HTTP, corps JSON ou None). Code 0 = indisponible (pas de
+    laissez-passer, réseau, délai). Un 401 (laissez-passer périmé ou clé de signature renouvelée) déclenche UN
+    nouveau laissez-passer puis un nouvel essai."""
     used = None
     for attempt in (0, 1):
         force = attempt == 1 and used is not None and _gateway_pass_state["pass"] == used
         token = _gateway_get_pass(force)
         if not token:
-            return None
+            return 0, None
         used = token
         try:
-            r = requests.get(f"{GATEWAY_URL}{route}", params=params or {}, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+            r = requests.request(method, f"{GATEWAY_URL}{route}", params=params or {}, json=body,
+                                 headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
         except Exception as e:
             warn(f"[gateway] {route} : {e}")
-            return None
+            return 0, None
         if r.status_code == 401 and attempt == 0:
             continue
         if not r.ok:
-            warn(f"[gateway] {route} : HTTP {r.status_code} {r.text[:200]}")
-            return None
+            warn(f"[gateway] {route} : HTTP {r.status_code}")
         try:
-            return r.json()
+            return r.status_code, r.json()
         except Exception:
-            return None
-    return None
+            return r.status_code, None
+    return 0, None
+
+
+def _gateway_get(route: str, params: dict | None = None, timeout: int = 15) -> dict | None:
+    """GET JSON sur la passerelle : le corps si 2xx, None sinon."""
+    status, data = _gateway_request("GET", route, params=params, timeout=timeout)
+    return data if 200 <= status < 300 else None
 
 
 def _fetch_turn_ice_servers() -> list[dict] | None:
@@ -6767,6 +6774,7 @@ def run_ha_ws_bridge():
                     if not new_state:
                         continue
                     _sse_note_state_change(entity_id, new_state)
+                    _alerts_note_state(entity_id, new_state.get("state", ""), new_state.get("attributes") or {})
                     _relay_ha_state(entity_id, new_state.get("state", ""), new_state.get("attributes", {}))
 
                 elif event_type == "entity_registry_updated":
@@ -6798,6 +6806,8 @@ def run_ha_ws_bridge():
                     # retiré directement dans HA plutôt que via l'appli.
                     if action in ("create", "remove"):
                         _sync_requested.set()
+                        _alerts_reindex.set()   # l'index des équipements du moteur d'alertes suit
+                        _alerts_wake.set()
                     # Équipement ajouté/retiré/renommé : l'app locale doit se relire sans attendre.
                     if action in ("create", "remove", "update") and entity_id:
                         _sse_publish("fast")
@@ -7373,9 +7383,313 @@ def _run_camera_watchdog():
                         for name in list(_cameras):
                             _cam_watch_online[name] = probed.get(name, False)
                             _cam_watch_dirty.add(name)
+                    for name in list(_cameras):
+                        _alerts_note_camera(name, probed.get(name, False))
         except Exception as e:
             warn(f"[watchdog] cycle échoué (poursuite au prochain) : {e}")
         time.sleep(60)
+
+
+# ── Moteur d'alertes du Pi (lot D du chantier « Pi-first ») ─────────────────────
+# Jusqu'ici les alertes (équipement/caméra hors ligne, batterie faible, pont HA figé) étaient fabriquées par
+# SUPABASE (≈ 30 migrations : pi_report_*, pg_cron) puis envoyées par Vercel ; l'app du Pi, elle, les
+# recalculait à chaque lecture, sans historique ni « depuis quand » réel. Le Pi devient le moteur : alertes
+# PERSISTANTES (/data/alerts.json), « depuis » réel, résolution à la reprise, e-mails par le relais de la
+# passerelle (POST /v1/notify, destinataire scellé par le portail). Règles REPRISES à l'identique des migrations,
+# y compris les décisions d'Hicham :
+#   - un équipement est hors ligne quand l'état HA de son entité principale vaut unavailable/unknown (0101) ;
+#   - une alerte ouverte par (type, équipement) : jamais de doublon (0053) ;
+#   - anti-flap : une coupure qui revient en < 5 min RÉ-OUVRE la même alerte, sans nouvelle notification (0103) ;
+#   - e-mail IMMÉDIAT pour caméra, capteurs, sirène, clavier…, mais JAMAIS pour ampoule/interrupteur/prise
+#     (light/switch/plug : push seulement, décision du 2026-09-02 — le push revient au lot F) ;
+#   - batterie faible < 15 % : alerte dans l'app uniquement, jamais d'e-mail (0092) ;
+#   - pont WebSocket HA déconnecté > 5 min alors que l'add-on tourne : « ws_bridge_down » (0122).
+# `ha_offline` (Pi éteint) ne peut pas venir du Pi lui-même : surveillance côté portail (lot F).
+_ALERTS_FILE = "/data/alerts.json"
+_ALERT_FLAP_WINDOW_S = 300
+_ALERT_BATTERY_LOW_PCT = 15
+_ALERT_WS_BRIDGE_DOWN_S = 300
+_ALERT_HISTORY_MAX = 100          # alertes résolues conservées (anti-flap + historique)
+_ALERT_HISTORY_KEEP_S = 7 * 86400
+_ALERT_NOTIFY_GIVE_UP_S = 24 * 3600   # un e-mail « hors ligne » vieux d'un jour n'a plus de sens
+_ALERT_NOTIFY_PER_TICK = 5            # étale les envois (redémarrage du Pi : N équipements d'un coup)
+_ALERT_NO_EMAIL_DEVICE_TYPES = frozenset({"light", "switch", "plug"})
+_ALERT_EMAIL_TYPES = frozenset({"camera_offline", "device_offline", "ws_bridge_down"})
+_ALERTS_TICK_S = 30
+_ALERTS_RECONCILE_S = 300
+
+_alerts_lock = threading.RLock()
+_alerts_state = {"loaded": False, "items": [], "dirty": False}
+_alerts_index: dict = {}        # entity_id principal -> {"name", "type"} (équipements classés)
+_alerts_wake = threading.Event()    # réveille la boucle : nouvelle alerte à notifier / réindexation
+_alerts_reindex = threading.Event()
+_alerts_ws_last_alive = time.time()
+
+
+def _alert_message(alert_type: str, name: str) -> str:
+    return {
+        "device_offline": f"Équipement « {name} » hors ligne",
+        "camera_offline": f"Caméra « {name} » hors ligne",
+        "battery_low": f"Batterie faible sur « {name} »",
+        "ws_bridge_down": "Connexion Home Assistant instable — les états des équipements ne se mettent plus à jour",
+    }[alert_type]
+
+
+def _alerts_load() -> None:
+    """Charge /data/alerts.json une fois (sous verrou). Fichier absent/corrompu : on repart de zéro."""
+    if _alerts_state["loaded"]:
+        return
+    _alerts_state["loaded"] = True
+    try:
+        with open(_ALERTS_FILE) as f:
+            items = json.load(f).get("items", [])
+        _alerts_state["items"] = [a for a in items if isinstance(a, dict) and a.get("id") and a.get("type")]
+    except Exception:
+        _alerts_state["items"] = []
+
+
+def _alerts_save() -> None:
+    """Écriture atomique (0600) si quelque chose a changé ; élague l'historique résolu."""
+    with _alerts_lock:
+        if not _alerts_state["dirty"]:
+            return
+        now = time.time()
+        opened = [a for a in _alerts_state["items"] if a.get("resolved_at") is None]
+        resolved = [a for a in _alerts_state["items"] if a.get("resolved_at") is not None and now - a["resolved_at"] < _ALERT_HISTORY_KEEP_S]
+        resolved.sort(key=lambda a: a["resolved_at"], reverse=True)
+        _alerts_state["items"] = opened + resolved[:_ALERT_HISTORY_MAX]
+        payload = json.dumps({"items": _alerts_state["items"]})
+        _alerts_state["dirty"] = False
+    try:
+        tmp = _ALERTS_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        os.replace(tmp, _ALERTS_FILE)
+    except Exception as e:
+        warn(f"[alerts] écriture impossible : {e}")
+        with _alerts_lock:
+            _alerts_state["dirty"] = True
+
+
+def _alert_initial_notify(alert_type: str, device_type: str | None, now: float) -> dict:
+    wants_email = alert_type in _ALERT_EMAIL_TYPES and not (alert_type == "device_offline" and device_type in _ALERT_NO_EMAIL_DEVICE_TYPES)
+    return {"state": "pending" if wants_email else "none", "attempts": 0, "next_at": now}
+
+
+def _alert_set_condition(alert_type: str, key: str, name: str, active: bool, now: float, device_type: str | None = None) -> bool:
+    """Ouvre / ré-ouvre / résout l'alerte (type, clé). True si quelque chose a changé (à diffuser et sauvegarder)."""
+    with _alerts_lock:
+        _alerts_load()
+        items = _alerts_state["items"]
+        opened = next((a for a in items if a["type"] == alert_type and a.get("key") == key and a.get("resolved_at") is None), None)
+        if not active:
+            if opened is None:
+                return False
+            opened["resolved_at"] = now
+            _alerts_state["dirty"] = True
+            return True
+        if opened is not None:
+            message = _alert_message(alert_type, name)
+            if opened.get("name") != name or opened.get("message") != message:  # équipement renommé
+                opened["name"], opened["message"] = name, message
+                _alerts_state["dirty"] = True
+                return True
+            return False
+        recent = [a for a in items if a["type"] == alert_type and a.get("key") == key and a.get("resolved_at") is not None
+                  and now - a["resolved_at"] < _ALERT_FLAP_WINDOW_S]
+        if recent:
+            # Anti-flap (0103) : MÊME alerte ré-ouverte — pas de nouvelle ligne, donc pas de nouvelle notification ;
+            # created_at inchangé (« depuis » = début réel de la coupure).
+            alert = max(recent, key=lambda a: a["resolved_at"])
+            alert["resolved_at"] = None
+            alert["name"], alert["message"] = name, _alert_message(alert_type, name)
+        else:
+            items.append({
+                "id": secrets.token_hex(6), "type": alert_type, "key": key, "name": name, "device_type": device_type,
+                "message": _alert_message(alert_type, name), "created_at": now, "resolved_at": None,
+                "notify": _alert_initial_notify(alert_type, device_type, now),
+            })
+            _alerts_wake.set()
+        _alerts_state["dirty"] = True
+        return True
+
+
+def _alert_send_email(alert: dict) -> int:
+    """Envoie l'e-mail d'une alerte par le relais de la passerelle ; code HTTP (0 = injoignable). La clé = id de
+    l'alerte : un nouvel essai après une coupure ne fait pas partir deux e-mails (idempotence côté Resend)."""
+    status, _ = _gateway_request("POST", "/v1/notify", body={
+        "type": alert["type"],
+        "name": alert.get("name") if alert["type"] != "ws_bridge_down" else None,
+        "since": datetime.fromtimestamp(alert["created_at"], timezone.utc).isoformat(),
+        "key": alert["id"],
+    }, timeout=15)
+    return status
+
+
+def _alerts_process_notifications(now: float, send=None) -> int:
+    """Envoie les e-mails dus (au plus _ALERT_NOTIFY_PER_TICK par passage). Retourne le nombre d'envois tentés."""
+    send = send or _alert_send_email
+    with _alerts_lock:
+        _alerts_load()
+        due = [a for a in _alerts_state["items"] if a.get("notify", {}).get("state") == "pending" and a["notify"]["next_at"] <= now]
+        due.sort(key=lambda a: a["created_at"])
+        to_send = []
+        for a in due:
+            if a.get("resolved_at") is not None:
+                a["notify"]["state"] = "skipped"        # incident terminé avant l'envoi : un mail tardif serait trompeur
+                _alerts_state["dirty"] = True
+            elif now - a["created_at"] > _ALERT_NOTIFY_GIVE_UP_S:
+                a["notify"]["state"] = "given_up"
+                _alerts_state["dirty"] = True
+            elif len(to_send) < _ALERT_NOTIFY_PER_TICK:
+                to_send.append(a)
+        snapshots = [dict(a) for a in to_send]
+    for snap in snapshots:
+        status = send(snap)       # hors verrou : réseau
+        with _alerts_lock:
+            a = next((x for x in _alerts_state["items"] if x["id"] == snap["id"]), None)
+            if a is None:
+                continue
+            n = a["notify"]
+            n["attempts"] += 1
+            if 200 <= status < 300:
+                n["state"], n["sent_at"] = "sent", now
+            elif status in (400, 413):
+                n["state"] = "given_up"                  # notre requête est refusée : réessayer ne servirait à rien
+                warn(f"[alerts] e-mail refusé par la passerelle (HTTP {status}) pour {a['type']}")
+            elif status == 409:
+                n["next_at"] = now + 6 * 3600            # pas encore d'adresse dans le laissez-passer (renouvelé tout seul)
+            elif status == 429:
+                n["next_at"] = now + 3600                # limite de la passerelle
+            else:                                        # injoignable / 5xx : retrait exponentiel plafonné à 1 h
+                n["next_at"] = now + min(300 * 2 ** (n["attempts"] - 1), 3600)
+            _alerts_state["dirty"] = True
+    return len(snapshots)
+
+
+def _alerts_eval_device(entity_id: str, state: str, attributes: dict, now: float) -> bool:
+    """Évalue UN équipement (entité principale) : hors ligne (0101) et batterie faible (0092)."""
+    info = _alerts_index.get(entity_id)
+    if not info:
+        return False
+    changed = _alert_set_condition("device_offline", entity_id, info["name"], state in ("unavailable", "unknown"), now, info["type"])
+    if attributes.get("device_class") == "battery" and entity_id.startswith("sensor."):
+        try:
+            level = _ha_entity_to_normalized_patch(entity_id, state, attributes).get("battery")
+        except Exception:
+            level = None
+        if isinstance(level, (int, float)):
+            changed |= _alert_set_condition("battery_low", entity_id, info["name"], level < _ALERT_BATTERY_LOW_PCT, now, info["type"])
+    return changed
+
+
+def _alerts_note_state(entity_id: str, state: str, attributes: dict) -> None:
+    """Appelé par le pont WebSocket pour chaque state_changed — un simple accès dict tant que l'entité n'est pas
+    celle d'un équipement."""
+    if entity_id not in _alerts_index:
+        return
+    if _alerts_eval_device(entity_id, state, attributes, time.time()):
+        _alerts_changed()
+
+
+def _alerts_note_camera(name: str, online: bool) -> None:
+    """Appelé par la sonde caméra (toutes les 60 s)."""
+    if name in _cameras and _alert_set_condition("camera_offline", name, name, not online, time.time()):
+        _alerts_changed()
+
+
+def _alerts_changed() -> None:
+    _alerts_save()
+    _alerts_wake.set()
+    try:
+        _sse_publish("fast")       # l'app relit ses alertes tout de suite
+    except Exception:
+        pass
+
+
+def _alerts_reconcile(now: float) -> None:
+    """Filet périodique : reconstruit l'index des équipements (renommage, ajout, suppression) puis évalue TOUS
+    les équipements sur l'état HA réel — rattrape un state_changed manqué (redémarrage de l'add-on, HA relancé)."""
+    devices = _build_local_devices()
+    r = ha_get("/states")
+    if not r.ok:
+        warn(f"[alerts] /states {r.status_code}")
+        return
+    states = {s["entity_id"]: s for s in r.json() if isinstance(s, dict) and s.get("entity_id")}
+    global _alerts_index
+    index = {d["haEntityId"]: {"name": d["name"], "type": d["type"]} for d in devices if d.get("haEntityId")}
+    _alerts_index = index       # remplacement atomique : le pont HA lit cet index en continu (jamais d'index vide, même brièvement)
+    changed = False
+    for entity_id in index:
+        s = states.get(entity_id)
+        if s is not None:
+            changed |= _alerts_eval_device(entity_id, s.get("state", ""), s.get("attributes") or {}, now)
+    # Équipements / caméras supprimés : plus d'alerte à garder (0064).
+    with _alerts_lock:
+        _alerts_load()
+        for a in _alerts_state["items"]:
+            if a.get("resolved_at") is not None:
+                continue
+            # `index` vide = registre HA pas encore prêt (démarrage) : on ne conclut JAMAIS « tout a disparu ».
+            gone = (a["type"] in ("device_offline", "battery_low") and bool(index) and a.get("key") not in index) or \
+                   (a["type"] == "camera_offline" and a.get("key") not in _cameras)
+            if gone:
+                a["resolved_at"] = now
+                _alerts_state["dirty"] = True
+                changed = True
+    if changed:
+        _alerts_changed()
+
+
+def _alerts_check_ws_bridge(now: float) -> bool:
+    """« ws_bridge_down » : le pont WebSocket HA (seul canal d'état événementiel) est déconnecté depuis plus de 5 min
+    alors que l'add-on, lui, tourne (0122). Résolu dès la reconnexion."""
+    global _alerts_ws_last_alive
+    if _ws_bridge_connected:
+        _alerts_ws_last_alive = now
+        return _alert_set_condition("ws_bridge_down", "site", "", False, now)
+    if now - _alerts_ws_last_alive > _ALERT_WS_BRIDGE_DOWN_S:
+        return _alert_set_condition("ws_bridge_down", "site", "", True, now)
+    return False
+
+
+def handle_local_alerts() -> dict:
+    """GET /local/alerts : alertes OUVERTES, la plus récente d'abord — lues par l'app du Pi."""
+    with _alerts_lock:
+        _alerts_load()
+        opened = [a for a in _alerts_state["items"] if a.get("resolved_at") is None]
+    opened.sort(key=lambda a: a["created_at"], reverse=True)
+    return {"alerts": [{
+        "id": a["id"], "type": a["type"], "message": a["message"], "resolved": False,
+        "createdAt": datetime.fromtimestamp(a["created_at"], timezone.utc).isoformat(),
+    } for a in opened]}
+
+
+def _run_alerts_engine():
+    """Thread permanent : toutes les 30 s pont HA + e-mails dus ; toutes les 5 min (ou sur demande) réconciliation
+    complète des équipements. Les transitions en temps réel arrivent par _alerts_note_state/_alerts_note_camera."""
+    time.sleep(20)     # laisser HA, go2rtc et le pont démarrer
+    last_reconcile = 0.0
+    while True:
+        try:
+            now = time.time()
+            if now - last_reconcile >= _ALERTS_RECONCILE_S or _alerts_reindex.is_set():
+                _alerts_reindex.clear()
+                try:
+                    _alerts_reconcile(now)
+                    last_reconcile = now
+                except Exception as e:
+                    warn(f"[alerts] réconciliation échouée (nouvel essai au prochain passage) : {e}")
+                    last_reconcile = now - _ALERTS_RECONCILE_S + 60
+            if _alerts_check_ws_bridge(now):
+                _alerts_changed()
+            _alerts_process_notifications(now)
+            _alerts_save()
+        except Exception as e:
+            warn(f"[alerts] cycle échoué (poursuite au prochain) : {e}")
+        _alerts_wake.wait(timeout=_ALERTS_TICK_S)
+        _alerts_wake.clear()
 
 
 # Mêmes tolérances que _ZB_DEADBAND, appliquées aux capteurs Matter/Wi-Fi (entités HA
@@ -11170,6 +11484,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_events_route()
         elif route == "/local/site":
             self._handle_local_site_route()
+        elif route == "/local/alerts":
+            self._handle_local_alerts_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -11264,6 +11580,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_local_devices())
         except Exception as e:
             warn(f"[local-devices] {e}")
+            self._reject(500, str(e))
+
+    def _handle_local_alerts_route(self):
+        try:
+            self._ok(handle_local_alerts())
+        except Exception as e:
+            warn(f"[local-alerts] {e}")
             self._reject(500, str(e))
 
     def _handle_local_site_route(self):
@@ -11770,6 +12093,7 @@ def run_bridge():
     threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
     # Flush du batch d'états toutes les 2.5s (réduit les appels Vercel)
     threading.Thread(target=_flush_state_batch,      daemon=True).start()
+    threading.Thread(target=_run_alerts_engine,      daemon=True).start()
     # Watchdog caméras : sonde go2rtc toutes les 60s, deltas envoyés dans le batch
     threading.Thread(target=_run_camera_watchdog,    daemon=True).start()
     # Proxy /cameras → go2rtc (retire le préfixe imposé par le tunnel Cloudflare)
