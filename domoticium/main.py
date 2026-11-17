@@ -12,7 +12,7 @@ Phase 2 (service permanent) :
   • Gestion des caméras : ajoute/supprime dans Frigate à la demande
   • Commissionnement Matter
 """
-import base64, hashlib, hmac, http.server, json, logging, logging.handlers, os, re, secrets, socket, socketserver, ssl, struct, subprocess, sys, threading, time, urllib.parse, uuid
+import base64, hashlib, hmac, http.server, json, logging, logging.handlers, os, queue, re, secrets, select, socket, socketserver, ssl, struct, subprocess, sys, threading, time, urllib.parse, uuid
 from datetime import datetime, date, timedelta, timezone
 import paho.mqtt.client as mqtt
 import requests
@@ -6541,6 +6541,67 @@ def _push_initial_entity_state(entity_id: str):
     _relay_ha_state(entity_id, state_val, s.get("attributes") or {})
 
 
+# ── Flux temps réel vers l'app locale (SSE) ────────────────────────────────
+# Chantier « Pi-first » (2026-11-17) : l'app Domoticium servie par le Pi n'interroge plus
+# l'add-on toutes les 4 s — elle ouvre UN flux Server-Sent Events (GET /local/events, via sa
+# route Next /api/local/events) et ne relit l'état QUE lorsqu'on lui signale un changement.
+# Le flux ne transporte volontairement AUCUNE donnée d'état : seulement « quelque chose a
+# changé » (voie `fast`) ou « une mesure a bougé » (voie `slow`). Le client relit alors
+# /local/devices, qui garde l'UNIQUE logique de classification/mise en forme des équipements
+# (_build_local_devices) — pas de 2e copie à tenir synchronisée.
+#  - voie `fast` : tout ce qui n'est pas une mesure (interrupteur, contact, mouvement,
+#    alarme, volet, clim…) — signal envoyé au plus toutes les _SSE_FAST_MIN_INTERVAL_S ;
+#  - voie `slow` : les `sensor.*` (puissance, température…) — au plus toutes les
+#    _SSE_SLOW_MIN_INTERVAL_S, pour qu'un compteur d'énergie qui bouge chaque seconde ne
+#    déclenche pas une relecture complète chaque seconde ;
+#  - un événement dont l'état ET les attributs (hors attributs « horloge » déjà ignorés par
+#    _DEDUPE_IGNORED_ATTRS, ex. position d'un lecteur média) sont identiques au précédent est
+#    ignoré — un seul téléviseur représentait 91 % des state_changed (cf. plus haut) ;
+#  - rien n'est calculé tant qu'aucun client n'est connecté.
+# Aucun quota à ménager (plus de Supabase dans ce chemin) : c'est la charge du Pi qu'on borne
+# (_SSE_MAX_SUBSCRIBERS flux simultanés, file de 64 signaux par abonné, un signal perdu est
+# rattrapé par le suivant ou par la relève de sécurité périodique côté client).
+_SSE_MAX_SUBSCRIBERS = 8
+_SSE_FAST_MIN_INTERVAL_S = 0.25
+_SSE_SLOW_MIN_INTERVAL_S = 4.0
+_SSE_KEEPALIVE_S = 15.0
+_SSE_IGNORED_DOMAINS = frozenset({
+    "sun", "weather", "update", "person", "zone", "persistent_notification",
+    "conversation", "tts", "stt", "todo", "calendar",
+})
+_sse_lock = threading.Lock()
+_sse_subscribers: set = set()
+_sse_last_sig: dict = {}
+
+
+def _sse_publish(lane: str) -> None:
+    with _sse_lock:
+        subscribers = list(_sse_subscribers)
+    for q in subscribers:
+        try:
+            q.put_nowait(lane)
+        except queue.Full:
+            pass  # abonné lent : le prochain signal (ou la relève client) le rattrape
+
+
+def _sse_note_state_change(entity_id: str, new_state: dict) -> None:
+    """Appelé par le pont WebSocket pour chaque state_changed — très bon marché tant qu'aucun client n'est connecté."""
+    if not _sse_subscribers:
+        return
+    domain = entity_id.split(".", 1)[0]
+    if domain in _SSE_IGNORED_DOMAINS:
+        return
+    attrs = new_state.get("attributes") or {}
+    sig = (
+        new_state.get("state"),
+        tuple(sorted((k, repr(v)) for k, v in attrs.items() if k not in _DEDUPE_IGNORED_ATTRS)),
+    )
+    if _sse_last_sig.get(entity_id) == sig:
+        return
+    _sse_last_sig[entity_id] = sig
+    _sse_publish("slow" if domain == "sensor" else "fast")
+
+
 def run_ha_ws_bridge():
     """Thread permanent : écoute HA WebSocket → persiste état + registre vers Supabase (ingest).
     Seul canal d'état événementiel — remplace entièrement EMQX et les automations HA
@@ -6578,6 +6639,7 @@ def run_ha_ws_bridge():
                     new_state = data.get("new_state")
                     if not new_state:
                         continue
+                    _sse_note_state_change(entity_id, new_state)
                     _relay_ha_state(entity_id, new_state.get("state", ""), new_state.get("attributes", {}))
 
                 elif event_type == "entity_registry_updated":
@@ -6609,6 +6671,9 @@ def run_ha_ws_bridge():
                     # retiré directement dans HA plutôt que via l'appli.
                     if action in ("create", "remove"):
                         _sync_requested.set()
+                    # Équipement ajouté/retiré/renommé : l'app locale doit se relire sans attendre.
+                    if action in ("create", "remove", "update") and entity_id:
+                        _sse_publish("fast")
 
         except Exception as e:
             _ws_bridge_connected = False
@@ -10974,8 +11039,84 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_wifi_shelly_discovered_route()
         elif route == "/local/devices":
             self._handle_local_devices_route()
+        elif route == "/local/events":
+            self._handle_local_events_route()
         else:
             self._reject(404, "Route inconnue")
+
+    def _sse_client_gone(self) -> bool:
+        """True si l'autre bout a fermé la connexion (lecture possible et vide = EOF). Sans
+        ça, un flux dont le client est parti ne serait remarqué qu'à la prochaine écriture
+        (jusqu'à _SSE_KEEPALIVE_S plus tard) et occuperait un des _SSE_MAX_SUBSCRIBERS créneaux."""
+        conn = getattr(self, "connection", None)
+        if conn is None:
+            return False
+        try:
+            readable, _, _ = select.select([conn], [], [], 0)
+            return bool(readable) and conn.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    def _handle_local_events_route(self):
+        """Flux SSE « quelque chose a changé » pour l'app locale — cf. le bloc _sse_* plus
+        haut. Reste ouvert jusqu'à la déconnexion du client. Un thread par flux (serveur
+        ThreadingTCPServer), plafonné par _SSE_MAX_SUBSCRIBERS."""
+        q = queue.Queue(maxsize=64)
+        with _sse_lock:
+            if len(_sse_subscribers) >= _SSE_MAX_SUBSCRIBERS:
+                return self._reject(429, "Trop de flux temps réel ouverts")
+            _sse_subscribers.add(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b"retry: 3000\n: connecte\n\n")
+            self.wfile.flush()
+
+            pending = {"fast": False, "slow": False}
+            last_sent = {"fast": 0.0, "slow": 0.0}
+            min_interval = {"fast": _SSE_FAST_MIN_INTERVAL_S, "slow": _SSE_SLOW_MIN_INTERVAL_S}
+            last_write = time.time()
+            while True:
+                if self._sse_client_gone():
+                    break  # le client (ou le relais Next) a fermé : libère le créneau sans attendre une écriture
+                now = time.time()
+                # Réveil au moins toutes les secondes pour détecter une fermeture côté client.
+                wait = min(1.0, _SSE_KEEPALIVE_S - (now - last_write))
+                for lane in ("fast", "slow"):
+                    if pending[lane]:
+                        wait = min(wait, last_sent[lane] + min_interval[lane] - now)
+                try:
+                    lane = q.get(timeout=max(0.01, wait))
+                    pending[lane] = True
+                    while True:  # vide la file : les signaux rapprochés se fondent en un seul
+                        pending[q.get_nowait()] = True
+                except queue.Empty:
+                    pass
+
+                now = time.time()
+                for lane in ("fast", "slow"):
+                    if pending[lane] and now - last_sent[lane] >= min_interval[lane]:
+                        self.wfile.write(f'event: change\ndata: {{"lane":"{lane}"}}\n\n'.encode())
+                        self.wfile.flush()
+                        last_sent[lane] = last_write = now
+                        pending[lane] = False
+                        if lane == "fast":
+                            pending["slow"] = False  # une relecture complète couvre aussi les mesures
+                            last_sent["slow"] = now
+                        break
+                else:
+                    if now - last_write >= _SSE_KEEPALIVE_S:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        last_write = now
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass  # client parti — fin normale du flux
+        finally:
+            with _sse_lock:
+                _sse_subscribers.discard(q)
 
     def _handle_camera_scan(self):
         if not _camera_scan_lock.acquire(blocking=False):
