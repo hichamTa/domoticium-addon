@@ -32,6 +32,10 @@ ZIGBEE_ADAPTER_TYPE     = cfg.get("zigbee_adapter_type", "ember")
 INSTALL_THREAD_ROUTER   = cfg.get("install_thread_border_router", False)
 THREAD_ADAPTER          = cfg.get("thread_adapter", "auto")
 APP_URL                 = cfg.get("app_url", "https://app.domoticium.fr")
+# Passerelle API Domoticium (Worker Cloudflare, dossier web/gateway/) : relais TURN pour les caméras (les
+# secrets Cloudflare ne quittent jamais la passerelle). Adresse publique, identique pour tous les sites ;
+# variable d'environnement seulement pour les tests (pas une option add-on).
+GATEWAY_URL             = (os.environ.get("DOMOTICIUM_GATEWAY_URL") or "https://gateway.domoticium.fr").rstrip("/")
 CLOUDFLARE_TUNNEL_TOKEN = cfg.get("cloudflare_tunnel_token", "")
 FORCE_SETUP             = cfg.get("force_setup", False)
 INGEST_SECRET           = cfg.get("ingest_secret", "")
@@ -1658,33 +1662,134 @@ def _has_turn(servers: list[dict]) -> bool:
     return any(s.get("credential") for s in servers)
 
 
+# ── Passerelle API : laissez-passer du site ─────────────────────────────────────
+# Le Pi n'a AUCUNE clé de fournisseur. Il présente à la passerelle (Worker Cloudflare) un « laissez-passer »
+# signé par le portail, obtenu une fois avec le secret du site (POST APP_URL/api/ingest/gateway-pass), conservé
+# sur disque et renouvelé quand il lui reste moins de 60 jours. Même logique que l'app locale du Pi
+# (web/src/lib/local/gateway.ts) : le fonctionnement courant ne dépend ni de Vercel ni de Supabase.
+_GATEWAY_PASS_FILE = "/data/gateway-pass.json"
+_GATEWAY_PASS_RENEW_WITHIN_S = 60 * 86400
+_GATEWAY_PASS_RETRY_S = 600  # pas plus d'un essai toutes les 10 min après un échec ou un refus
+_gateway_pass_lock = threading.Lock()
+_gateway_pass_state = {"pass": None, "exp": 0.0, "loaded": False, "next_attempt": 0.0}
+
+
+def _gateway_pass_load() -> tuple[str | None, float]:
+    try:
+        with open(_GATEWAY_PASS_FILE) as f:
+            d = json.load(f)
+        if isinstance(d.get("pass"), str) and isinstance(d.get("expiresAt"), (int, float)):
+            return d["pass"], float(d["expiresAt"])
+    except Exception:
+        pass
+    return None, 0.0
+
+
+def _gateway_pass_save(token: str, exp: float) -> None:
+    try:
+        tmp = _GATEWAY_PASS_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"pass": token, "expiresAt": exp}, f)
+        os.replace(tmp, _GATEWAY_PASS_FILE)
+    except Exception as e:
+        warn(f"[gateway] écriture du laissez-passer impossible : {e}")  # reste en mémoire, redemandé au prochain démarrage
+
+
+def _gateway_pass_request() -> tuple[str, float] | None:
+    if not INGEST_SECRET or not SITE_PREFIX:
+        return None
+    try:
+        r = requests.post(
+            f"{APP_URL}/api/ingest/gateway-pass",
+            json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX},
+            timeout=15,
+        )
+        if not r.ok:
+            warn(f"[gateway] laissez-passer refusé par le portail : HTTP {r.status_code}")
+            return None
+        d = r.json()
+        if isinstance(d.get("pass"), str) and isinstance(d.get("expiresAt"), (int, float)):
+            return d["pass"], float(d["expiresAt"])
+    except Exception as e:
+        warn(f"[gateway] portail injoignable pour le laissez-passer : {e}")
+    return None
+
+
+def _gateway_get_pass(force: bool = False) -> str | None:
+    """Laissez-passer utilisable, ou None. `force` = le précédent vient d'être refusé : en redemander un."""
+    with _gateway_pass_lock:
+        st = _gateway_pass_state
+        if not st["loaded"]:
+            st["pass"], st["exp"] = _gateway_pass_load()
+            st["loaded"] = True
+        now = time.time()
+        valid = bool(st["pass"]) and st["exp"] > now + 60
+        fresh = valid and st["exp"] - now > _GATEWAY_PASS_RENEW_WITHIN_S
+        if fresh and not force:
+            return st["pass"]
+        if now >= st["next_attempt"]:
+            got = _gateway_pass_request()
+            if got:
+                st["pass"], st["exp"] = got
+                _gateway_pass_save(*got)
+            # Après un échec OU un renouvellement forcé (l'ancien venait d'être refusé) : 10 min de répit —
+            # un site bloqué par la passerelle ne doit pas rappeler le portail à chaque tentative.
+            if not got or force:
+                st["next_attempt"] = now + _GATEWAY_PASS_RETRY_S
+            if got:
+                return st["pass"]
+        return st["pass"] if (valid and not force) else None
+
+
+def _gateway_get(route: str, params: dict | None = None, timeout: int = 15) -> dict | None:
+    """GET JSON sur la passerelle ; None si indisponible (pas de laissez-passer, réseau, refus, panne).
+    Un 401 (laissez-passer périmé ou clé de signature renouvelée) déclenche UN nouveau laissez-passer puis
+    un nouvel essai."""
+    used = None
+    for attempt in (0, 1):
+        force = attempt == 1 and used is not None and _gateway_pass_state["pass"] == used
+        token = _gateway_get_pass(force)
+        if not token:
+            return None
+        used = token
+        try:
+            r = requests.get(f"{GATEWAY_URL}{route}", params=params or {}, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        except Exception as e:
+            warn(f"[gateway] {route} : {e}")
+            return None
+        if r.status_code == 401 and attempt == 0:
+            continue
+        if not r.ok:
+            warn(f"[gateway] {route} : HTTP {r.status_code} {r.text[:200]}")
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+    return None
+
+
 def _fetch_turn_ice_servers() -> list[dict] | None:
-    """Récupère des identifiants TURN Cloudflare Realtime de courte durée via le
-    backend (secret Cloudflare — TURN_KEY_API_TOKEN — jamais exposé à l'addon, cf.
-    /api/ingest/webrtc-credentials). Retourne None en cas d'échec (réseau, quota
-    Vercel, etc.) — à distinguer d'un repli STUN volontaire : _turn_refresh_loop()
+    """Récupère des identifiants TURN Cloudflare Realtime de courte durée (48 h, rafraîchis toutes les 24 h)
+    via la PASSERELLE API (secret Cloudflare — TURN_KEY_API_TOKEN — jamais exposé à l'addon ; avant le lot C du
+    chantier « Pi-first », route Vercel /api/ingest/webrtc-credentials). Retourne None en cas d'échec (réseau,
+    passerelle, quota…) — à distinguer d'un repli STUN volontaire : _turn_refresh_loop()
     ne doit PAS redémarrer Frigate sur un échec transitoire de ce fetch (bug corrigé
     le 2026-07-19 : un simple hoquet réseau faisait passer _turn_ice_servers d'un
     vrai TURN à un repli STUN, détecté comme un "changement" → redémarrage Frigate
     inutile → coupure caméra réelle → fausse alerte "hors ligne" envoyée au client)."""
     if not INGEST_SECRET:
         return None
-    try:
-        r = requests.post(
-            f"{APP_URL}/api/ingest/webrtc-credentials",
-            json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX},
-            timeout=15,
-        )
-        if not r.ok:
-            warn(f"[webrtc] identifiants TURN : {r.status_code} {r.text[:200]}")
-            return None
-        ice = r.json().get("iceServers")
-        if not ice or not ice.get("urls"):
-            return [{"urls": ["stun:stun.cloudflare.com:3478"]}]
-        return [{"urls": ["stun:stun.cloudflare.com:3478"]}, ice]
-    except Exception as e:
-        warn(f"[webrtc] identifiants TURN : {e}")
+    # 10 s : cet appel est SYNCHRONE au démarrage (run_bridge) — le pire cas reste ~15 s, comme avant.
+    data = _gateway_get("/v1/turn", {"ttl": 172800}, timeout=10)
+    if data is None:
+        warn("[webrtc] identifiants TURN indisponibles (passerelle)")
         return None
+    ice = data.get("iceServers")
+    if not ice or not ice.get("urls"):
+        return [{"urls": ["stun:stun.cloudflare.com:3478"]}]
+    return [{"urls": ["stun:stun.cloudflare.com:3478"]}, ice]
 
 
 def _yaml_dq(value: str) -> str:
