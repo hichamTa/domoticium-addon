@@ -1665,10 +1665,12 @@ def _has_turn(servers: list[dict]) -> bool:
 # ── Passerelle API : laissez-passer du site ─────────────────────────────────────
 # Le Pi n'a AUCUNE clé de fournisseur. Il présente à la passerelle (Worker Cloudflare) un « laissez-passer »
 # signé par le portail, obtenu une fois avec le secret du site (POST APP_URL/api/ingest/gateway-pass), conservé
-# sur disque et renouvelé quand il lui reste moins de 60 jours. Même logique que l'app locale du Pi
+# sur disque et renouvelé dès qu'il a plus de 30 jours. Même logique que l'app locale du Pi
 # (web/src/lib/local/gateway.ts) : le fonctionnement courant ne dépend ni de Vercel ni de Supabase.
 _GATEWAY_PASS_FILE = "/data/gateway-pass.json"
-_GATEWAY_PASS_RENEW_WITHIN_S = 60 * 86400
+# Renouvelé dès qu'il a plus de 30 jours (180 j de validité − 150) : l'adresse e-mail du client y est signée, un
+# changement d'adresse ne doit pas rester ignoré des mois ; portail injoignable → l'ancien sert jusqu'à son expiration.
+_GATEWAY_PASS_RENEW_WITHIN_S = 150 * 86400
 _GATEWAY_PASS_RETRY_S = 600  # pas plus d'un essai toutes les 10 min après un échec ou un refus
 _gateway_pass_lock = threading.Lock()
 _gateway_pass_state = {"pass": None, "exp": 0.0, "loaded": False, "next_attempt": 0.0}
