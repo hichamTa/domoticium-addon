@@ -4067,6 +4067,26 @@ def _remove_legacy_heartbeat_automation_once():
     open(_LEGACY_HEARTBEAT_AUTO_MARKER, "w").close()
 
 
+def handle_local_site() -> dict:
+    """Coordonnées du logement pour l'app Domoticium servie par le Pi (route GET /local/site).
+
+    Source : la config Home Assistant elle-même (zone « home »), la MÊME que `_sync_site_location`
+    reporte à Supabase — mais lue en direct, sans aller-retour cloud (chantier « Pi-first », lot C :
+    l'app du Pi en tire la météo/trafic/vigilance, via la passerelle API pour ce qui exige une clé).
+    `latitude`/`longitude` valent None si la zone « home » n'est pas réglée : l'app affiche alors
+    simplement « indisponible » au lieu de deviner."""
+    r = ha_get("/config")
+    if not r.ok:
+        raise RuntimeError(f"HA /config : HTTP {r.status_code}")
+    cfg = r.json()
+    return {
+        "latitude": cfg.get("latitude"),
+        "longitude": cfg.get("longitude"),
+        "elevation": cfg.get("elevation"),
+        "time_zone": cfg.get("time_zone"),
+    }
+
+
 _SITE_LOCATION_MARKER = "/data/.site_location_reported"
 
 
@@ -11041,6 +11061,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_devices_route()
         elif route == "/local/events":
             self._handle_local_events_route()
+        elif route == "/local/site":
+            self._handle_local_site_route()
         else:
             self._reject(404, "Route inconnue")
 
@@ -11135,6 +11157,13 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._ok(handle_local_devices())
         except Exception as e:
             warn(f"[local-devices] {e}")
+            self._reject(500, str(e))
+
+    def _handle_local_site_route(self):
+        try:
+            self._ok(handle_local_site())
+        except Exception as e:
+            warn(f"[local-site] {e}")
             self._reject(500, str(e))
 
     def _handle_wifi_shelly_discovered_route(self):
