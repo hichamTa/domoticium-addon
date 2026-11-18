@@ -147,6 +147,97 @@ def _supabase_note_result(ok: bool) -> None:
             warn(f"[supabase] indisponible/refusé — pause {step}s avant de réessayer (pauses croissantes jusqu'à 300s)")
 
 
+# ── Compteurs de requêtes sortantes vers le cloud (lot D phase 1 du chantier « Pi-first ») ─────────────
+# Le dépassement du quota Supabase du 2026-11-13 s'est diagnostiqué à l'aveugle : aucune mesure de ce que l'add-on
+# envoie n'existait. Chaque requête vers Supabase (RPC pi_*), Vercel (/api/ingest/*) ou la passerelle API est
+# désormais comptée par « étiquette » (nombre, octets envoyés/reçus, erreurs), par heure (24 h conservées sur
+# disque) et depuis le démarrage. Consultable par GET /local/stats ; un résumé de l'heure écoulée est écrit dans
+# les journaux à chaque changement d'heure. Sert à PROUVER l'effet des retraits de flux (avant/après).
+_CLOUD_STATS_FILE = "/data/cloud-stats.json"
+_CLOUD_STATS_KEEP_HOURS = 24
+_cloud_stats_lock = threading.Lock()
+_cloud_stats = {"loaded": False, "since": time.time(), "totals": {}, "hours": {}}
+
+
+def _cloud_stats_load() -> None:
+    if _cloud_stats["loaded"]:
+        return
+    _cloud_stats["loaded"] = True
+    try:
+        with open(_CLOUD_STATS_FILE) as f:
+            _cloud_stats["hours"] = {k: v for k, v in (json.load(f).get("hours") or {}).items() if isinstance(v, dict)}
+    except Exception:
+        _cloud_stats["hours"] = {}
+
+
+def _cloud_stats_summary(bucket: dict) -> str:
+    total_n = sum(v["n"] for v in bucket.values())
+    total_b = sum(v["out"] + v["in"] for v in bucket.values())
+    top = sorted(bucket.items(), key=lambda kv: kv[1]["n"], reverse=True)[:4]
+    return f"{total_n} requêtes, {total_b / 1024:.1f} Ko — " + ", ".join(f"{k} ×{v['n']}" for k, v in top)
+
+
+def _cloud_stats_flush(hours: dict) -> None:
+    try:
+        tmp = _CLOUD_STATS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"hours": hours}, f)
+        os.replace(tmp, _CLOUD_STATS_FILE)
+    except Exception:
+        pass
+
+
+def _cloud_note(label: str, sent: int, received: int, ok: bool, now: float | None = None) -> None:
+    """Compte UNE requête sortante. Jamais d'exception (ne doit pas perturber l'envoi lui-même)."""
+    try:
+        now = time.time() if now is None else now
+        hour = str(int(now // 3600))
+        rolled = None
+        with _cloud_stats_lock:
+            _cloud_stats_load()
+            hours = _cloud_stats["hours"]
+            if hour not in hours and hours:
+                previous = max(hours, key=int)
+                rolled = (previous, dict(hours[previous]))
+            for bucket in (hours.setdefault(hour, {}), _cloud_stats["totals"]):
+                c = bucket.setdefault(label, {"n": 0, "out": 0, "in": 0, "err": 0})
+                c["n"] += 1
+                c["out"] += max(0, int(sent))
+                c["in"] += max(0, int(received))
+                c["err"] += 0 if ok else 1
+            if rolled:
+                for old in sorted(hours, key=int)[:-_CLOUD_STATS_KEEP_HOURS]:
+                    del hours[old]
+                snapshot = {h: dict(b) for h, b in hours.items()}
+        if rolled:
+            log(f"[cloud-stats] heure écoulée : {_cloud_stats_summary(rolled[1])}")
+            _cloud_stats_flush(snapshot)
+    except Exception:
+        pass
+
+
+def handle_local_stats() -> dict:
+    """GET /local/stats : requêtes cloud depuis le démarrage + les dernières heures."""
+    with _cloud_stats_lock:
+        _cloud_stats_load()
+        return {
+            "since": _cloud_stats["since"],
+            "totals": {k: dict(v) for k, v in _cloud_stats["totals"].items()},
+            "hours": {h: {k: dict(v) for k, v in b.items()} for h, b in sorted(_cloud_stats["hours"].items(), key=lambda kv: int(kv[0]))},
+        }
+
+
+def _cloud_post(label: str, url: str, **kwargs):
+    """requests.post compté (Vercel /api/ingest/*, passerelle). Même comportement que requests.post."""
+    try:
+        r = requests.post(url, **kwargs)
+    except Exception:
+        _cloud_note(label, len(json.dumps(kwargs.get("json"), default=str)) if kwargs.get("json") is not None else 0, 0, False)
+        raise
+    _cloud_note(label, len(r.request.body or b"") if getattr(r, "request", None) is not None else 0, len(r.content or b""), r.ok)
+    return r
+
+
 def _supabase_rpc(fn_name: str, payload: dict, timeout: float = 10.0) -> requests.Response:
     """Appelle une fonction Postgres pi_* via PostgREST (clé publique anon — la vraie
     autorisation vient de la signature HMAC incluse dans payload, vérifiée côté DB)."""
@@ -168,8 +259,10 @@ def _supabase_rpc(fn_name: str, payload: dict, timeout: float = 10.0) -> request
         )
     except Exception:
         _supabase_note_result(False)
+        _cloud_note(f"supabase:{fn_name}", len(json.dumps(payload, default=str)), 0, False)
         raise
     _supabase_note_result(not (r.status_code in (402, 429) or r.status_code >= 500))
+    _cloud_note(f"supabase:{fn_name}", len(r.request.body or b"") if getattr(r, "request", None) is not None else 0, len(r.content or b""), r.ok)
     return r
 
 def _normalize_device(
@@ -1704,7 +1797,8 @@ def _gateway_pass_request() -> tuple[str, float] | None:
     if not INGEST_SECRET or not SITE_PREFIX:
         return None
     try:
-        r = requests.post(
+        r = _cloud_post(
+            "vercel:ingest/gateway-pass",
             f"{APP_URL}/api/ingest/gateway-pass",
             json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX},
             timeout=15,
@@ -1763,7 +1857,9 @@ def _gateway_request(method: str, route: str, params: dict | None = None, body: 
                                  headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
         except Exception as e:
             warn(f"[gateway] {route} : {e}")
+            _cloud_note(f"gateway:{method} {route}", len(json.dumps(body, default=str)) if body is not None else 0, 0, False)
             return 0, None
+        _cloud_note(f"gateway:{method} {route}", len(r.request.body or b"") if getattr(r, "request", None) is not None else 0, len(r.content or b""), r.ok)
         if r.status_code == 401 and attempt == 0:
             continue
         if not r.ok:
@@ -5640,7 +5736,8 @@ def _post_ingest_commission_status(
     if not INGEST_SECRET:
         return
     try:
-        requests.post(
+        _cloud_post(
+            "vercel:ingest/commission-status",
             f"{APP_URL}/api/ingest/commission-status",
             json={
                 "siteSecret": INGEST_SECRET,
@@ -5916,16 +6013,6 @@ def _configure_zlinky_tic_polling_logged(ieee: str) -> None:
         warn(f"[zlinky-tic] échec configuration polling pour {ieee} : {result}")
 
 
-# friendly_name → online, messages availability arrivés AVANT que le cache ci-dessus
-# ne soit peuplé (ex: juste après un redémarrage addon — Mosquitto souscrit
-# quasi instantanément, alors que le 1er cycle de sync qui peuple le cache ci-dessus
-# attend ~30s, cf. logs "premier sync dans 30s"). Sans ce tampon, un message
-# "online" retenu par Mosquitto reçu dans cette fenêtre était silencieusement
-# perdu (ieee introuvable → ignoré) — si c'était la SEULE transition offline→online
-# depuis la dernière vraie coupure, l'alerte correspondante restait bloquée pour
-# toujours, jusqu'à la prochaine vraie coupure de ce device. Rejoué dans
-# _sync_zigbee_devices_direct() dès que le cache ci-dessus est reconstruit.
-_pending_z2m_availability: dict[str, bool] = {}
 # node_id Matter commissionnés explicitement via "Ajouter un équipement" (cf.
 # handle_matter_commission) — exclus de la détection de fusion de doublon
 # (pi_sync_matter_devices) : un vrai nouvel achat, identique à un équipement déjà
@@ -6010,100 +6097,9 @@ def _check_and_fix_mqtt_broker():
         break
 
 
-def _reconcile_device_states():
-    """(2026-09-02) Filet de réconciliation périodique pour `online` — bug réel
-    signalé par Hicham : "Ampoule couloir"/"Alarme entrée" hors ligne dans HA mais
-    toujours `online=true` côté app. Cause : `run_ha_ws_bridge()` (état événementiel,
-    seul chemin qui met à jour `online`) ne relaie QUE les `state_changed` reçus —
-    or HA ne republie JAMAIS un état "unavailable"/"unknown" en boucle une fois
-    émis. Une entité déjà hors ligne au démarrage de HA, ou tombée hors ligne
-    pendant une coupure de l'add-on (redémarrage, réseau), n'émet plus aucun
-    nouvel événement à relayer : `online` reste figé à sa dernière valeur
-    (`true`) indéfiniment, sans qu'aucun futur `state_changed` ne vienne le
-    corriger puisque rien ne change plus côté HA non plus.
-
-    Repousse SEULEMENT les entités actuellement unavailable/unknown (jamais un
-    état normal — pousser un état inchangé rafraîchirait artificiellement son
-    `last_seen`, qui sert par ailleurs à diagnostiquer la fraîcheur RÉELLE du
-    reporting Zigbee, cf. mesures de latence électrique HANDOFF 2026-09-01 ;
-    aucun risque ici puisqu'une entité déjà unavailable n'a justement plus de
-    valeur dont la fraîcheur compte). Même chemin qu'un vrai événement
-    (_relay_ha_state) — auto-réparateur à chaque cycle de sync (5 min), jamais
-    de logique dupliquée avec le bridge événementiel.
-
-    (2026-09-12) Extension — SENS INVERSE, bug réel trouvé par Hicham : des
-    appareils ("prise chambre"/"prise salon") restaient marqués `online=false`
-    (alerte comprise) alors que HA les montrait bien normaux ("on") depuis
-    plusieurs jours. Cause : ce filet ne corrigeait jusqu'ici QUE le sens
-    "online=true alors que HA montre unavailable" — jamais l'inverse. Si
-    l'UNIQUE `state_changed` marquant le retour en ligne est manqué (ex:
-    l'add-on redémarre pile à ce moment), rien ne le rattrape : HA ne republie
-    jamais le même état en boucle. Corrige maintenant aussi ce sens : compare
-    la liste des entités marquées `online=false` côté app (nouvelle RPC
-    `pi_list_offline_devices`) à l'état HA RÉEL déjà récupéré ci-dessus — pour
-    celles dont HA ne montre PAS unavailable/unknown, repousse l'état réel
-    (même chemin `_relay_ha_state`, donc `online` recalculé correctement)."""
-    r = ha_get("/states")
-    if not r.ok:
-        warn(f"[reconcile] /states {r.status_code}: {r.text[:150]}")
-        return
-    try:
-        states = r.json()
-    except Exception as e:
-        warn(f"[reconcile] réponse /states invalide: {e}")
-        return
-
-    states_by_entity = {
-        s["entity_id"]: s for s in states if isinstance(s, dict) and s.get("entity_id")
-    }
-
-    n = 0
-    for s in states:
-        if not isinstance(s, dict):
-            continue
-        state_val = s.get("state", "")
-        if state_val not in ("unavailable", "unknown"):
-            continue
-        entity_id = s.get("entity_id", "")
-        domain = entity_id.split(".")[0] if "." in entity_id else ""
-        if domain not in RELAY_DOMAINS:
-            continue
-        _relay_ha_state(entity_id, state_val, s.get("attributes") or {})
-        n += 1
-    if n:
-        log(f"[reconcile] {n} entité(s) unavailable/unknown repoussée(s) (filet périodique)")
-
-    try:
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:list_offline_devices"
-        resp = _supabase_rpc("pi_list_offline_devices", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-        })
-        offline_entity_ids = [row["ha_entity_id"] for row in resp.json()] if resp.ok else []
-    except Exception as e:
-        warn(f"[reconcile] pi_list_offline_devices échoué : {e}")
-        offline_entity_ids = []
-
-    m = 0
-    for entity_id in offline_entity_ids:
-        s = states_by_entity.get(entity_id)
-        if not s:
-            continue
-        state_val = s.get("state", "")
-        if state_val in ("unavailable", "unknown"):
-            continue  # toujours réellement hors ligne, rien à corriger
-        domain = entity_id.split(".")[0] if "." in entity_id else ""
-        if domain not in RELAY_DOMAINS:
-            continue
-        _relay_ha_state(entity_id, state_val, s.get("attributes") or {})
-        m += 1
-    if m:
-        log(f"[reconcile] {m} entité(s) revenue(s) en ligne re-synchronisée(s) (filet périodique)")
-
-
 def _run_ha_maintenance_cycle():
     """Cycle d'entretien LOCAL (toutes les 5 min, ou tout de suite via _sync_requested) : réveil de Z2M, réconciliation
-    des équipements Matter/Wi-Fi, liens d'entités, réconciliation d'états/d'alarme, IP locale et certificat.
+    des équipements Matter/Wi-Fi, liens d'entités, réconciliation de l'alarme, IP locale et certificat.
 
     Lot D (phase 0) du chantier « Pi-first » : ce cycle (ex-`_sync_all_to_ha`) commençait par TIRER l'état voulu depuis le
     cloud (GET /api/webhooks/pi/sync-state : pièces, affectations, scènes, automatisations et caméras de Supabase) et
@@ -6152,7 +6148,6 @@ def _run_ha_maintenance_cycle():
 
     _backfill_ha_entity_links()
     _backfill_camera_entity_links()
-    _reconcile_device_states()
     _reconcile_alarm_state()
     _report_local_ip()
     _fetch_local_cert()
@@ -6243,7 +6238,7 @@ def _backfill_ha_entity_links():
                     continue
                 payload["wifiId"] = wifi_id
         try:
-            requests.post(f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
+            _cloud_post("vercel:ingest/registry", f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
         except Exception as ex:
             warn(f"[sync] backfill ha_entity_id {entity_id}: {ex}")
 
@@ -6306,7 +6301,8 @@ def _backfill_camera_entity_links():
             continue
 
         try:
-            requests.post(
+            _cloud_post(
+                "vercel:ingest/camera-registry",
                 f"{APP_URL}/api/ingest/camera-registry",
                 json={
                     "siteSecret": INGEST_SECRET,
@@ -6367,83 +6363,24 @@ def call_heartbeat_api():
     _heartbeat_direct()
 
 
-# Domaines HA à persister (filtre pour réduire le trafic — tout ce que l'app affiche).
-# Module-level (pas local à run_ha_ws_bridge) — réutilisé par _reconcile_device_states()
-# (2026-09-02) pour la réconciliation périodique ci-dessous, même filtre.
-RELAY_DOMAINS = {
-    "light", "switch", "cover", "lock", "fan", "valve", "humidifier", "climate",
-    "sensor", "binary_sensor", "input_boolean", "media_player", "camera",
-    "alarm_control_panel", "scene", "automation",
-    # select/number : entités secondaires de config (ex: mélodie/volume/durée
-    # d'une sirène de clavier) — jusqu'ici exclues du relai, donc jamais
-    # rafraîchies dans device_entities (état/attributs toujours vides), bug
-    # trouvé en conditions réelles (Hicham, 2026-08-10 : "Duration" affichait
-    # NaN, "Volume"/"Melody" restaient vides malgré des vraies valeurs côté HA).
-    "select", "number",
-}
+def _relay_alarm_state(entity_id: str, state_val: str, attributes: dict):
+    """Pousse l'état d'une alarme (alarm_control_panel.*) vers Supabase (pi_report_alarm_state) — appel direct
+    immédiat (rare : seulement les transitions). Depuis le lot D (phase 1) du chantier « Pi-first », c'est le SEUL état
+    d'équipement encore remonté au cloud : il déclenche le PUSH « alarme déclenchée » (pg_net → /api/webhooks/push-alarm),
+    fonction de sécurité conservée jusqu'à ce que le Pi envoie lui-même ses notifications (lot F). Tout le reste
+    (lumières, capteurs, prises, mesures… — le gros du volume Supabase) n'est plus envoyé : l'app du Pi lit HA directement.
 
-
-def _relay_ha_state(entity_id: str, state_val: str, attributes: dict):
-    """Pousse un état HA (entity_id/state/attributes) vers Supabase — même chemin
-    que ce que déclenche un `state_changed` réel (WS bridge) : alarm_control_panel
-    en appel direct immédiat (peu fréquent, pas besoin d'attendre le cycle du
-    batch), le reste accumulé dans _state_batch (_flush_state_batch() l'envoie
-    toutes les 2.5s, dédupliqué par entity_id). Factorisé (2026-09-02) pour être
-    appelable aussi depuis _reconcile_device_states() — la réconciliation
-    périodique doit produire EXACTEMENT le même effet qu'un vrai événement, pas
-    une logique parallèle.
-
-    Audit add-on 2026-09-22 : l'appel direct alarme n'avait aucun filet de
-    retry (contrairement à _state_batch) — un échec (Supabase indisponible,
-    timeout) perdait la transition définitivement. En cas d'échec du premier
-    essai immédiat, réintégré dans _alarm_state_batch pour être retenté par
-    _flush_state_batch au prochain cycle (2.5s), même garantie de livraison
-    que le reste."""
-    domain = entity_id.split(".")[0] if "." in entity_id else ""
-    if domain not in RELAY_DOMAINS or not INGEST_SECRET:
+    Audit add-on 2026-09-22 : l'appel direct n'avait aucun filet de retry — un échec (Supabase indisponible, timeout)
+    perdait la transition définitivement, sur la donnée la plus sensible du système. En cas d'échec du premier essai,
+    réintégré dans _alarm_state_batch pour être retenté par _flush_alarm_state_batch au prochain cycle (2.5s)."""
+    if not entity_id.startswith("alarm_control_panel.") or not INGEST_SECRET:
         return
-    if domain == "alarm_control_panel":
-        def _send_alarm_with_retry():
-            if not _report_alarm_state_direct(entity_id, state_val, attributes):
-                with _state_batch_lock:
-                    _alarm_state_batch[entity_id] = (state_val, attributes)
-        threading.Thread(target=_send_alarm_with_retry, daemon=True).start()
-        return
-    with _state_batch_lock:
-        _state_batch[entity_id] = (state_val, attributes)
 
-
-def _push_initial_entity_state(entity_id: str):
-    """Pousse l'état ACTUEL d'une entité tout juste créée dans HA — comble un vrai
-    trou trouvé en conditions réelles (2026-11-10) : un appareil Matter fraîchement
-    commissionné (ampoule KAJPLATS) restait avec `state: {}` indéfiniment côté app
-    alors que HA le montrait bien allumé. Cause : `state` n'est alimenté QUE par un
-    `state_changed` relayé (run_ha_ws_bridge) — pour une entité qu'on vient de créer,
-    HA émet en général UN SEUL `state_changed` (sa toute première valeur), souvent
-    AVANT que `entity_registry_updated(create)` lui-même n'arrive, ou avant que ce
-    thread ne soit prêt à le traiter — l'app ne le voit jamais, et comme ce n'est
-    pas "unavailable"/"unknown", _reconcile_device_states() (filet existant,
-    2026-09-02) ne le rattrape pas non plus : il ne corrige QUE `online`, pas un
-    `state` resté vide. Un Zigbee tout juste appairé n'a jamais ce trou car Z2M
-    republie son état complet dès l'appairage (indépendant de ce mécanisme HA).
-
-    Petit délai avant lecture : juste après sa création, l'entité peut encore être
-    à "unknown" le temps que HA lise sa 1ère valeur réelle (Matter en particulier,
-    qui interroge le device juste après commissioning) — lire tout de suite
-    pousserait "unknown" au lieu du vrai état, revu seulement au state_changed
-    suivant (qui peut ne jamais arriver si l'état n'évolue plus ensuite)."""
-    time.sleep(3)
-    r = ha_get(f"/states/{entity_id}")
-    if not r.ok:
-        return
-    try:
-        s = r.json()
-    except Exception:
-        return
-    state_val = s.get("state", "")
-    if state_val in ("", "unknown"):
-        return  # pas encore prêt — un futur state_changed réel le rattrapera
-    _relay_ha_state(entity_id, state_val, s.get("attributes") or {})
+    def _send_alarm_with_retry():
+        if not _report_alarm_state_direct(entity_id, state_val, attributes):
+            with _state_batch_lock:
+                _alarm_state_batch[entity_id] = (state_val, attributes)
+    threading.Thread(target=_send_alarm_with_retry, daemon=True).start()
 
 
 # ── Flux temps réel vers l'app locale (SSE) ────────────────────────────────
@@ -6508,13 +6445,10 @@ def _sse_note_state_change(entity_id: str, new_state: dict) -> None:
 
 
 def run_ha_ws_bridge():
-    """Thread permanent : écoute HA WebSocket → persiste état + registre vers Supabase (ingest).
-    Seul canal d'état événementiel — remplace entièrement EMQX et les automations HA
-    State Stream. Complété par _reconcile_device_states() (sync périodique, cf. plus
-    bas) pour les cas où AUCUN state_changed ne survient (ex: une entité déjà
-    "unavailable" au démarrage de l'add-on, ou depuis avant que l'add-on ne tourne —
-    HA ne republie jamais "unavailable" en boucle, donc rien ne corrige un online=true
-    resté stale sans ce filet)."""
+    """Thread permanent : écoute le WebSocket de Home Assistant (state_changed + entity_registry_updated). Seul canal d'état
+    événementiel. Alimente : le flux temps réel de l'app du Pi (SSE), le moteur d'alertes, le relais d'ALARME vers le cloud
+    (seul état encore remonté, cf. _relay_alarm_state) et le registre d'entités. Depuis le lot D (phase 1) du chantier
+    « Pi-first », les états d'équipements ne sont plus envoyés à Supabase."""
     global _ws_bridge_connected
     while True:
         _ws_bridge_connected = False
@@ -6546,7 +6480,7 @@ def run_ha_ws_bridge():
                         continue
                     _sse_note_state_change(entity_id, new_state)
                     _alerts_note_state(entity_id, new_state.get("state", ""), new_state.get("attributes") or {})
-                    _relay_ha_state(entity_id, new_state.get("state", ""), new_state.get("attributes", {}))
+                    _relay_alarm_state(entity_id, new_state.get("state", ""), new_state.get("attributes", {}))
 
                 elif event_type == "entity_registry_updated":
                     action = data.get("action")
@@ -6557,12 +6491,6 @@ def run_ha_ws_bridge():
                             target=_post_ingest_registry,
                             args=(entity_id, ha_action, data),
                             daemon=True,
-                        ).start()
-                    # (2026-11-10) cf. docstring _push_initial_entity_state — comble le
-                    # trou "state: {}" pour un device Matter/natif tout juste créé.
-                    if entity_id and action == "create":
-                        threading.Thread(
-                            target=_push_initial_entity_state, args=(entity_id,), daemon=True,
                         ).start()
                     # Une entité créée/retirée dans HA (Matter ou natif — Zigbee est
                     # déjà instantané via zigbee2mqtt/bridge/devices, cf. on_local_message)
@@ -6891,151 +6819,17 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
     return result
 
 
-# ── Batch d'états : accumule les state_changed, flush toutes les 2.5s ────────
-# Réduit les appels Vercel de ×N (un par event) à 1 par fenêtre temporelle.
-# La déduplication par entity_id garantit qu'on n'envoie que le dernier état connu.
-_state_batch: dict = {}
+# ── Retry de l'état d'alarme (seul état encore remonté au cloud) ──────────────────────────────────────
+# Les batchs d'états d'équipements (HA + Zigbee brut), leurs frein/filtres/tolérances et le « statut caméra » ont été retirés
+# au lot D (phase 1) : c'était le gros du volume Supabase (3 dépassements de quota en novembre 2026). Reste le retry de
+# l'alarme, qui utilise une RPC dédiée (pi_report_alarm_state) — cf. _relay_alarm_state / _flush_alarm_state_batch.
 _state_batch_lock = threading.Lock()
-
-# Retry pour l'état alarme — audit add-on 2026-09-22 : contrairement à tous les
-# autres domaines de RELAY_DOMAINS (garantis par _state_batch/_flush_state_batch,
-# cf. docstring de cette dernière), alarm_control_panel était envoyé par un
-# thread direct sans AUCUN filet — un échec (Supabase indisponible, timeout
-# réseau) perdait la transition d'alarme définitivement, sans retry ni
-# rattrapage, sur la donnée la plus sensible du système. Dict séparé (pas
-# _state_batch) car l'alarme utilise une RPC dédiée (pi_report_alarm_state,
-# pas pi_report_device_state — cf. _report_alarm_state_direct). Réutilise
-# _state_batch_lock (opérations rares et triviales, pas de contention réelle).
 _alarm_state_batch: dict = {}
 
-# Frein dédié aux entités "sensor.*" (audit egress Supabase, 2026-09-21,
-# 2e volet — étend à Matter/WiFi le même principe que le boost Zigbee
-# ci-dessus : "prise pour cause de bruit de mesure" était spécifique à
-# Zigbee, mais un capteur Matter/WiFi bavard cause exactement le même
-# problème via CE chemin — _report_device_state_direct est le point d'entrée
-# UNIQUE et déjà partagé par les 3 protocoles dès qu'une entité a un
-# ha_entity_id. Domaine "sensor" choisi précisément : jamais un actionneur
-# (light/switch/cover/lock/fan/climate), jamais l'alarme (déjà hors batch,
-# cf. _relay_ha_state) ni un binary_sensor de sécurité (mouvement/ouverture/
-# fumée) — seulement des mesures passives (température/CO2/humidité/
-# puissance/etc.), exactement le même genre d'attribut que _REPORTING_ATTRS
-# côté Zigbee. Ne retarde jamais une commande ni un capteur de sécurité.
-_SENSOR_REPORT_MIN_INTERVAL_S = 20
-_sensor_report_last_sent: dict[str, float] = {}
-
-# Filtre "rien de nouveau" (2026-09-27, chantier consommation de données — quota
-# Supabase/Vercel proche de la limite) : mesuré en direct sur 90 s, UN SEUL
-# lecteur média (télé) représentait 91 % des `state_changed` de tout le site
-# (~2 par seconde), alors que seuls `media_position`/`media_position_updated_at`
-# changeaient — un simple compteur de lecture, sans valeur pour l'app. Chaque
-# événement déclenchait pourtant un appel Supabase complet. Règle GÉNÉRALE (par
-# nom d'attribut, jamais par équipement : tout lecteur média d'un futur client,
-# Sonos/Chromecast/TV, se comporte pareil) : si l'état ET tous les attributs
-# HORS de cette liste sont identiques au dernier envoi réussi de cette entité,
-# on n'appelle pas Supabase. `_DEDUPE_REFRESH_S` : renvoi forcé au bout de 5 min
-# même sans changement, pour garder `last_seen` de l'entité raisonnablement
-# frais. Ne concerne que des attributs "horloge" — un vrai changement d'état ou
-# d'un autre attribut (batterie, sabotage, valeur…) passe toujours.
+# Attributs « horloge » qui changent sans valeur pour l'app (position d'un lecteur média…) : un événement dont l'état ET
+# tous les autres attributs sont identiques au précédent est ignoré par le flux temps réel local (cf. _sse_note_state_change)
+# — un seul téléviseur représentait 91 % des state_changed d'un site (mesuré le 2026-09-27).
 _DEDUPE_IGNORED_ATTRS = frozenset({"media_position", "media_position_updated_at", "last_seen"})
-_DEDUPE_REFRESH_S = 300
-_last_reported_signature: dict[str, tuple[str, float]] = {}
-
-# ── Envoi groupé + filtre des états Zigbee bruts (2026-11-13) ────────────────
-# 3e dépassement du quota egress Supabase. Cause mesurée : un appel HTTP par
-# entité/message (même pour une valeur identique), alors que le coût par appel
-# (en-têtes, vérification HMAC, lecture du secret) dépasse celui de la donnée.
-# Désormais :
-#  - changement "discret" (interrupteur, contact, mouvement, bouton, batterie,
-#    luminosité…) → part au prochain cycle (2,5 s) ;
-#  - simples mesures (puissance, courant, tension, énergie…) → ramassées et
-#    envoyées toutes les _MEASURE_FLUSH_S secondes ;
-#  - TOUT (les deux voies, HA + Zigbee brut) part dans UN SEUL appel
-#    pi_report_states_batch par cycle, signé une fois ;
-#  - une mesure n'est renvoyée que si elle a bougé au-delà d'une tolérance
-#    (_ZB_DEADBAND) par rapport à la dernière valeur ENVOYÉE (pas reçue —
-#    sinon une dérive lente ne dépasserait jamais le seuil) ; le bruit pur
-#    (qualité du signal, date du Linky…) est ignoré ;
-#  - rien de nouveau → un envoi de rafraîchissement toutes les 5 min seulement.
-_MEASURE_FLUSH_S = 10
-_ZB_REFRESH_S = 300
-_BATCH_MAX_ITEMS = 100
-_ZB_NOISE_KEYS = frozenset({"linkquality", "update", "update_available", "last_seen", "current_date"})
-# clé Z2M → (seuil relatif, seuil absolu) : changement significatif si |Δ| ≥ max(abs, rel×|ancienne|)
-_ZB_DEADBAND = {
-    "voltage": (0.0, 2.0), "rms_voltage": (0.0, 2.0), "average_rms_voltage_meas_period": (0.0, 2.0),
-    "power": (0.05, 2.0), "active_power": (0.05, 2.0), "apparent_power": (0.05, 2.0),
-    "current": (0.05, 0.02), "rms_current": (0.05, 0.02),
-}
-_ZB_MEASURE_PREFIXES = (
-    "active_power", "apparent_power", "reactive_power", "power", "voltage", "current", "rms_",
-    "energy", "current_summ", "current_tier", "active_energy", "drawn_v_a", "average_rms",
-)
-_zb_last_sent: dict[str, tuple[dict, float]] = {}
-_zb_pending: dict[str, dict] = {}
-_zb_pending_urgent: set[str] = set()
-_last_measure_flush = 0.0
-_batch_rpc_disabled_until = 0.0
-
-
-def _zb_is_measure(key: str, old, new) -> bool:
-    numeric = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-    return (numeric(old) or old is None) and numeric(new) and key.startswith(_ZB_MEASURE_PREFIXES)
-
-
-def _zb_measure_changed(key: str, old, new) -> bool:
-    if old is None:
-        return True
-    rel, absolute = _ZB_DEADBAND.get(key, (0.0, 0.0))
-    return abs(new - old) >= max(absolute, rel * abs(old)) and new != old
-
-
-def _zb_classify(prev: dict | None, new: dict) -> str | None:
-    """Compare l'état Z2M reçu à la dernière version ENVOYÉE : "urgent" (un champ
-    discret a changé), "measure" (seules des mesures ont bougé au-delà de leur
-    tolérance) ou None (rien de significatif)."""
-    if prev is None:
-        return "urgent"
-    measure_changed = False
-    for key in set(prev) | set(new):
-        if key in _ZB_NOISE_KEYS:
-            continue
-        old_v, new_v = prev.get(key), new.get(key)
-        if old_v == new_v:
-            continue
-        if _zb_is_measure(key, old_v, new_v):
-            if _zb_measure_changed(key, old_v, new_v):
-                measure_changed = True
-        else:
-            return "urgent"
-    return "measure" if measure_changed else None
-
-
-def _zb_enqueue(ieee: str, raw_state: dict) -> None:
-    now = time.time()
-    sent = _zb_last_sent.get(ieee)
-    kind = _zb_classify(sent[0] if sent else None, raw_state)
-    if kind is None:
-        if sent and now - sent[1] < _ZB_REFRESH_S:
-            with _state_batch_lock:
-                if ieee in _zb_pending:
-                    _zb_pending[ieee] = raw_state
-            return
-        kind = "measure"
-    with _state_batch_lock:
-        _zb_pending[ieee] = raw_state
-        if kind == "urgent":
-            _zb_pending_urgent.add(ieee)
-
-
-def _ha_item_is_urgent(entity_id: str) -> bool:
-    return not entity_id.startswith("sensor.")
-
-# ── Watchdog caméras ─────────────────────────────────────────────────────────
-# Sonde go2rtc toutes les 60s, envoie les deltas dans le même flush que les états.
-_cam_watch_online: dict[str, bool] = {}   # streamName → dernière valeur connue
-_cam_watch_dirty: set[str] = set()        # streamNames dont le statut a changé
-_cam_watch_lock = threading.Lock()
-
 
 def _go2rtc_active_consumers() -> dict[str, bool]:
     """Liste (via /api/streams, une seule requête légère, aucune nouvelle connexion
@@ -7124,36 +6918,17 @@ def _probe_cameras_go2rtc() -> dict[str, bool]:
 
 
 def _run_camera_watchdog():
-    """Thread de fond : sonde les caméras via go2rtc toutes les 60s.
-    Chaque cycle est injecté dans _cam_watch_dirty pour être envoyé dans le
-    prochain flush de _flush_state_batch.
-
-    §97 : le thread ne mourait pas silencieusement (l'hypothèse initiale) — le vrai
-    problème, trouvé en conditions réelles le 2026-07-26 grâce à l'horodatage des
-    logs (§97bis) : ce cycle ne rapportait auparavant que les CHANGEMENTS d'état
-    (`if _cam_watch_online.get(name) != new_online`). Une caméra qui reste en ligne
-    en continu n'était donc plus jamais re-rapportée après son premier passage à
-    'true' — last_seen ne se rafraîchissait plus jamais pour elle. Mais le filet
-    pg_cron (§91, check_stale_cameras) suppose que last_seen se rafraîchit
-    périodiquement pour prouver qu'une caméra est toujours vivante : au bout de 5
-    minutes sans nouveau rapport (même si rien n'avait changé), il concluait à tort
-    à une coupure et marquait la caméra hors ligne — systématiquement, ~5-10 min
-    après chaque redémarrage, indépendamment du masquage ou des tentatives
-    précédentes (§92/§95/§96), qui corrigeaient toutes un faux problème. **Fix** :
-    chaque caméra est désormais marquée 'dirty' à CHAQUE cycle, changement ou non —
-    last_seen reste frais tant que le watchdog tourne et sonde avec succès, ce qui
-    est exactement ce dont pg_cron a besoin. Le blindage try/except (toujours utile,
-    gardé) continue de protéger contre une vraie exception future."""
+    """Thread de fond : sonde les caméras via go2rtc toutes les 60s et transmet chaque résultat au moteur d'alertes
+    (_alerts_note_camera). Depuis le lot D (phase 1) du chantier « Pi-first », le statut des caméras n'est plus envoyé à
+    Supabase (1 requête par caméra et par minute) : l'ancien filet pg_cron « check_stale_cameras », qui supposait un
+    last_seen rafraîchi toutes les minutes, n'a plus d'objet. Blindé : une exception non prévue ne tue pas le thread
+    (§97, journalisée, la boucle continue)."""
     time.sleep(30)  # laisser go2rtc démarrer
     while True:
         try:
             if _cameras:
                 probed = _probe_cameras_go2rtc()
                 if probed:
-                    with _cam_watch_lock:
-                        for name in list(_cameras):
-                            _cam_watch_online[name] = probed.get(name, False)
-                            _cam_watch_dirty.add(name)
                     for name in list(_cameras):
                         _alerts_note_camera(name, probed.get(name, False))
         except Exception as e:
@@ -7463,160 +7238,6 @@ def _run_alerts_engine():
         _alerts_wake.clear()
 
 
-# Mêmes tolérances que _ZB_DEADBAND, appliquées aux capteurs Matter/Wi-Fi (entités HA
-# sensor.* — ils n'ont pas de message Zigbee brut). (device_class, unité) → (relatif, absolu).
-# Les compteurs d'énergie (kWh) n'ont volontairement aucune tolérance.
-_HA_SENSOR_DEADBAND = {
-    ("power", "W"): (0.05, 2.0), ("apparent_power", "VA"): (0.05, 2.0),
-    ("voltage", "V"): (0.0, 2.0), ("current", "A"): (0.05, 0.02),
-}
-
-
-def _ha_sensor_within_deadband(prev_signature: str, state: str, attributes: dict, signature: str) -> bool:
-    """True si seule la VALEUR numérique d'un capteur de puissance/tension/courant
-    a bougé, et de moins que sa tolérance, depuis le dernier envoi réussi (les
-    attributs hors état doivent être strictement identiques)."""
-    tol = _HA_SENSOR_DEADBAND.get((attributes.get("device_class"), attributes.get("unit_of_measurement")))
-    if not tol or "\x00" not in prev_signature or "\x00" not in signature:
-        return False
-    prev_state, prev_attrs = prev_signature.split("\x00", 1)
-    if prev_attrs != signature.split("\x00", 1)[1]:
-        return False
-    try:
-        old, new = float(prev_state), float(state)
-    except ValueError:
-        return False
-    return abs(new - old) < max(tol[1], tol[0] * abs(old))
-
-
-def _prepare_ha_state_item(entity_id: str, state: str, attributes: dict):
-    """Même décision que le début de _report_device_state_direct (dédoublonnage,
-    frein des capteurs), mais SANS appel réseau : renvoie ("skip"|"defer"|"send",
-    item pour pi_report_states_batch, signature de dédoublonnage). "skip" = rien
-    de nouveau (considéré réussi), "defer" = trop tôt, à retenter plus tard."""
-    domain = entity_id.split(".")[0] if "." in entity_id else ""
-    try:
-        signature = state + "\x00" + json.dumps(
-            {k: v for k, v in attributes.items() if k not in _DEDUPE_IGNORED_ATTRS},
-            sort_keys=True, default=str,
-        )
-    except Exception:
-        signature = ""
-    if signature:
-        prev = _last_reported_signature.get(entity_id)
-        if prev and prev[0] == signature and time.time() - prev[1] < _DEDUPE_REFRESH_S:
-            return "skip", None, signature
-        if prev and domain == "sensor" and time.time() - prev[1] < _DEDUPE_REFRESH_S \
-                and _ha_sensor_within_deadband(prev[0], state, attributes, signature):
-            return "skip", None, signature
-    if domain == "sensor":
-        now = time.time()
-        if now - _sensor_report_last_sent.get(entity_id, 0.0) < _SENSOR_REPORT_MIN_INTERVAL_S:
-            return "defer", None, signature
-        _sensor_report_last_sent[entity_id] = now
-    item = {
-        "k": "ha", "id": entity_id, "state": state,
-        "patch": _ha_entity_to_normalized_patch(entity_id, state, attributes),
-        "cap": _ha_attributes_to_capabilities(entity_id, attributes),
-        "attrs": attributes,
-    }
-    return "send", item, signature
-
-
-def _send_states_batch(items: list) -> bool:
-    """UN appel pi_report_states_batch (par paquets de _BATCH_MAX_ITEMS). True si
-    tous les paquets ont réussi. Fonction absente côté base (404, ex. migration
-    pas encore appliquée) : désactive le mode groupé 10 min et signale l'échec —
-    l'appelant retombe sur l'envoi par élément."""
-    global _batch_rpc_disabled_until
-    for start in range(0, len(items), _BATCH_MAX_ITEMS):
-        chunk = items[start:start + _BATCH_MAX_ITEMS]
-        ids = ",".join(sorted(f"{it['k']}:{it['id']}" for it in chunk))
-        ts = int(time.time())
-        try:
-            r = _supabase_rpc("pi_report_states_batch", {
-                "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts,
-                "p_signature": _pi_sign(f"{SITE_PREFIX}:{ts}:states_batch:{ids}"),
-                "p_items": chunk,
-            }, timeout=20.0)
-        except Exception as e:
-            warn(f"[supabase] pi_report_states_batch : {e}")
-            return False
-        if r.status_code == 404:
-            _batch_rpc_disabled_until = time.time() + 600
-            warn("[supabase] pi_report_states_batch absente côté base — envoi par élément pendant 10 min")
-            return False
-        if r.status_code >= 300:
-            if r.status_code != 503:
-                warn(f"[supabase] pi_report_states_batch {r.status_code}: {r.text[:160]}")
-            return False
-    return True
-
-
-def _report_device_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
-    """pi_report_device_state via Supabase direct — True si réussi. p_raw_state
-    (état HA brut) permet à la fonction Postgres de mettre à jour une entité
-    SECONDAIRE (device_entities — ex: température/CO2/PM2.5 d'un capteur
-    multi-mesures) quand aucun device principal ne correspond à cet entity_id —
-    ces mesures n'étaient jusqu'ici JAMAIS rafraîchies après leur liaison
-    initiale (bug trouvé en conditions réelles, Hicham, 2026-08-05 : "mon
-    capteur est resté figé depuis plusieurs jours").
-
-    Frein "sensor.*" (2026-09-21, cf. commentaire de _sensor_report_last_sent
-    ci-dessus) : un capteur Matter/WiFi qui republie plusieurs fois par
-    seconde (ex: qualité de l'air) traverse ce même point d'entrée — sans
-    filtre, il aurait généré le même dépassement egress que Zigbee, pour un
-    coût bien réel côté Supabase. Retourne False (comme un échec réseau) sur
-    un envoi volontairement retardé : _flush_state_batch le réintègre alors
-    tel quel dans _state_batch (mécanisme de retry déjà existant, cf. son
-    docstring) — retenté au cycle suivant (2.5s), avec la valeur la PLUS
-    RÉCENTE si une autre est arrivée entre-temps (setdefault ne réécrit
-    jamais une valeur plus fraîche). Garantit un envoi dès que l'intervalle
-    est écoulé, jamais une perte silencieuse — même garantie que
-    maximum_report_interval côté Zigbee."""
-    domain = entity_id.split(".")[0] if "." in entity_id else ""
-    try:
-        signature = state + "\x00" + json.dumps(
-            {k: v for k, v in attributes.items() if k not in _DEDUPE_IGNORED_ATTRS},
-            sort_keys=True, default=str,
-        )
-    except Exception:
-        signature = ""
-    if signature:
-        prev = _last_reported_signature.get(entity_id)
-        if prev and prev[0] == signature and time.time() - prev[1] < _DEDUPE_REFRESH_S:
-            return True
-    if domain == "sensor":
-        now = time.time()
-        last_sent = _sensor_report_last_sent.get(entity_id, 0.0)
-        if now - last_sent < _SENSOR_REPORT_MIN_INTERVAL_S:
-            return False
-        _sensor_report_last_sent[entity_id] = now
-    try:
-        patch = _ha_entity_to_normalized_patch(entity_id, state, attributes)
-        capabilities = _ha_attributes_to_capabilities(entity_id, attributes)
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:device_state:{entity_id}"
-        r = _supabase_rpc("pi_report_device_state", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_ha_entity_id": entity_id, "p_patch": patch, "p_capabilities": capabilities,
-            "p_raw_state": state,
-            # Tout le dict d'attributs HA brut, sans tri — capture générique (§160+),
-            # source de vérité pour tout ce qui n'a pas encore de traitement dédié
-            # (couleur, effet, réglages avancés Zigbee, tout attribut futur inconnu).
-            "p_raw_attributes": attributes,
-        })
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_report_device_state({entity_id}) {r.status_code}: {r.text[:120]}")
-            return False
-        if signature:
-            _last_reported_signature[entity_id] = (signature, time.time())
-        return True
-    except Exception as e:
-        warn(f"[supabase] pi_report_device_state({entity_id}): {e}")
-        return False
-
-
 def _reconcile_alarm_state():
     """Sécurité add-on, point 12 (audit 2026-09-22, resté ouvert jusqu'ici) : l'état
     alarme (armé/désarmé) ne remonte QUE via le bridge événementiel (state_changed
@@ -7788,150 +7409,31 @@ def _report_alarm_state_direct(entity_id: str, state: str, attributes: dict) -> 
         return False
 
 
-def _report_camera_status_direct(stream_name: str, online: bool) -> bool:
-    """pi_report_camera_status via Supabase direct — True si réussi."""
-    try:
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:camera_status:{stream_name}:{str(online).lower()}"
-        r = _supabase_rpc("pi_report_camera_status", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_online": online, "p_stream_name": stream_name,
-        })
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_report_camera_status({stream_name}) {r.status_code}: {r.text[:120]}")
-            return False
-        return True
-    except Exception as e:
-        warn(f"[supabase] pi_report_camera_status({stream_name}): {e}")
-        return False
-
-
-def _flush_state_batch():
-    """Thread de fond (cycle 2,5 s) : envoie états devices (HA + Zigbee brut),
-    statuts caméras et retries d'état alarme vers Supabase direct.
-
-    Depuis 2026-11-13 les états partent GROUPÉS : un seul appel
-    pi_report_states_batch par cycle (cf. bloc "Envoi groupé" plus haut) au lieu
-    d'un appel HMAC par élément. Changement discret (interrupteur, contact…) →
-    envoyé au prochain cycle ; simples mesures → ramassées et envoyées toutes les
-    _MEASURE_FLUSH_S secondes. Un élément non envoyé (réseau, Supabase refuse)
-    est réintégré pour être retenté — jamais perdu silencieusement ; après un
-    refus Supabase, pause croissante (cf. _supabase_rpc) au lieu de réessayer
-    toutes les 2,5 s.
-
-    Blindé (§97) par cohérence avec _run_camera_watchdog() : une exception non
-    prévue ici tuerait ce thread silencieusement, plus jamais aucun état ni
-    heartbeat rapporté ensuite — désormais journalisée, la boucle continue."""
-    global _last_measure_flush
+def _flush_alarm_state_batch():
+    """Thread de fond (cycle 2,5 s) : retente les transitions d'alarme qui n'ont pas pu partir (réseau, Supabase). Seul reste de
+    l'ancien _flush_state_batch, qui groupait aussi états d'équipements (HA + Zigbee brut) et statuts de caméras — retirés au
+    lot D (phase 1). Une transition non envoyée est réintégrée pour être retentée — jamais perdue silencieusement ; après un
+    refus Supabase, pause croissante (cf. _supabase_rpc). Blindé : une exception non prévue ne tue pas le thread."""
     while True:
         time.sleep(2.5)
         try:
-            if not INGEST_SECRET:
+            if not INGEST_SECRET or _supabase_is_backing_off():
                 continue
-            if _supabase_is_backing_off():
-                continue
-
-            now = time.time()
-            measure_due = now - _last_measure_flush >= _MEASURE_FLUSH_S
             with _state_batch_lock:
-                ha_take = {
-                    eid: v for eid, v in _state_batch.items()
-                    if measure_due or _ha_item_is_urgent(eid)
-                }
-                for eid in ha_take:
-                    del _state_batch[eid]
-                zb_take = {
-                    ieee: raw for ieee, raw in _zb_pending.items()
-                    if measure_due or ieee in _zb_pending_urgent
-                }
-                zb_urgent = {ieee for ieee in zb_take if ieee in _zb_pending_urgent}
-                for ieee in zb_take:
-                    del _zb_pending[ieee]
-                    _zb_pending_urgent.discard(ieee)
                 alarm_batch = dict(_alarm_state_batch)
                 _alarm_state_batch.clear()
-            if measure_due:
-                _last_measure_flush = now
-
-            with _cam_watch_lock:
-                cam_batch = {
-                    n: _cam_watch_online[n]
-                    for n in _cam_watch_dirty
-                    if n in _cam_watch_online and n in _cameras
-                }
-                _cam_watch_dirty.clear()
-
-            items, meta, deferred_ha = [], [], {}
-            for eid, (st, attrs) in ha_take.items():
-                status, item, sig = _prepare_ha_state_item(eid, st, attrs)
-                if status == "defer":
-                    deferred_ha[eid] = (st, attrs)
-                elif status == "send":
-                    items.append(item)
-                    meta.append(("ha", eid, sig))
-            for ieee, raw in zb_take.items():
-                items.append({"k": "zb", "id": ieee, "raw": raw})
-                meta.append(("zb", ieee, raw))
-
-            failed_ha, failed_zb = dict(deferred_ha), {}
-            if items:
-                if time.time() < _batch_rpc_disabled_until:
-                    # Repli (fonction groupée absente côté base) : un appel par élément.
-                    ok_flags = []
-                    for it in items:
-                        if it["k"] == "ha":
-                            ok_flags.append(_report_device_state_direct(it["id"], it["state"], it["attrs"]))
-                        else:
-                            ok_flags.append(_report_zigbee_state_direct(it["id"], it["raw"]))
-                    results = ok_flags
-                else:
-                    batch_ok = _send_states_batch(items)
-                    if not batch_ok and time.time() < _batch_rpc_disabled_until:
-                        results = [
-                            (_report_device_state_direct(it["id"], it["state"], it["attrs"]) if it["k"] == "ha"
-                             else _report_zigbee_state_direct(it["id"], it["raw"]))
-                            for it in items
-                        ]
-                    else:
-                        results = [batch_ok] * len(items)
-                sent_at = time.time()
-                for (kind, key, extra), ok in zip(meta, results):
-                    if kind == "ha":
-                        if ok:
-                            if extra:
-                                _last_reported_signature[key] = (extra, sent_at)
-                        else:
-                            failed_ha[key] = ha_take[key]
-                    else:
-                        if ok:
-                            _zb_last_sent[key] = (dict(extra), sent_at)
-                        else:
-                            failed_zb[key] = extra
-
-            failed_alarm = {
+            if not alarm_batch:
+                continue
+            failed = {
                 eid: (st, attrs) for eid, (st, attrs) in alarm_batch.items()
                 if not _report_alarm_state_direct(eid, st, attrs)
             }
-            failed_cams = {
-                name: online for name, online in cam_batch.items()
-                if not _report_camera_status_direct(name, online)
-            }
-
-            if failed_ha or failed_zb or failed_alarm:
+            if failed:
                 with _state_batch_lock:
-                    for eid, v in failed_ha.items():
-                        _state_batch.setdefault(eid, v)
-                    for ieee, raw in failed_zb.items():
-                        _zb_pending.setdefault(ieee, raw)
-                        if ieee in zb_urgent:
-                            _zb_pending_urgent.add(ieee)
-                    for eid, v in failed_alarm.items():
+                    for eid, v in failed.items():
                         _alarm_state_batch.setdefault(eid, v)
-            if failed_cams:
-                with _cam_watch_lock:
-                    _cam_watch_dirty.update(failed_cams.keys())
         except Exception as e:
-            warn(f"[flush-state] cycle échoué (poursuite au prochain) : {e}")
+            warn(f"[flush-alarm] cycle échoué (poursuite au prochain) : {e}")
 
 
 _IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
@@ -8042,7 +7544,7 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
                 node_id = _matter_node_id_from_unique_id(unique_id)
                 if node_id is not None:
                     payload["matterNodeId"] = node_id
-        requests.post(f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
+        _cloud_post("vercel:ingest/registry", f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
     except Exception as e:
         warn(f"[ingest/registry] {entity_id}: {e}")
 
@@ -9079,19 +8581,6 @@ def _sync_zigbee_devices_direct(devices_list) -> bool:
         except Exception as exc:
             warn(f"[alarmo] Keypad automation: {exc}")
 
-        # Rejoue les messages availability arrivés avant que le cache ci-dessus ne
-        # soit prêt (cf. _pending_z2m_availability) — sans ça, une transition
-        # offline→online reçue dans cette fenêtre reste silencieusement perdue et
-        # l'alerte correspondante ne se résout jamais toute seule.
-        if _pending_z2m_availability:
-            for pending_name in list(_pending_z2m_availability.keys()):
-                ieee = friendly_to_ieee.get(pending_name)
-                if ieee:
-                    online = _pending_z2m_availability.pop(pending_name)
-                    threading.Thread(
-                        target=_report_device_availability_direct, args=(ieee, online), daemon=True
-                    ).start()
-
         # Harmonisation Zigbee/Matter/WiFi (chantier approuvé, 2026-09-21) —
         # bascule vers pi_sync_devices générique. `online` volontairement absent
         # ici : cf. docstring de _normalize_device, la synchro Zigbee n'a jamais
@@ -9123,60 +8612,9 @@ def _sync_devices_to_app(devices_list):
     _sync_zigbee_devices_direct(devices_list)
 
 
-def _report_device_availability_direct(ieee: str, online: bool) -> bool:
-    """pi_report_device_state (protocole "zigbee", p_online explicite) via
-    Supabase direct — True si réussi. Reçoit l'état réel de
-    zigbee2mqtt/{friendly_name}/availability (cf. on_local_message),
-    contrairement à la synchro périodique qui n'a jamais de signal fiable (cf.
-    _normalize_device). Basculé de pi_report_device_availability vers la RPC
-    consolidée le 2026-09-21 (chantier d'harmonisation, 2e étape) — la RPC
-    défère elle-même au chemin ha_entity_id si ce device en a déjà un
-    (même garde que l'ancienne RPC dédiée)."""
-    try:
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:device_state:zigbee:{ieee}"
-        r = _supabase_rpc("pi_report_device_state", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_protocol": "zigbee", "p_external_id": ieee, "p_online": online,
-        })
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_report_device_state(zigbee availability) {r.status_code}: {r.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        warn(f"[supabase] pi_report_device_state(zigbee availability): {e}")
-        return False
-
-
-def _report_zigbee_state_direct(ieee: str, raw_state: dict) -> bool:
-    """pi_report_device_state (protocole "zigbee", p_raw_attributes) via
-    Supabase direct — True si réussi. Reçoit l'état COMPLET publié par Z2M sur
-    zigbee2mqtt/{friendly_name} (cf. on_local_message) : seule source de
-    valeurs réelles pour un device Zigbee sans entité HA principale liée (ex:
-    une télécommande classée sensor-generic, cf. §167) — jusqu'ici son schéma
-    d'exposes s'affichait côté web (§168) mais sans aucune valeur, faute de
-    pipeline de capture pour ce topic (bug remonté par Hicham en conditions
-    réelles, 2026-08-09 : "—" partout sur battery/action/linkquality).
-    Basculé de pi_report_zigbee_state vers la RPC consolidée le 2026-09-21."""
-    try:
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:device_state:zigbee:{ieee}"
-        r = _supabase_rpc("pi_report_device_state", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_protocol": "zigbee", "p_external_id": ieee, "p_raw_attributes": raw_state,
-        })
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_report_device_state(zigbee state) {r.status_code}: {r.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        warn(f"[supabase] pi_report_device_state(zigbee state): {e}")
-        return False
-
-
 def on_local_message(client, userdata, msg):
-    """Messages reçus depuis Mosquitto local (Z2M). Plus de relay cloud —
-    l'état passe uniquement par run_ha_ws_bridge() → Supabase direct (pi_report_device_state)."""
+    """Messages reçus depuis Mosquitto local (Z2M). Plus aucun relais d'état vers le cloud (lot D, phase 1) : l'app du Pi lit HA
+    directement ; seuls la liste des équipements (bridge/devices) et la santé de Z2M (heartbeat) partent encore."""
     global _z2m_online
     topic   = msg.topic
     payload = msg.payload
@@ -9236,29 +8674,6 @@ def on_local_message(client, userdata, msg):
             warn(f"[devices-sync] parse error: {exc}")
         return
 
-    # ── Z2M availability (fonctionnalité native, cf. _ensure_z2m_availability) ──
-    # zigbee2mqtt/{friendly_name}/availability, jamais zigbee2mqtt/bridge/* —
-    # exclusion explicite plutôt que de supposer qu'aucun device ne s'appelle
-    # jamais "bridge".
-    if topic.endswith("/availability") and not topic.startswith("zigbee2mqtt/bridge/"):
-        friendly_name = topic[len("zigbee2mqtt/"):-len("/availability")]
-        try:
-            online = json.loads(payload.decode()).get("state") == "online"
-        except Exception:
-            online = payload.decode().strip() == "online"
-        ieee = _z2m_friendly_to_ieee.get(friendly_name)
-        if not ieee:
-            # Pas encore résolu (device tout juste appairé, ou redémarrage récent —
-            # cf. commentaire _pending_z2m_availability) : mémorisé pour être rejoué
-            # dès que _sync_zigbee_devices_direct() reconstruit le cache, plutôt que
-            # silencieusement perdu.
-            _pending_z2m_availability[friendly_name] = online
-            return
-        threading.Thread(
-            target=_report_device_availability_direct, args=(ieee, online), daemon=True
-        ).start()
-        return
-
     # ── Z2M état individuel d'un device → valeurs réelles des exposes (battery,
     # linkquality, action...) — cf. _report_zigbee_state_direct ci-dessus. Topic
     # exact "zigbee2mqtt/{friendly_name}", sans rien après (ni /availability, déjà
@@ -9274,15 +8689,9 @@ def on_local_message(client, userdata, msg):
             try:
                 raw_state = json.loads(payload.decode())
                 if isinstance(raw_state, dict):
-                    # Cache LOCAL (2026-09-08, gap "device sans entité
-                    # utilisable" en mode local) — en plus de l'envoi
-                    # Supabase existant, jamais un remplacement : la seule
-                    # source disponible pour _build_local_devices(), qui n'a
-                    # aucun Supabase à lire.
+                    # Cache LOCAL (2026-09-08, gap "device sans entité utilisable") : la seule source
+                    # disponible pour _build_local_devices(). Depuis le lot D (phase 1) ce n'est plus envoyé au cloud.
                     _last_z2m_raw_state[ieee] = raw_state
-                    # Plus un thread + un appel par message (2026-11-13) : filtré
-                    # (tolérances) puis envoyé groupé par _flush_state_batch.
-                    _zb_enqueue(ieee, raw_state)
             except Exception as exc:
                 warn(f"[zigbee-state] parse error ({friendly_name}): {exc}")
         return
@@ -11236,6 +10645,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_site_route()
         elif route == "/local/alerts":
             self._handle_local_alerts_route()
+        elif route == "/local/stats":
+            self._ok(handle_local_stats())
         else:
             self._reject(404, "Route inconnue")
 
@@ -11841,8 +11252,8 @@ def run_bridge():
     threading.Thread(target=run_local_bridge, daemon=True).start()
     # Bridge HA WebSocket → Supabase (ingest) : seul canal d'état, remplace EMQX
     threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
-    # Flush du batch d'états toutes les 2.5s (réduit les appels Vercel)
-    threading.Thread(target=_flush_state_batch,      daemon=True).start()
+    # Retry des transitions d'alarme (seul état encore remonté au cloud)
+    threading.Thread(target=_flush_alarm_state_batch, daemon=True).start()
     threading.Thread(target=_run_alerts_engine,      daemon=True).start()
     # Watchdog caméras : sonde go2rtc toutes les 60s, deltas envoyés dans le batch
     threading.Thread(target=_run_camera_watchdog,    daemon=True).start()
