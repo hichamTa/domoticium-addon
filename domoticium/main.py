@@ -22,8 +22,10 @@ with open("/data/options.json") as f:
     cfg = json.load(f)
 
 SITE_PREFIX             = cfg["site_prefix"]
-PI_USER                 = cfg["pi_username"]
-PI_PASS                 = cfg["pi_password"]
+# (lot D phase 0) Plus utilisés : ils authentifiaient le tirage GET /api/webhooks/pi/sync-state, supprimé. Les options
+# add-on `pi_username`/`pi_password` restent au schéma (config.yaml) pour ne pas casser les installations existantes.
+PI_USER                 = cfg.get("pi_username", "")
+PI_PASS                 = cfg.get("pi_password", "")
 COORDINATOR_HOST        = cfg.get("coordinator_host", "").strip()   # vide = mode USB
 COORDINATOR_ZIGBEE_PORT = cfg.get("coordinator_zigbee_port", 6638)
 COORDINATOR_THREAD_PORT = cfg.get("coordinator_thread_port", 20108)
@@ -4882,40 +4884,6 @@ def _ha_remove_camera_entities(stream_name: str):
             pass
 
 
-def _reconcile_cameras(app_cameras: list):
-    """Réconciliation bidirectionnelle caméras — même principe que bridge/devices pour
-    Zigbee/Matter. handle_camera_configure() est normalement appelé en direct par la
-    route /camera/configure, mais si le Pi était hors-ligne au moment de l'action côté
-    app (add/remove/mot de passe changé), l'appel direct est perdu : ce cycle de sync
-    (toutes les ~5 min) rattrape la divergence en comparant l'état encore en DB avec
-    l'état local (_cameras)."""
-    app_by_name = {
-        c["streamName"]: c
-        for c in app_cameras
-        if c.get("streamName") and c.get("rtspUrl")
-    }
-
-    # Caméras manquantes localement ou dont l'URL a changé (mot de passe mis à jour
-    # pendant que le Pi était injoignable) → (ré)ajout.
-    for name, cam in app_by_name.items():
-        rtsp_url = cam["rtspUrl"]
-        if _cameras.get(name) != rtsp_url:
-            log(f"[sync/cameras] '{name}' manquante ou désynchronisée localement — ajout")
-            try:
-                handle_camera_configure("add", name, rtsp_url)
-            except Exception as e:
-                warn(f"[sync/cameras] add '{name}': {e}")
-
-    # Caméras encore locales mais supprimées côté app (delete manqué par l'addon).
-    for name in list(_cameras):
-        if name not in app_by_name:
-            log(f"[sync/cameras] '{name}' supprimée côté app mais encore locale — nettoyage")
-            try:
-                handle_camera_configure("remove", name)
-            except Exception as e:
-                warn(f"[sync/cameras] remove '{name}': {e}")
-
-
 def handle_camera_configure(action: str, stream_name: str, rtsp_url: str | None = None) -> bool:
     """Ajoute ou supprime une caméra dans Frigate. Appelé par le serveur de commandes HTTP.
     Entièrement bloquant, de bout en bout — la réponse HTTP appelante ne doit dire 'ok'
@@ -5649,7 +5617,7 @@ def handle_matter_commission(request_id: str, code: str):
             _post_ingest_commission_status(request_id, False, error=str(exc))
         finally:
             # Réveille la réconciliation complète (_sync_matter_devices_to_app via
-            # _sync_all_to_ha) dans TOUS les cas — succès, échec ET exception — pas
+            # _run_ha_maintenance_cycle) dans TOUS les cas — succès, échec ET exception — pas
             # seulement en cas de succès détecté par CE thread. Course PASE déjà
             # documentée plus haut (cf. _matter_commission_lock) : matter-server peut
             # avoir réellement commissionné le device même quand notre appel WS
@@ -6042,174 +6010,6 @@ def _check_and_fix_mqtt_broker():
         break
 
 
-def _sync_areas_batch(rooms: list, devices: list, all_devices: list) -> list:
-    """Sync bidirectionnel App ↔ HA pour les pièces/areas.
-
-    Push (App → HA) : crée les areas manquantes, assigne Zigbee ET Matter à leur area.
-    Pull (HA → App) : détecte les devices dont l'area HA diverge du room_id DB et
-                      retourne la liste de mises à jour à poster vers ingest/states.
-
-    Retourne : liste de {deviceId, roomId} à appliquer en DB.
-    """
-    if not rooms and not devices and not all_devices:
-        return []
-
-    ws_send, ws_recv, ws_close = _ha_ws_connect()
-    if not ws_send:
-        warn("[sync] Session WebSocket indisponible — sync areas/devices ignorée")
-        return []
-
-    room_updates: list = []
-
-    try:
-        mid = [0]
-
-        def call(cmd_type, **params):
-            mid[0] += 1
-            ws_send({"id": mid[0], "type": cmd_type, **params})
-            return ws_recv()
-
-        # 1. Areas HA existantes
-        res = call("config/area_registry/list")
-        existing_areas: dict[str, str] = {}  # name → area_id
-        if res and res.get("success"):
-            for a in res.get("result", []):
-                existing_areas[a.get("name", "")] = a.get("area_id", "")
-        log(f"[sync] Areas HA existantes : {list(existing_areas)}")
-
-        # 2. Device registry HA complet (Zigbee + Matter)
-        res = call("config/device_registry/list")
-        ha_devices_full: list = []
-        did_by_uid: dict[str, str] = {}  # identifier_value → ha_device_id
-        if res and res.get("success"):
-            ha_devices_full = res.get("result", [])
-            for dev in ha_devices_full:
-                did = dev.get("id")
-                if not did:
-                    continue
-                for identifier in dev.get("identifiers", []):
-                    if isinstance(identifier, (list, tuple)) and len(identifier) >= 2:
-                        did_by_uid[str(identifier[1])] = did
-                for conn in dev.get("connections", []):
-                    if isinstance(conn, (list, tuple)) and len(conn) >= 2:
-                        did_by_uid[str(conn[1])] = did
-        if not did_by_uid:
-            log("[sync] ⚠ Device registry HA vide — sera réessayé au prochain cycle")
-
-        # 3. Créer les areas manquantes
-        for room in rooms:
-            name = room["name"]
-            if name in existing_areas:
-                continue
-            res = call("config/area_registry/create", name=name)
-            if res and res.get("success"):
-                existing_areas[name] = res.get("result", {}).get("area_id", "")
-                log(f"[sync] Area créée : '{name}'")
-            else:
-                err = (res or {}).get("error", {}).get("code", "?")
-                if err == "name_exists":
-                    log(f"[sync] Area '{name}' déjà présente (conflit résolu)")
-                else:
-                    warn(f"[sync] Erreur création area '{name}' : {res}")
-
-        # ── Helper : résoudre le ha_device_id d'un device ──────────────────
-        def _resolve_ha_device(ieee: str, matter_node_id) -> str | None:
-            if ieee:
-                ieee_l = ieee.lower()
-                for id_val, did in did_by_uid.items():
-                    if ieee_l in id_val.lower():
-                        return did
-            if matter_node_id is not None:
-                hex_node = f"{int(matter_node_id):016x}"
-                for id_val, did in did_by_uid.items():
-                    if hex_node in id_val.lower():
-                        return did
-            return None
-
-        # 4. Push App → HA (Zigbee + Matter)
-        for d in devices:
-            ieee           = (d.get("ieee_address")   or "").strip()
-            matter_node_id = d.get("matter_node_id")
-            area_name      = (d.get("area_name")      or "").strip()
-            area_id        = existing_areas.get(area_name) if area_name else None
-
-            if not ieee and matter_node_id is None:
-                continue  # entité système sans identifiant — skip
-
-            device_id = _resolve_ha_device(ieee, matter_node_id)
-            if not device_id:
-                label = ieee or f"Matter#{matter_node_id}"
-                warn(f"[sync] Device non trouvé dans HA ({label}) — sera retentée au prochain cycle")
-                continue
-            if not area_id:
-                warn(f"[sync] Area '{area_name}' inconnue pour {ieee or f'Matter#{matter_node_id}'}")
-                continue
-
-            res = call("config/device_registry/update", device_id=device_id, area_id=area_id)
-            label = ieee or f"Matter#{matter_node_id}"
-            if res and res.get("success"):
-                log(f"[sync] {label} → area '{area_name}' ✓")
-            else:
-                warn(f"[sync] Erreur assignation {label} → '{area_name}': {res}")
-
-        # 5. Pull HA → App : détecte les divergences area HA ↔ room_id DB
-        area_id_to_name  = {v: k for k, v in existing_areas.items()}
-        room_name_to_id  = {r["name"]: r["id"] for r in rooms}
-
-        # Index des devices DB par identifiant
-        db_by_ieee   = {(d.get("ieee_address") or "").lower(): d
-                        for d in all_devices if d.get("ieee_address")}
-        db_by_matter = {d["matter_node_id"]: d
-                        for d in all_devices if d.get("matter_node_id") is not None}
-
-        for ha_dev in ha_devices_full:
-            ha_area_id = ha_dev.get("area_id")
-            if not ha_area_id:
-                continue
-            expected_area = area_id_to_name.get(ha_area_id)
-            if not expected_area:
-                continue  # area HA non gérée par Domoticium
-            expected_room_id = room_name_to_id.get(expected_area)
-            if not expected_room_id:
-                continue
-
-            # Trouver le device DB correspondant
-            db_dev = None
-            for ident in ha_dev.get("identifiers", []):
-                if not (isinstance(ident, (list, tuple)) and len(ident) >= 2):
-                    continue
-                val = str(ident[1])
-                m = _IEEE_RE.search(val.lower())
-                if m:
-                    db_dev = db_by_ieee.get(m.group(0))
-                    break
-                # Matter : chercher node_id en hex dans l'identifier
-                for node_id, d in db_by_matter.items():
-                    if f"{int(node_id):016x}" in val.lower():
-                        db_dev = d
-                        break
-                if db_dev:
-                    break
-
-            if not db_dev:
-                continue
-
-            if db_dev.get("room_id") != expected_room_id:
-                label = ha_dev.get("name_by_user") or ha_dev.get("name") or ha_dev.get("id")
-                room_updates.append({"deviceId": db_dev["id"], "roomId": expected_room_id})
-                log(f"[sync] Pull pièce : '{label}' → '{expected_area}'")
-
-    except Exception as e:
-        warn(f"[sync] Erreur batch areas : {e}")
-    finally:
-        try:
-            ws_close()
-        except Exception:
-            pass
-
-    return room_updates
-
-
 def _reconcile_device_states():
     """(2026-09-02) Filet de réconciliation périodique pour `online` — bug réel
     signalé par Hicham : "Ampoule couloir"/"Alarme entrée" hors ligne dans HA mais
@@ -6301,53 +6101,29 @@ def _reconcile_device_states():
         log(f"[reconcile] {m} entité(s) revenue(s) en ligne re-synchronisée(s) (filet périodique)")
 
 
-def _sync_all_to_ha():
-    """Récupère l'état complet depuis l'app et l'applique à HA (idempotent, une session WS)."""
+def _run_ha_maintenance_cycle():
+    """Cycle d'entretien LOCAL (toutes les 5 min, ou tout de suite via _sync_requested) : réveil de Z2M, réconciliation
+    des équipements Matter/Wi-Fi, liens d'entités, réconciliation d'états/d'alarme, IP locale et certificat.
+
+    Lot D (phase 0) du chantier « Pi-first » : ce cycle (ex-`_sync_all_to_ha`) commençait par TIRER l'état voulu depuis le
+    cloud (GET /api/webhooks/pi/sync-state : pièces, affectations, scènes, automatisations et caméras de Supabase) et
+    l'appliquait à Home Assistant. Le cloud n'est plus la source de vérité — l'app du Pi écrit directement dans HA par le
+    serveur de commandes — et ce tirage était devenu DESTRUCTEUR :
+      - `_reconcile_cameras` supprimait de Frigate (puis redémarrait Frigate) toute caméra locale absente de la table
+        `cameras` de Supabase ; or une caméra ajoutée depuis l'app du Pi n'y est jamais écrite → un site Pi-first aurait
+        perdu TOUTES ses caméras au plus tard 5 min après son premier passage (reproduit sur le vrai code) ;
+      - les scènes/automatisations supprimées dans l'app du Pi étaient recréées depuis le cloud, les pièces ré-affectées.
+    Retiré en bloc (avec `_sync_areas_batch`, `_reconcile_cameras`, `_report_room_assignments_direct`). Les actions de
+    l'app arrivent par les commandes directes ; il n'y a plus de « rattrapage » depuis le cloud."""
     global _last_ha_status_publish, _last_z2m_devices_request
-    auth = base64.b64encode(f"{PI_USER}:{PI_PASS}".encode()).decode()
-    try:
-        r = requests.get(
-            f"{APP_URL}/api/webhooks/pi/sync-state?siteId={SITE_PREFIX}",
-            headers={"Authorization": f"Basic {auth}"},
-            timeout=15,
-        )
-        if not r.ok:
-            warn(f"[sync] sync-state HTTP {r.status_code}: {r.text[:100]}")
-            return
-        state = r.json()
-    except Exception as e:
-        warn(f"[sync] Impossible de récupérer sync-state: {e}")
-        return
-
-    rooms       = state.get("rooms", [])
-    devices     = state.get("device_assignments", [])
-    all_devices = state.get("all_devices", [])
-    scenes      = state.get("scene_commands", [])
-    autos       = state.get("automation_commands", [])
-    app_cameras = state.get("cameras", [])
-
-    log(f"[sync] Début : {len(rooms)} pièces, {len(devices)} assignations, "
-        f"{len(all_devices)} devices total, {len(scenes)} scènes, {len(autos)} automations")
 
     # Déclencher Z2M pour republier ses discovery messages HA → HA peuple son device registry.
-    # Envoyé EN PREMIER pour laisser à Z2M le temps de répondre pendant qu'on sync scènes/autos.
-    # Throttlé à 1x/5min pour éviter le flood de messages MQTT à chaque cycle 60s.
+    # Throttlé à 1x/5min pour éviter le flood de messages MQTT.
     _now = time.time()
     if _local_client and (_now - _last_ha_status_publish > 300):
         _local_client.publish("homeassistant/status", "online", qos=1)
         _last_ha_status_publish = _now
         log("[sync] homeassistant/status online → Z2M republiera les discovery HA")
-
-    # Scènes + automations via REST HA (rapide, pas de WebSocket)
-    for scene in scenes:
-        _handle_ha_command(json.dumps(scene).encode())
-    for auto in autos:
-        _handle_ha_command(json.dumps(auto).encode())
-
-    # Areas + device assignments en une seule session WebSocket (bidirectionnel)
-    room_updates = _sync_areas_batch(rooms, devices, all_devices)
-    if room_updates and INGEST_SECRET:
-        _report_room_assignments_direct(room_updates)
 
     # Forcer la redélivrance du retained zigbee2mqtt/bridge/devices → vendor/model/
     # features/z2m_name mis à jour sans redémarrer Z2M. Z2M n'expose AUCUN topic de
@@ -6359,7 +6135,7 @@ def _sync_all_to_ha():
     # immédiatement le dernier message retained, qui déclenche on_local_message()
     # exactement comme un vrai événement Z2M — sans dépendre d'un mécanisme de
     # requête qui n'existe pas côté Z2M.
-    # Throttlé à 1x/5min (inutile à chaque cycle 60s).
+    # Throttlé à 1x/5min.
     if _local_client and (time.time() - _last_z2m_devices_request > 300):
         _local_client.unsubscribe("zigbee2mqtt/bridge/devices")
         _local_client.subscribe([("zigbee2mqtt/bridge/devices", 1)])
@@ -6374,11 +6150,6 @@ def _sync_all_to_ha():
     # commencer, cf. HANDOFF.md 2026-09-06).
     _sync_wifi_devices_to_app()
 
-    # Réconciliation caméras — rattrape un ajout/suppression manqué par l'addon si le Pi
-    # était hors-ligne au moment de l'action côté app (sinon une caméra supprimée dans
-    # l'app pendant une coupure réseau resterait fantôme sur le Pi indéfiniment).
-    _reconcile_cameras(app_cameras)
-
     _backfill_ha_entity_links()
     _backfill_camera_entity_links()
     _reconcile_device_states()
@@ -6386,7 +6157,7 @@ def _sync_all_to_ha():
     _report_local_ip()
     _fetch_local_cert()
 
-    log("[sync] ✓ Terminé")
+    log("[sync] ✓ Entretien local terminé")
 
 
 def _backfill_ha_entity_links():
@@ -6551,13 +6322,13 @@ def _backfill_camera_entity_links():
 
 
 def _ha_sync_loop():
-    """Thread de fond : synchronise l'app avec HA toutes les 5 minutes.
-    Se déclenche immédiatement sur reconnexion EMQX (via _sync_requested)."""
+    """Thread de fond : cycle d'entretien local (_run_ha_maintenance_cycle) toutes les 5 minutes.
+    Se déclenche immédiatement via _sync_requested (appairage Matter, entité créée/retirée, bouton « Sync HA »)."""
     log("[sync] Thread de sync démarré — premier sync dans 30s")
     time.sleep(30)  # laisser HA + EMQX s'initialiser
     while True:
         try:
-            _sync_all_to_ha()
+            _run_ha_maintenance_cycle()
         except Exception as e:
             warn(f"[sync] Erreur inattendue : {e}")
         # Attend 5 min OU un déclenchement immédiat (reconnexion EMQX, etc.) — le
@@ -7915,7 +7686,7 @@ def _report_local_ip():
     abandonnée le 2026-10-31, cf. tunnel.ts — qui doit suivre l'IP réelle du
     boîtier, pouvant changer au gré du bail DHCP). Volontairement HORS de la boucle heartbeat (60s,
     trop fréquent pour une valeur qui ne bouge presque jamais) — même cadence
-    que le reste de la réconciliation périodique (_sync_all_to_ha, 5 min).
+    que le reste de la réconciliation périodique (_run_ha_maintenance_cycle, 5 min).
     Best-effort : un échec ici ne doit jamais interrompre le reste du cycle
     de sync (cohérent avec tous les autres appels de cette fonction)."""
     global _last_reported_local_ip
@@ -7954,7 +7725,7 @@ def _fetch_local_cert():
     acme-client/Vercel cron, jamais sur le Pi, cf. web/src/lib/acme/issueCert.ts)
     et recharge le contexte TLS du relais local (run_local_tls_relay) si la
     valeur a changé (1ère émission ou renouvellement). Lecture seule, même
-    cadence que _report_local_ip (5 min, cf. _sync_all_to_ha) — un cycle en
+    cadence que _report_local_ip (5 min, cf. _run_ha_maintenance_cycle) — un cycle en
     plus après un renouvellement (tous les ~60 jours) est sans conséquence."""
     global _last_local_cert_expires_at, _local_tls_context
     if not INGEST_SECRET:
@@ -8744,7 +8515,7 @@ def _handle_ha_command(payload: bytes, trusted_wiring: bool = False) -> bool | d
     client SYSTÉMATIQUEMENT, même quand l'écriture HA échouait réellement
     (ex: HA temporairement indisponible) — un client pouvait croire une
     automatisation/scène enregistrée alors qu'elle ne l'était pas. Les autres
-    appelants (Alarmo SOS/clavier, _sync_all_to_ha) ignorent déjà la valeur
+    appelants (Alarmo SOS/clavier, _run_ha_maintenance_cycle) ignorent déjà la valeur
     de retour sans rien casser — ajout rétrocompatible.
 
     (2026-10-18) scene_upsert renvoie désormais {"ok": True, "entity_id": ...}
@@ -9350,27 +9121,6 @@ def _sync_devices_to_app(devices_list):
     """Background thread : envoie la liste bridge/devices pour upsert auto (Supabase
     direct). En cas d'échec : log, retenté au prochain cycle périodique."""
     _sync_zigbee_devices_direct(devices_list)
-
-
-def _report_room_assignments_direct(room_updates) -> bool:
-    """pi_report_room_assignments via Supabase direct — corrige côté app un device dont
-    la pièce a été changée directement dans HA (pas dans l'app). True si réussi."""
-    try:
-        ts = int(time.time())
-        key = ",".join(sorted(f"{u['deviceId']}:{u['roomId']}" for u in room_updates))
-        message = f"{SITE_PREFIX}:{ts}:room_assignments:{key}"
-        r = _supabase_rpc("pi_report_room_assignments", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_assignments": [{"deviceId": u["deviceId"], "roomId": u["roomId"]} for u in room_updates],
-        })
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_report_room_assignments {r.status_code}: {r.text[:200]}")
-            return False
-        log(f"[supabase] pi_report_room_assignments — {len(room_updates)} assignation(s)")
-        return True
-    except Exception as e:
-        warn(f"[supabase] pi_report_room_assignments: {e}")
-        return False
 
 
 def _report_device_availability_direct(ieee: str, online: bool) -> bool:
@@ -11321,9 +11071,9 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         self._ok({"ok": True, "detail": "step"})
 
     def _handle_sync_now(self, data):
-        """Déclenche un cycle de _sync_all_to_ha() immédiat (pièces/scènes/automations
-        + republication bridge/devices Z2M → réconciliation devices-sync) au lieu
-        d'attendre le prochain cycle périodique (jusqu'à 60s) — bouton "Sync HA"."""
+        """Déclenche un cycle d'entretien local immédiat (republication bridge/devices Z2M,
+        réconciliation Matter/Wi-Fi/états) au lieu d'attendre le prochain cycle périodique
+        (5 min) — bouton "Sync HA"."""
         _sync_requested.set()
         self._ok()
 
