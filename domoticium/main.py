@@ -6866,6 +6866,13 @@ _ALERTS_RECONCILE_S = 300
 _alerts_lock = threading.RLock()
 _alerts_state = {"loaded": False, "items": [], "dirty": False, "priming_since": None}
 _ALERT_PRIMING_MAX_S = 600        # amorçage : au plus 10 min, même si la réconciliation n'aboutit pas
+# Période de grâce à CHAQUE démarrage de l'add-on (mise à jour, redémarrage du Pi) : Z2M, Matter, HA et les caméras
+# repartent et paraissent « indisponibles » quelques minutes. Les alertes ouvertes pendant ce temps sont inscrites
+# tout de suite, mais leur e-mail n'est envoyé qu'une minute APRÈS la fin de la grâce, et seulement si l'incident dure
+# encore (sinon « skipped », cf. _alerts_process_notifications).
+_ALERTS_BOOT_AT = time.time()
+_ALERT_STARTUP_GRACE_S = 300
+_ALERT_STARTUP_GRACE_MARGIN_S = 60
 _alerts_index: dict = {}        # entity_id principal -> {"name", "type"} (équipements classés)
 _alerts_wake = threading.Event()    # réveille la boucle : nouvelle alerte à notifier / réindexation
 # Dernier état connu des équipements (entité principale → en ligne ?) et des caméras, pour le résumé de flotte.
@@ -6944,7 +6951,10 @@ def _alerts_priming_active(now: float) -> bool:
 
 def _alert_initial_notify(alert_type: str, device_type: str | None, now: float, silent: bool = False) -> dict:
     wants_email = alert_type in _ALERT_EMAIL_TYPES and not (alert_type == "device_offline" and device_type in _ALERT_NO_EMAIL_DEVICE_TYPES)
-    return {"state": "pending" if wants_email and not silent else "none", "attempts": 0, "next_at": now}
+    next_at = now
+    if now < _ALERTS_BOOT_AT + _ALERT_STARTUP_GRACE_S:
+        next_at = _ALERTS_BOOT_AT + _ALERT_STARTUP_GRACE_S + _ALERT_STARTUP_GRACE_MARGIN_S
+    return {"state": "pending" if wants_email and not silent else "none", "attempts": 0, "next_at": next_at}
 
 
 def _alert_set_condition(alert_type: str, key: str, name: str, active: bool, now: float, device_type: str | None = None) -> bool:
