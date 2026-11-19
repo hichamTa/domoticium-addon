@@ -6864,7 +6864,8 @@ _ALERTS_TICK_S = 30
 _ALERTS_RECONCILE_S = 300
 
 _alerts_lock = threading.RLock()
-_alerts_state = {"loaded": False, "items": [], "dirty": False}
+_alerts_state = {"loaded": False, "items": [], "dirty": False, "priming_since": None}
+_ALERT_PRIMING_MAX_S = 600        # amorçage : au plus 10 min, même si la réconciliation n'aboutit pas
 _alerts_index: dict = {}        # entity_id principal -> {"name", "type"} (équipements classés)
 _alerts_wake = threading.Event()    # réveille la boucle : nouvelle alerte à notifier / réindexation
 # Dernier état connu des équipements (entité principale → en ligne ?) et des caméras, pour le résumé de flotte.
@@ -6896,6 +6897,11 @@ def _alerts_load() -> None:
         with open(_ALERTS_FILE) as f:
             items = json.load(f).get("items", [])
         _alerts_state["items"] = [a for a in items if isinstance(a, dict) and a.get("id") and a.get("type")]
+    except FileNotFoundError:
+        # TOUT PREMIER démarrage du moteur sur ce site : ce qui est déjà hors ligne à cet instant n'est pas un
+        # incident qui commence — il est inscrit dans l'app, mais sans e-mail (amorçage, cf. _alerts_priming_active).
+        _alerts_state["items"] = []
+        _alerts_state["priming_since"] = time.time()
     except Exception:
         _alerts_state["items"] = []
 
@@ -6924,9 +6930,21 @@ def _alerts_save() -> None:
             _alerts_state["dirty"] = True
 
 
-def _alert_initial_notify(alert_type: str, device_type: str | None, now: float) -> dict:
+def _alerts_priming_active(now: float) -> bool:
+    """Vrai pendant l'amorçage du tout premier démarrage (fichier d'alertes absent) : de la création du moteur
+    jusqu'à la fin de sa première réconciliation complète, 10 min au plus. Sous verrou."""
+    since = _alerts_state.get("priming_since")
+    if since is None:
+        return False
+    if now - since > _ALERT_PRIMING_MAX_S:
+        _alerts_state["priming_since"] = None
+        return False
+    return True
+
+
+def _alert_initial_notify(alert_type: str, device_type: str | None, now: float, silent: bool = False) -> dict:
     wants_email = alert_type in _ALERT_EMAIL_TYPES and not (alert_type == "device_offline" and device_type in _ALERT_NO_EMAIL_DEVICE_TYPES)
-    return {"state": "pending" if wants_email else "none", "attempts": 0, "next_at": now}
+    return {"state": "pending" if wants_email and not silent else "none", "attempts": 0, "next_at": now}
 
 
 def _alert_set_condition(alert_type: str, key: str, name: str, active: bool, now: float, device_type: str | None = None) -> bool:
@@ -6960,7 +6978,7 @@ def _alert_set_condition(alert_type: str, key: str, name: str, active: bool, now
             items.append({
                 "id": secrets.token_hex(6), "type": alert_type, "key": key, "name": name, "device_type": device_type,
                 "message": _alert_message(alert_type, name), "created_at": now, "resolved_at": None,
-                "notify": _alert_initial_notify(alert_type, device_type, now),
+                "notify": _alert_initial_notify(alert_type, device_type, now, silent=_alerts_priming_active(now)),
             })
             _alerts_wake.set()
         _alerts_state["dirty"] = True
@@ -7088,6 +7106,11 @@ def _alerts_reconcile(now: float) -> None:
     # Équipements / caméras supprimés : plus d'alerte à garder (0064).
     with _alerts_lock:
         _alerts_load()
+        if _alerts_state.get("priming_since") is not None and index:
+            # Première réconciliation complète terminée : fin de l'amorçage, le fichier d'alertes existe désormais.
+            _alerts_state["priming_since"] = None
+            _alerts_state["dirty"] = True
+            changed = True
         for a in _alerts_state["items"]:
             if a.get("resolved_at") is not None:
                 continue
