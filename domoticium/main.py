@@ -4282,8 +4282,7 @@ def _remove_legacy_heartbeat_automation_once():
 def handle_local_site() -> dict:
     """Coordonnées du logement pour l'app Domoticium servie par le Pi (route GET /local/site).
 
-    Source : la config Home Assistant elle-même (zone « home »), la MÊME que `_sync_site_location`
-    reporte à Supabase — mais lue en direct, sans aller-retour cloud (chantier « Pi-first », lot C :
+    Source : la config Home Assistant elle-même (zone « home »), lue en direct, sans aller-retour cloud (chantier « Pi-first », lot C :
     l'app du Pi en tire la météo/trafic/vigilance, via la passerelle API pour ce qui exige une clé).
     `latitude`/`longitude` valent None si la zone « home » n'est pas réglée : l'app affiche alors
     simplement « indisponible » au lieu de deviner."""
@@ -4297,83 +4296,6 @@ def handle_local_site() -> dict:
         "elevation": cfg.get("elevation"),
         "time_zone": cfg.get("time_zone"),
     }
-
-
-_SITE_LOCATION_MARKER = "/data/.site_location_reported"
-
-
-def _sync_site_location():
-    """Reporte à Supabase les coordonnées du logement (lat/lon/altitude), lues
-    depuis la config Home Assistant elle-même (zone "home") — pour la météo
-    réelle sur l'Accueil (2026-08-18) et tout ce qui en dépend depuis
-    (suggestions UV/gel/vacances scolaires, 2026-08-27).
-
-    Auto-guéri (2026-08-27) : compare aux dernières coordonnées reportées
-    (stockées dans le marker, plus un simple booléen) et ne renvoie l'appel
-    Supabase QUE si elles ont changé. Avant, le marker ne voulait dire que
-    "déjà fait une fois" — une adresse mal réglée au premier démarrage (ou
-    changée depuis, ex. déménagement) restait fausse pour toujours, MÊME
-    après correction dans HA, puisque plus aucun redémarrage ne redéclenchait
-    l'envoi. Bug réel trouvé le 2026-08-27 : le site de test avait des
-    coordonnées à Amsterdam au lieu de la France, corrigées dans HA par
-    Hicham mais jamais remontées à Supabase pour cette raison."""
-    try:
-        r = ha_get("/config")
-        if not r.ok:
-            warn(f"[site-location] GET /config : HTTP {r.status_code}")
-            return
-        cfg = r.json()
-        lat, lon = cfg.get("latitude"), cfg.get("longitude")
-        elevation = cfg.get("elevation")
-        if lat is None or lon is None:
-            warn("[site-location] latitude/longitude absentes de la config HA — zone \"home\" non réglée")
-            return
-    except Exception as e:
-        warn(f"[site-location] lecture config HA : {e}")
-        return
-
-    last = None
-    if os.path.exists(_SITE_LOCATION_MARKER):
-        try:
-            with open(_SITE_LOCATION_MARKER) as f:
-                last = json.load(f)
-        except Exception:
-            last = None
-    if last and last.get("lat") == lat and last.get("lon") == lon:
-        return  # déjà à jour côté Supabase, rien à renvoyer
-
-    try:
-        ts = int(time.time())
-        # p_latitude/p_longitude/p_elevation envoyés en TEXTE (pas en JSON
-        # numérique) — migration 0091 : Postgres reformatait différemment un
-        # double precision en texte (`::text`) par rapport au f-string Python
-        # au-delà d'une certaine précision, faisant diverger la signature
-        # ("signature invalide", trouvé 2026-08-27). En envoyant nous-mêmes la
-        # représentation texte, elle est garantie identique des deux côtés :
-        # Postgres signe la chaîne reçue telle quelle, jamais reconstruite.
-        lat_s, lon_s = str(lat), str(lon)
-        elev_s = str(elevation) if elevation is not None else None
-        message = f"{SITE_PREFIX}:{ts}:site_location:{lat_s}:{lon_s}:{elev_s if elev_s is not None else 'null'}"
-        payload = {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_latitude": lat_s, "p_longitude": lon_s,
-        }
-        if elev_s is not None:
-            payload["p_elevation"] = elev_s
-        resp = _supabase_rpc("pi_report_site_location", payload)
-        if resp.status_code >= 300:
-            warn(f"[site-location] pi_report_site_location {resp.status_code}: {resp.text[:120]}")
-            return
-        log(f"[site-location] ✓ coordonnées reportées ({lat}, {lon})")
-    except Exception as e:
-        warn(f"[site-location] envoi Supabase : {e}")
-        return
-
-    try:
-        with open(_SITE_LOCATION_MARKER, "w") as f:
-            json.dump({"lat": lat, "lon": lon}, f)
-    except Exception as e:
-        warn(f"[site-location] écriture marker : {e}")
 
 
 _WATCHDOG_ENABLED_MARKER = "/data/.watchdog_enabled_v2"
@@ -6334,33 +6256,10 @@ def _ha_sync_loop():
         _sync_requested.clear()
 
 
-def _heartbeat_direct() -> bool:
-    """Heartbeat via pi_report_heartbeat (Supabase direct) — True si réussi."""
-    try:
-        ts = int(time.time())
-        z2m_part = "null" if _z2m_online is None else str(_z2m_online).lower()
-        ws_part = str(_ws_bridge_connected).lower()
-        message = f"{SITE_PREFIX}:{ts}:heartbeat:{z2m_part}:{ws_part}"
-        payload: dict = {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_ws_bridge_alive": _ws_bridge_connected,
-        }
-        if _z2m_online is not None:
-            payload["p_z2m_online"] = _z2m_online
-        r = _supabase_rpc("pi_report_heartbeat", payload)
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_report_heartbeat {r.status_code}: {r.text[:120]}")
-            return False
-        return True
-    except Exception as e:
-        warn(f"[supabase] pi_report_heartbeat: {e}")
-        return False
-
-
 def call_heartbeat_api():
-    """Envoie le heartbeat (+ état Z2M courant) via Supabase direct. En cas d'échec :
-    log, retenté au prochain cycle (_heartbeat_loop, 60s)."""
-    _heartbeat_direct()
+    """Demande l'envoi du résumé de flotte (cf. _run_fleet_status_loop) — appelé quand la santé de Z2M change. L'envoi
+    effectif est limité à 1 par minute. (Nom conservé : ancien heartbeat à la minute, remplacé par le résumé de flotte.)"""
+    _fleet_request.set()
 
 
 def _relay_alarm_state(entity_id: str, state_val: str, attributes: dict):
@@ -6968,6 +6867,13 @@ _alerts_lock = threading.RLock()
 _alerts_state = {"loaded": False, "items": [], "dirty": False}
 _alerts_index: dict = {}        # entity_id principal -> {"name", "type"} (équipements classés)
 _alerts_wake = threading.Event()    # réveille la boucle : nouvelle alerte à notifier / réindexation
+# Dernier état connu des équipements (entité principale → en ligne ?) et des caméras, pour le résumé de flotte.
+_fleet_devices: dict = {}
+_fleet_cameras: dict = {}
+_fleet_request = threading.Event()    # un envoi du résumé de flotte est demandé
+_FLEET_MIN_INTERVAL_S = 60
+_FLEET_PERIOD_S = 300
+_addon_version_cache: list = []
 _alerts_reindex = threading.Event()
 _alerts_ws_last_alive = time.time()
 
@@ -7119,7 +7025,9 @@ def _alerts_eval_device(entity_id: str, state: str, attributes: dict, now: float
     info = _alerts_index.get(entity_id)
     if not info:
         return False
-    changed = _alert_set_condition("device_offline", entity_id, info["name"], state in ("unavailable", "unknown"), now, info["type"])
+    offline = state in ("unavailable", "unknown")
+    _fleet_devices[entity_id] = not offline
+    changed = _alert_set_condition("device_offline", entity_id, info["name"], offline, now, info["type"])
     if attributes.get("device_class") == "battery" and entity_id.startswith("sensor."):
         try:
             level = _ha_entity_to_normalized_patch(entity_id, state, attributes).get("battery")
@@ -7141,13 +7049,17 @@ def _alerts_note_state(entity_id: str, state: str, attributes: dict) -> None:
 
 def _alerts_note_camera(name: str, online: bool) -> None:
     """Appelé par la sonde caméra (toutes les 60 s)."""
-    if name in _cameras and _alert_set_condition("camera_offline", name, name, not online, time.time()):
+    if name not in _cameras:
+        return
+    _fleet_cameras[name] = bool(online)
+    if _alert_set_condition("camera_offline", name, name, not online, time.time()):
         _alerts_changed()
 
 
 def _alerts_changed() -> None:
     _alerts_save()
     _alerts_wake.set()
+    _fleet_request.set()       # la vue staff est prévenue dans la minute
     try:
         _sse_publish("fast")       # l'app relit ses alertes tout de suite
     except Exception:
@@ -7165,6 +7077,8 @@ def _alerts_reconcile(now: float) -> None:
     states = {s["entity_id"]: s for s in r.json() if isinstance(s, dict) and s.get("entity_id")}
     global _alerts_index
     index = {d["haEntityId"]: {"name": d["name"], "type": d["type"]} for d in devices if d.get("haEntityId")}
+    for gone in [k for k in _fleet_devices if k not in index]:
+        _fleet_devices.pop(gone, None)
     _alerts_index = index       # remplacement atomique : le pont HA lit cet index en continu (jamais d'index vide, même brièvement)
     changed = False
     for entity_id in index:
@@ -7198,6 +7112,54 @@ def _alerts_check_ws_bridge(now: float) -> bool:
     if now - _alerts_ws_last_alive > _ALERT_WS_BRIDGE_DOWN_S:
         return _alert_set_condition("ws_bridge_down", "site", "", True, now)
     return False
+
+
+def _addon_version() -> str | None:
+    """Version de l'add-on (API Supervisor), lue une fois."""
+    if not _addon_version_cache:
+        try:
+            r = sup_get("/addons/self/info")
+            _addon_version_cache.append(((r.json().get("data") or {}).get("version")) if r.ok else None)
+        except Exception:
+            _addon_version_cache.append(None)
+    return _addon_version_cache[0]
+
+
+def _fleet_status_payload() -> dict:
+    """Résumé de flotte : santé + présence des équipements/caméras + alertes ouvertes (cf. migration 0154)."""
+    with _alerts_lock:
+        _alerts_load()
+        alerts = [
+            {"type": a["type"], "key": a.get("key"), "message": a["message"], "since": int(a["created_at"])}
+            for a in _alerts_state["items"] if a.get("resolved_at") is None
+        ]
+    return {
+        "v": _addon_version(), "ha": True, "z2m": _z2m_online, "ws": bool(_ws_bridge_connected),
+        "devices": dict(_fleet_devices),
+        "cameras": {n: o for n, o in _fleet_cameras.items() if n in _cameras},
+        "alerts": alerts,
+    }
+
+
+def _fleet_status_direct() -> bool:
+    """pi_report_fleet_status via Supabase direct — True si réussi. Le corps part en TEXTE et la signature porte sur son
+    SHA-256 : la base hache exactement les mêmes octets (UTF-8)."""
+    if not INGEST_SECRET:
+        return False
+    try:
+        body = json.dumps(_fleet_status_payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        ts = int(time.time())
+        message = f"{SITE_PREFIX}:{ts}:fleet_status:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
+        r = _supabase_rpc("pi_report_fleet_status", {
+            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message), "p_status": body,
+        })
+        if r.status_code >= 300:
+            warn(f"[supabase] pi_report_fleet_status {r.status_code}: {r.text[:120]}")
+            return False
+        return True
+    except Exception as e:
+        warn(f"[supabase] pi_report_fleet_status: {e}")
+        return False
 
 
 def handle_local_alerts() -> dict:
@@ -7549,15 +7511,22 @@ def _post_ingest_registry(entity_id: str, action: str, data: dict):
         warn(f"[ingest/registry] {entity_id}: {e}")
 
 
-def _heartbeat_loop():
-    """Envoie un heartbeat toutes les 60 secondes via webhook API — met à jour
-    sites.last_heartbeat_at, relayé au navigateur par Supabase Realtime.
-    Était à 30s (réduit après dépassement de quota Vercel Hobby le 2026-07-18) —
-    cf. seuils "online" côté web (2 min de marge, largement suffisant à 60s)."""
-    time.sleep(10)
+def _run_fleet_status_loop():
+    """Envoie le résumé de flotte (RPC pi_report_fleet_status) toutes les 5 min, et dès que la santé ou les alertes
+    changent (au plus 1 envoi par minute). Remplace le heartbeat à la minute (lot D, phase 2)."""
+    time.sleep(45)   # laisser le moteur d'alertes faire sa 1re réconciliation
+    last = 0.0
     while True:
-        call_heartbeat_api()
-        time.sleep(60)
+        try:
+            wait = _FLEET_MIN_INTERVAL_S - (time.time() - last)
+            if wait > 0:
+                time.sleep(wait)
+            _fleet_status_direct()
+            last = time.time()
+        except Exception as e:
+            warn(f"[fleet] cycle échoué (poursuite au prochain) : {e}")
+        _fleet_request.wait(timeout=_FLEET_PERIOD_S)
+        _fleet_request.clear()
 
 
 def on_local_connect(client, userdata, flags, reason_code, properties):
@@ -11240,13 +11209,12 @@ def run_bridge():
     threading.Thread(target=_remove_legacy_heartbeat_automation_once, daemon=True).start()
     threading.Thread(target=_remove_legacy_rest_commands_once, daemon=True).start()
     threading.Thread(target=_enable_watchdogs_once, daemon=True).start()
-    threading.Thread(target=_sync_site_location, daemon=True).start()
     threading.Thread(target=_reenable_frigate_watchdog_if_needed, daemon=True).start()
     threading.Thread(target=_ensure_frigate,       daemon=True).start()
     threading.Thread(target=_turn_refresh_loop,    daemon=True).start()
     threading.Thread(target=_ensure_matter_server, daemon=True).start()
     threading.Thread(target=_check_and_fix_mqtt_broker, daemon=True).start()
-    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    threading.Thread(target=_run_fleet_status_loop, daemon=True).start()
     threading.Thread(target=_ha_sync_loop,   daemon=True).start()
     threading.Thread(target=_alarmo_calendar_loop, daemon=True).start()
     threading.Thread(target=run_local_bridge, daemon=True).start()
