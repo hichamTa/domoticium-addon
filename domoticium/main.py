@@ -4618,30 +4618,108 @@ def _run_setup_inner():
 # PHASE 2 — SERVICE PERMANENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Tunnel Cloudflare : lancement SUPERVISÉ (lot F, « santé du tunnel ») ──────────────────────────────────────
+# Avant : cloudflared était lancé UNE fois, sans surveillance — s'il s'arrêtait (plantage, coupure réseau longue,
+# processus tué), l'accès à distance restait coupé jusqu'au prochain redémarrage de l'add-on, sans que personne le sache.
+# Maintenant : un fil surveille le processus ET son état réel (`/ready` de ses métriques : 200 seulement s'il a au moins
+# une connexion établie vers Cloudflare). Processus arrêté → relancé (pause 5 s doublée jusqu'à 60 s) ; processus vivant
+# mais non connecté depuis 5 min → relancé (au plus une fois par 5 min). L'état est publié dans le résumé de flotte
+# (`tun`) et une coupure de plus de 10 min ouvre l'alerte `tunnel_down` (visible dans l'app et par le staff, sans e-mail :
+# le client ne peut rien y faire, c'est à Domoticium d'agir).
+_CLOUDFLARED_METRICS_ADDR = "127.0.0.1:20243"
+_TUNNEL_PROBE_PERIOD_S = 15
+_TUNNEL_STUCK_RESTART_S = 300
+_TUNNEL_RESTART_MIN_GAP_S = 300
+_TUNNEL_BACKOFF_MAX_S = 60
+_tunnel_state = {"ready": None, "not_ready_since": None, "last_restart": 0.0, "failures": 0, "started_at": 0.0}
+
+
+def _tunnel_next_action(now: float, proc_alive: bool, ready: bool) -> str:
+    """Décision pure du superviseur : « none » ou « restart ». Met à jour _tunnel_state["ready" / "not_ready_since"]."""
+    st = _tunnel_state
+    if proc_alive and ready:
+        st["ready"], st["not_ready_since"] = True, None
+        if now - st["started_at"] > 300:
+            st["failures"] = 0            # stable depuis 5 min : la pause de relance repart de zéro
+        return "none"
+    st["ready"] = False
+    if st["not_ready_since"] is None:
+        st["not_ready_since"] = now
+    if not proc_alive:
+        gap = min(5 * 2 ** st["failures"], _TUNNEL_BACKOFF_MAX_S)
+        return "restart" if now - st["last_restart"] >= gap else "none"
+    if now - st["not_ready_since"] >= _TUNNEL_STUCK_RESTART_S and now - st["last_restart"] >= _TUNNEL_RESTART_MIN_GAP_S:
+        return "restart"
+    return "none"
+
+
+def _tunnel_probe_ready() -> bool:
+    try:
+        return requests.get(f"http://{_CLOUDFLARED_METRICS_ADDR}/ready", timeout=3).status_code == 200
+    except Exception:
+        return False
+
+
+def _cloudflared_spawn():
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "--no-autoupdate", "--metrics", _CLOUDFLARED_METRICS_ADDR, "run",
+         "--token", CLOUDFLARE_TUNNEL_TOKEN],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+
+    def _log_output():
+        for line in proc.stdout:
+            log(f"cloudflared: {line.decode().strip()}")
+
+    threading.Thread(target=_log_output, daemon=True).start()
+    return proc
+
+
+def _run_cloudflared_supervisor(spawn=None, probe=None, sleep=None, clock=None, max_loops=None):
+    """Fil permanent : lance cloudflared et le garde en vie (cf. commentaire ci-dessus). Les paramètres ne servent qu'aux tests."""
+    spawn, probe, sleep, clock = spawn or _cloudflared_spawn, probe or _tunnel_probe_ready, sleep or time.sleep, clock or time.time
+    proc = None
+    loops = 0
+    while max_loops is None or loops < max_loops:
+        loops += 1
+        try:
+            now = clock()
+            alive = proc is not None and proc.poll() is None
+            action = _tunnel_next_action(now, alive, bool(alive and probe()))
+            if proc is None and _tunnel_state["last_restart"] == 0.0:
+                action = "restart"            # premier lancement : sans attente
+            if action == "restart":
+                if alive:
+                    warn("[tunnel] cloudflared vivant mais non connecté depuis 5 min — relance")
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=10)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                elif proc is not None:
+                    warn(f"[tunnel] cloudflared arrêté (code {proc.poll()}) — relance")
+                _tunnel_state["failures"] += 1 if proc is not None else 0
+                _tunnel_state["last_restart"], _tunnel_state["started_at"] = now, now
+                proc = spawn()      # not_ready_since N'EST PAS remis à zéro : une boucle de relances ne doit pas masquer la coupure
+                log("✓ cloudflared lancé — accès distant par le tunnel Cloudflare")
+        except FileNotFoundError:
+            warn("cloudflared introuvable")
+            return
+        except Exception as e:
+            warn(f"[tunnel] cycle échoué (poursuite au prochain) : {e}")
+        sleep(_TUNNEL_PROBE_PERIOD_S)
+
+
 def start_cloudflared():
-    """Démarre cloudflared → Frigate go2rtc port 1984 via Cloudflare Tunnel."""
+    """Démarre le superviseur du tunnel Cloudflare (fil de fond)."""
     if not CLOUDFLARE_TUNNEL_TOKEN:
         log("cloudflared: pas de token — tunnel caméras désactivé")
         return
-
-    log("Démarrage de cloudflared…")
-    try:
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--no-autoupdate", "run",
-             "--token", CLOUDFLARE_TUNNEL_TOKEN],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-
-        def _log_output():
-            for line in proc.stdout:
-                log(f"cloudflared: {line.decode().strip()}")
-
-        threading.Thread(target=_log_output, daemon=True).start()
-        log("✓ cloudflared actif — Frigate go2rtc accessible via Cloudflare Tunnel")
-    except FileNotFoundError:
-        warn("cloudflared introuvable")
-    except Exception as e:
-        warn(f"cloudflared: {e}")
+    log("Démarrage du tunnel Cloudflare (supervisé)…")
+    threading.Thread(target=_run_cloudflared_supervisor, daemon=True, name="cloudflared-supervisor").start()
 
 
 def restart_frigate() -> bool:
@@ -6855,6 +6933,7 @@ _ALERTS_FILE = "/data/alerts.json"
 _ALERT_FLAP_WINDOW_S = 300
 _ALERT_BATTERY_LOW_PCT = 15
 _ALERT_WS_BRIDGE_DOWN_S = 300
+_ALERT_TUNNEL_DOWN_S = 600        # tunnel Cloudflare coupé depuis 10 min (cf. _run_cloudflared_supervisor)
 _ALERT_HISTORY_MAX = 100          # alertes résolues conservées (anti-flap + historique)
 _ALERT_HISTORY_KEEP_S = 7 * 86400
 _ALERT_NOTIFY_GIVE_UP_S = 24 * 3600   # un e-mail « hors ligne » vieux d'un jour n'a plus de sens
@@ -6909,6 +6988,7 @@ def _alert_message(alert_type: str, name: str) -> str:
         "camera_offline": f"Caméra « {name} » hors ligne",
         "battery_low": f"Batterie faible sur « {name} »",
         "ws_bridge_down": "Connexion Home Assistant instable — les états des équipements ne se mettent plus à jour",
+        "tunnel_down": "Accès à distance interrompu — le boîtier n'est plus joignable depuis l'extérieur de la maison",
     }[alert_type]
 
 
@@ -7302,6 +7382,18 @@ def _alerts_check_ws_bridge(now: float) -> bool:
     return False
 
 
+def _alerts_check_tunnel(now: float) -> bool:
+    """« tunnel_down » : le tunnel Cloudflare est coupé depuis plus de 10 min (hors cas « pas de tunnel configuré »).
+    App + vue staff seulement : ni e-mail ni push, le client ne peut rien y faire. Résolu dès la reconnexion."""
+    if not CLOUDFLARE_TUNNEL_TOKEN:
+        return False
+    st = _tunnel_state
+    down = st["ready"] is False and st["not_ready_since"] is not None and now - st["not_ready_since"] > _ALERT_TUNNEL_DOWN_S
+    if st["ready"] is True:
+        return _alert_set_condition("tunnel_down", "site", "", False, now)
+    return _alert_set_condition("tunnel_down", "site", "", True, now) if down else False
+
+
 def _addon_version() -> str | None:
     """Version de l'add-on (API Supervisor), lue une fois."""
     if not _addon_version_cache:
@@ -7323,6 +7415,7 @@ def _fleet_status_payload() -> dict:
         ]
     return {
         "v": _addon_version(), "ha": True, "z2m": _z2m_online, "ws": bool(_ws_bridge_connected),
+        "tun": (_tunnel_state["ready"] if CLOUDFLARE_TUNNEL_TOKEN else None),
         "devices": dict(_fleet_devices),
         "cameras": {n: o for n, o in _fleet_cameras.items() if n in _cameras},
         "alerts": alerts,
@@ -7379,6 +7472,8 @@ def _run_alerts_engine():
                     warn(f"[alerts] réconciliation échouée (nouvel essai au prochain passage) : {e}")
                     last_reconcile = now - _ALERTS_RECONCILE_S + 60
             if _alerts_check_ws_bridge(now):
+                _alerts_changed()
+            if _alerts_check_tunnel(now):
                 _alerts_changed()
             _alerts_process_notifications(now)
             _alerts_process_push(now)
