@@ -7443,6 +7443,140 @@ def _fleet_status_direct() -> bool:
         return False
 
 
+# ── Assistants vocaux (Alexa / Google Home) — lot F ────────────────────────────────────────────────────────────
+# Avant : les appels vocaux étaient traités par le cloud à partir des TABLES Supabase (équipements, scènes, drapeau
+# `voice_exposed`, état recopié). Depuis le chantier « Pi-first », ces tables ne sont plus alimentées : le boîtier est la
+# source de vérité. Le cloud (obligatoire : Amazon et Google appellent une URL publique, et le lien de compte OAuth y
+# vit) ne garde que le travail de traduction ; il demande au boîtier, par le tunnel, un INSTANTANÉ des seuls éléments que
+# le client a choisi d'exposer (POST /voice/snapshot) et lui fait exécuter les commandes (/cmd, déjà en liste blanche).
+#  - le choix « quoi exposer » est un réglage du foyer : /data/voice-exposure.json, modifié depuis l'app du Pi ;
+#  - un changement de ce choix prévient le cloud (ingest/voice-changed) pour qu'Alexa / Google redécouvrent tout seuls.
+_VOICE_FILE = "/data/voice-exposure.json"
+_VOICE_TYPES = frozenset({"light", "switch", "plug", "cover", "valve", "lock", "thermostat", "fan", "humidifier"})
+_VOICE_MAX_ITEMS = 300
+_VOICE_ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+_VOICE_SNAPSHOT_TTL_S = 5
+_voice_lock = threading.Lock()
+_voice_cache = {"at": 0.0, "data": None}
+_voice_notify_timer = {"t": None}
+
+
+def _voice_clean_ids(raw) -> list:
+    out, seen = [], set()
+    for x in (raw if isinstance(raw, list) else []):
+        if isinstance(x, str) and _VOICE_ID_RE.match(x) and x not in seen:
+            seen.add(x)
+            out.append(x)
+        if len(out) >= _VOICE_MAX_ITEMS:
+            break
+    return out
+
+
+def _voice_load() -> dict:
+    try:
+        with open(_VOICE_FILE) as f:
+            d = json.load(f)
+        return {"devices": _voice_clean_ids(d.get("devices")), "scenes": _voice_clean_ids(d.get("scenes"))}
+    except Exception:
+        return {"devices": [], "scenes": []}
+
+
+def _voice_save(d: dict) -> None:
+    tmp = _VOICE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(d))
+    os.replace(tmp, _VOICE_FILE)
+
+
+def _voice_notify_cloud() -> None:
+    """Prévient le cloud que l'exposition a changé (il relance la découverte Alexa / la synchro Google). Regroupé :
+    plusieurs bascules rapprochées ne font qu'UN appel, 5 s après la dernière."""
+    if not INGEST_SECRET:
+        return
+
+    def _send():
+        try:
+            _cloud_post("vercel:ingest/voice-changed", f"{APP_URL}/api/ingest/voice-changed",
+                        json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX}, timeout=10)
+        except Exception as e:
+            warn(f"[voice] notification du cloud impossible : {e}")
+
+    with _voice_lock:
+        if _voice_notify_timer["t"] is not None:
+            _voice_notify_timer["t"].cancel()
+        t = threading.Timer(5.0, _send)
+        t.daemon = True
+        _voice_notify_timer["t"] = t
+        t.start()
+
+
+def _voice_area_names() -> dict:
+    r = _ha_ws_call("config/area_registry/list")
+    areas = r.get("result", []) if r and r.get("success") else []
+    return {a.get("area_id"): a.get("name") for a in areas}
+
+
+def _voice_scene_candidates() -> list:
+    """Scènes HA (id d'entité + nom) — lecture légère de /states, sans interroger la config de chaque scène."""
+    try:
+        r = ha_get("/states")
+        if not r.ok:
+            return []
+        return [{"id": s["entity_id"], "name": (s.get("attributes") or {}).get("friendly_name") or s["entity_id"]}
+                for s in r.json() if isinstance(s, dict) and str(s.get("entity_id", "")).startswith("scene.")]
+    except Exception as e:
+        warn(f"[voice] lecture des scènes : {e}")
+        return []
+
+
+def handle_voice_exposure_get() -> dict:
+    """Réglage + candidats (pour l'écran « Assistants vocaux » de l'app du Pi)."""
+    exposure = _voice_load()
+    names = _voice_area_names()
+    devices = [{"id": d["id"], "name": d["name"], "type": d["type"], "room": names.get(d.get("areaId"))}
+               for d in _build_local_devices() if d.get("type") in _VOICE_TYPES and d.get("id")]
+    return {"exposed": exposure, "candidates": {"devices": devices, "scenes": _voice_scene_candidates()}}
+
+
+def handle_voice_exposure_set(data: dict) -> dict:
+    """Enregistre le choix (identifiants invalides ignorés) et prévient le cloud si quelque chose a changé."""
+    new = {"devices": _voice_clean_ids(data.get("devices")), "scenes": _voice_clean_ids(data.get("scenes"))}
+    with _voice_lock:
+        old = _voice_load()
+        if new == old:
+            return {"ok": True, "changed": False, "exposed": new}
+        _voice_save(new)
+        _voice_cache["data"] = None
+    _voice_notify_cloud()
+    return {"ok": True, "changed": True, "exposed": new}
+
+
+def handle_voice_snapshot(now=None) -> dict:
+    """Instantané demandé par le cloud : UNIQUEMENT les équipements et scènes exposés, sous la forme neutre que le cloud
+    traduit en Alexa / Google (type, capacités, état normalisé, en ligne, pièce). Court cache (5 s) : Alexa et Google
+    envoient des rafales de QUERY."""
+    now = time.time() if now is None else now
+    cached = _voice_cache["data"]
+    if cached is not None and now - _voice_cache["at"] < _VOICE_SNAPSHOT_TTL_S:
+        return cached
+    exposure = _voice_load()
+    wanted = set(exposure["devices"])
+    out_devices = []
+    if wanted:
+        names = _voice_area_names()
+        for d in _build_local_devices():
+            if d.get("id") in wanted and d.get("type") in _VOICE_TYPES:
+                out_devices.append({
+                    "id": d["id"], "name": d["name"], "type": d["type"], "room": names.get(d.get("areaId")),
+                    "online": bool(d.get("online")), "capabilities": d.get("capabilities") or {}, "state": d.get("state") or {},
+                })
+    scenes = [s for s in _voice_scene_candidates() if s["id"] in set(exposure["scenes"])] if exposure["scenes"] else []
+    data = {"devices": out_devices, "scenes": scenes}
+    _voice_cache["at"], _voice_cache["data"] = now, data
+    return data
+
+
 def handle_local_alerts() -> dict:
     """GET /local/alerts : alertes OUVERTES, la plus récente d'abord — lues par l'app du Pi."""
     with _alerts_lock:
@@ -10349,6 +10483,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
                 "/matter/merge/reject":  self._handle_matter_merge_reject_route,
                 "/wifi/shelly/add":      self._handle_wifi_shelly_add_route,
+                "/voice/snapshot":       lambda d: self._ok(handle_voice_snapshot()),
+                "/local/voice/exposure": lambda d: self._ok(handle_voice_exposure_set(d)),
                 "/ha/session-token/create": self._handle_ha_session_token_create,
                 "/ha/session-token/revoke": self._handle_ha_session_token_revoke,
             }
@@ -10900,6 +11036,12 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_alerts_route()
         elif route == "/local/stats":
             self._ok(handle_local_stats())
+        elif route == "/local/voice/exposure":
+            try:
+                self._ok(handle_voice_exposure_get())
+            except Exception as e:
+                warn(f"[voice] {e}")
+                self._reject(500, str(e))
         else:
             self._reject(404, "Route inconnue")
 
