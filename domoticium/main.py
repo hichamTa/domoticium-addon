@@ -1767,6 +1767,7 @@ _GATEWAY_PASS_FILE = "/data/gateway-pass.json"
 # abonnement est suspendu (le portail répond 402 au lieu d'un laissez-passer) ; portail injoignable → l'ancien sert jusqu'à son
 # expiration (13 jours de marge).
 _GATEWAY_PASS_RENEW_WITHIN_S = 13 * 86400
+_GATEWAY_PASS_MAX_AGE_S = 14 * 86400  # durée de vie des laissez-passer actuels
 # Abonnement suspendu (décision d'Hicham, 2026-11-20) : services cloud coupés (passerelle, e-mails, accès à distance), usage LOCAL
 # intact. Plus aucun appel à la passerelle ; le portail est re-sondé toutes les 30 min (un réabonnement se voit vite).
 _GATEWAY_ENTITLEMENT_FILE = "/data/entitlement.json"
@@ -1887,7 +1888,10 @@ def _gateway_get_pass(force: bool = False) -> str | None:
             _gateway_pass_save(*got)
             return st["pass"]
         valid = bool(st["pass"]) and st["exp"] > now + 60
-        fresh = valid and st["exp"] - now > _GATEWAY_PASS_RENEW_WITHIN_S
+        # « Frais » = émis il y a moins d'un jour (13 à 14 jours restants). Un laissez-passer qui en a PLUS est un ancien (180 jours,
+        # émis avant le passage à 14 jours) : il ne serait jamais renouvelé de lui-même et le boîtier n'apprendrait jamais une
+        # suspension → renouvelé tout de suite (tolérance d'1 h sur l'horloge).
+        fresh = valid and _GATEWAY_PASS_RENEW_WITHIN_S < st["exp"] - now <= _GATEWAY_PASS_MAX_AGE_S + 3600
         if fresh and not force:
             return st["pass"]
         if now >= st["next_attempt"]:
