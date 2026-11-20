@@ -1912,6 +1912,57 @@ def _gateway_get_pass(force: bool = False) -> str | None:
         return st["pass"] if (valid and not force) else None
 
 
+def handle_local_entitlement() -> dict:
+    """État d'abonnement connu du boîtier — lu par l'app du foyer (bandeau « Abonnement suspendu », refus de l'accès à distance).
+    L'add-on principal est la SEULE autorité : c'est lui qui interroge le portail, en tâche de fond (cf. _run_entitlement_loop)."""
+    _gateway_ent_load()
+    return {"suspended": bool(_gateway_ent["suspended"]), "since": _gateway_ent["since"]}
+
+
+def _entitlement_check_now() -> dict:
+    """Interroge le portail MAINTENANT (laissez-passer) : 402 → suspendu ; laissez-passer reçu → actif (et conservé) ; panne du
+    portail → l'état connu ne change pas (une panne ne suspend personne)."""
+    with _gateway_pass_lock:
+        st = _gateway_pass_state
+        kind, got = _gateway_pass_request()
+        if kind == "suspended":
+            _gateway_set_suspended(True)
+            _gateway_ent["next_check"] = time.time() + _GATEWAY_SUSPENDED_RECHECK_S
+        elif kind == "ok" and got:
+            _gateway_set_suspended(False)
+            st["pass"], st["exp"], st["loaded"] = got[0], got[1], True
+            _gateway_pass_save(*got)
+    return handle_local_entitlement()
+
+
+_ENTITLEMENT_LOOP_PERIOD_S = 3600
+_entitlement_last_forced = [0.0]
+
+
+def handle_local_entitlement_recheck() -> dict:
+    """« J'ai payé : vérifier » — re-vérification immédiate, au plus une fois par minute."""
+    if time.time() - _entitlement_last_forced[0] >= 60:
+        _entitlement_last_forced[0] = time.time()
+        return _entitlement_check_now()
+    return handle_local_entitlement()
+
+
+def _run_entitlement_loop(sleep=None, max_loops=None):
+    """Thread permanent : interroge le portail TOUTES LES HEURES (et 90 s après le démarrage), qu'un service cloud soit utilisé
+    ou non. Sans ça, une tablette murale allumée 24 h/24 n'apprendrait la suspension (ou le réabonnement) qu'au prochain besoin
+    de la passerelle, parfois un jour plus tard. Latence maximale : 1 h (immédiate avec le bouton du bandeau)."""
+    sleep = sleep or time.sleep
+    sleep(90)
+    loops = 0
+    while max_loops is None or loops < max_loops:
+        loops += 1
+        try:
+            _entitlement_check_now()
+        except Exception as e:
+            warn(f"[entitlement] cycle échoué (poursuite au prochain) : {e}")
+        sleep(_ENTITLEMENT_LOOP_PERIOD_S)
+
+
 def _gateway_request(method: str, route: str, params: dict | None = None, body: dict | None = None,
                      timeout: int = 15) -> tuple[int, dict | None]:
     """Requête JSON sur la passerelle → (code HTTP, corps JSON ou None). Code 0 = indisponible (pas de
@@ -10568,6 +10619,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/local/matter/merge/reject":  lambda d: self._ok(handle_matter_merge_reject(d)),
                 "/wifi/shelly/add":      self._handle_wifi_shelly_add_route,
                 "/voice/snapshot":       lambda d: self._ok(handle_voice_snapshot()),
+                "/local/entitlement/recheck": lambda d: self._ok(handle_local_entitlement_recheck()),
                 "/local/voice/exposure": lambda d: self._ok(handle_voice_exposure_set(d)),
                 "/ha/session-token/create": self._handle_ha_session_token_create,
                 "/ha/session-token/revoke": self._handle_ha_session_token_revoke,
@@ -11113,6 +11165,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_alerts_route()
         elif route == "/local/stats":
             self._ok(handle_local_stats())
+        elif route == "/local/entitlement":
+            self._ok(handle_local_entitlement())
         elif route == "/local/matter/merge":
             try:
                 self._ok(handle_matter_merge_suggestions())
@@ -11740,6 +11794,7 @@ def run_bridge():
     # Retry des transitions d'alarme (seul état encore remonté au cloud)
     threading.Thread(target=_flush_alarm_state_batch, daemon=True).start()
     threading.Thread(target=_run_alerts_engine,      daemon=True).start()
+    threading.Thread(target=_run_entitlement_loop,   daemon=True, name="entitlement").start()
     # Watchdog caméras : sonde go2rtc toutes les 60s, deltas envoyés dans le batch
     threading.Thread(target=_run_camera_watchdog,    daemon=True).start()
     # Proxy /cameras → go2rtc (retire le préfixe imposé par le tunnel Cloudflare)
