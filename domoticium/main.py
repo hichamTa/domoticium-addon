@@ -1763,9 +1763,15 @@ def _has_turn(servers: list[dict]) -> bool:
 # sur disque et renouvelé dès qu'il a plus de 30 jours. Même logique que l'app locale du Pi
 # (web/src/lib/local/gateway.ts) : le fonctionnement courant ne dépend ni de Vercel ni de Supabase.
 _GATEWAY_PASS_FILE = "/data/gateway-pass.json"
-# Renouvelé dès qu'il a plus de 30 jours (180 j de validité − 150) : l'adresse e-mail du client y est signée, un
-# changement d'adresse ne doit pas rester ignoré des mois ; portail injoignable → l'ancien sert jusqu'à son expiration.
-_GATEWAY_PASS_RENEW_WITHIN_S = 150 * 86400
+# Laissez-passer de 14 jours, renouvelé dès qu'il a plus d'UN jour (14 − 13) : c'est aussi comme ça que le boîtier apprend qu'un
+# abonnement est suspendu (le portail répond 402 au lieu d'un laissez-passer) ; portail injoignable → l'ancien sert jusqu'à son
+# expiration (13 jours de marge).
+_GATEWAY_PASS_RENEW_WITHIN_S = 13 * 86400
+# Abonnement suspendu (décision d'Hicham, 2026-11-20) : services cloud coupés (passerelle, e-mails, accès à distance), usage LOCAL
+# intact. Plus aucun appel à la passerelle ; le portail est re-sondé toutes les 30 min (un réabonnement se voit vite).
+_GATEWAY_ENTITLEMENT_FILE = "/data/entitlement.json"
+_GATEWAY_SUSPENDED_RECHECK_S = 1800
+_gateway_ent = {"loaded": False, "suspended": False, "since": None, "next_check": 0.0}
 _GATEWAY_PASS_RETRY_S = 600  # pas plus d'un essai toutes les 10 min après un échec ou un refus
 _gateway_pass_lock = threading.Lock()
 _gateway_pass_state = {"pass": None, "exp": 0.0, "loaded": False, "next_attempt": 0.0}
@@ -1793,9 +1799,54 @@ def _gateway_pass_save(token: str, exp: float) -> None:
         warn(f"[gateway] écriture du laissez-passer impossible : {e}")  # reste en mémoire, redemandé au prochain démarrage
 
 
-def _gateway_pass_request() -> tuple[str, float] | None:
+def _gateway_ent_load() -> None:
+    if _gateway_ent["loaded"]:
+        return
+    _gateway_ent["loaded"] = True
+    try:
+        with open(_GATEWAY_ENTITLEMENT_FILE) as f:
+            d = json.load(f)
+        _gateway_ent["suspended"] = d.get("suspended") is True
+        _gateway_ent["since"] = d.get("since") if isinstance(d.get("since"), (int, float)) else None
+    except Exception:
+        pass
+
+
+def _gateway_is_suspended() -> bool:
+    """Vrai si le portail a signifié que l'abonnement est suspendu (état conservé sur disque entre deux redémarrages)."""
+    _gateway_ent_load()
+    return bool(_gateway_ent["suspended"])
+
+
+def _gateway_set_suspended(suspended: bool) -> None:
+    _gateway_ent_load()
+    if _gateway_ent["suspended"] == suspended:
+        return
+    _gateway_ent["suspended"] = suspended
+    _gateway_ent["since"] = int(time.time()) if suspended else None
+    try:
+        tmp = _GATEWAY_ENTITLEMENT_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"suspended": suspended, "since": _gateway_ent["since"]}, f)
+        os.replace(tmp, _GATEWAY_ENTITLEMENT_FILE)
+    except Exception as e:
+        warn(f"[gateway] écriture de l'état d'abonnement impossible : {e}")
+    if suspended:
+        warn("[gateway] abonnement suspendu : services cloud coupés (l'usage local reste intact)")
+        _gateway_pass_state["pass"], _gateway_pass_state["exp"] = None, 0.0
+        try:
+            os.remove(_GATEWAY_PASS_FILE)
+        except OSError:
+            pass
+    else:
+        log("[gateway] abonnement de nouveau actif : services cloud rétablis")
+
+
+def _gateway_pass_request() -> tuple[str, tuple[str, float] | None]:
+    """('ok', (laissez-passer, expiration)) | ('suspended', None) | ('error', None)."""
     if not INGEST_SECRET or not SITE_PREFIX:
-        return None
+        return "error", None
     try:
         r = _cloud_post(
             "vercel:ingest/gateway-pass",
@@ -1803,15 +1854,17 @@ def _gateway_pass_request() -> tuple[str, float] | None:
             json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX},
             timeout=15,
         )
+        if r.status_code == 402:
+            return "suspended", None
         if not r.ok:
             warn(f"[gateway] laissez-passer refusé par le portail : HTTP {r.status_code}")
-            return None
+            return "error", None
         d = r.json()
         if isinstance(d.get("pass"), str) and isinstance(d.get("expiresAt"), (int, float)):
-            return d["pass"], float(d["expiresAt"])
+            return "ok", (d["pass"], float(d["expiresAt"]))
     except Exception as e:
         warn(f"[gateway] portail injoignable pour le laissez-passer : {e}")
-    return None
+    return "error", None
 
 
 def _gateway_get_pass(force: bool = False) -> str | None:
@@ -1822,12 +1875,27 @@ def _gateway_get_pass(force: bool = False) -> str | None:
             st["pass"], st["exp"] = _gateway_pass_load()
             st["loaded"] = True
         now = time.time()
+        if _gateway_is_suspended():
+            if now < _gateway_ent["next_check"]:
+                return None
+            _gateway_ent["next_check"] = now + _GATEWAY_SUSPENDED_RECHECK_S
+            kind, got = _gateway_pass_request()
+            if kind != "ok" or not got:
+                return None
+            _gateway_set_suspended(False)
+            st["pass"], st["exp"] = got
+            _gateway_pass_save(*got)
+            return st["pass"]
         valid = bool(st["pass"]) and st["exp"] > now + 60
         fresh = valid and st["exp"] - now > _GATEWAY_PASS_RENEW_WITHIN_S
         if fresh and not force:
             return st["pass"]
         if now >= st["next_attempt"]:
-            got = _gateway_pass_request()
+            kind, got = _gateway_pass_request()
+            if kind == "suspended":
+                _gateway_set_suspended(True)
+                _gateway_ent["next_check"] = now + _GATEWAY_SUSPENDED_RECHECK_S
+                return None
             if got:
                 st["pass"], st["exp"] = got
                 _gateway_pass_save(*got)
@@ -1850,7 +1918,7 @@ def _gateway_request(method: str, route: str, params: dict | None = None, body: 
         force = attempt == 1 and used is not None and _gateway_pass_state["pass"] == used
         token = _gateway_get_pass(force)
         if not token:
-            return 0, None
+            return (402 if _gateway_is_suspended() else 0), None
         used = token
         try:
             r = requests.request(method, f"{GATEWAY_URL}{route}", params=params or {}, json=body,
@@ -7158,6 +7226,8 @@ def _alerts_process_notifications(now: float, send=None) -> int:
             elif status in (400, 413):
                 n["state"] = "given_up"                  # notre requête est refusée : réessayer ne servirait à rien
                 warn(f"[alerts] e-mail refusé par la passerelle (HTTP {status}) pour {a['type']}")
+            elif status == 402:
+                n["state"] = "given_up"                  # abonnement suspendu : service cloud coupé, rien à retenter
             elif status == 409:
                 n["next_at"] = now + 6 * 3600            # pas encore d'adresse dans le laissez-passer (renouvelé tout seul)
             elif status == 429:
@@ -11494,6 +11564,14 @@ class _Go2rtcProxyHandler(socketserver.BaseRequestHandler):
             client_sock.settimeout(10)
             head = _read_http_head(client_sock)
             if not head:
+                return
+            # Abonnement suspendu : le relais caméra À DISTANCE (arrivée par le tunnel Cloudflare, qui ajoute toujours CF-Connecting-IP)
+            # est coupé ; les caméras restent utilisables en local.
+            if b"cf-connecting-ip:" in head.lower() and _gateway_is_suspended():
+                try:
+                    client_sock.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
                 return
             if not _verify_camera_session_cookie(head):
                 try:
