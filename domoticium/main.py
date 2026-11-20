@@ -2954,143 +2954,153 @@ def _resolve_entity_for_matter_node(node_id: int) -> str | None:
     return None
 
 
-def _migrate_matter_device_merge(old_node_id, new_node_id, device_name: str):
-    """Suite d'une fusion automatique de doublon Matter (cf. pi_sync_matter_devices,
-    migration 0055) : l'équipement garde le même id/nom/pièce côté app (rien à
-    migrer là), mais son entity_id HA change — tout ce qui référence l'ancien
-    entity_id EN DUR doit être explicitement mis à jour :
-    - Alarmo (config interne, jamais recalculée dynamiquement)
-    - Automatisations (entity_id figé dans trigger/action au moment de leur création,
-      contrairement aux scènes qui référencent notre device_id, stable)
-    Décidé avec Hicham le 2026-08-01."""
-    if old_node_id is None or new_node_id is None:
-        return
-    old_entity = _resolve_entity_for_matter_node(int(old_node_id))
-    new_entity = _resolve_entity_for_matter_node(int(new_node_id))
-    if not old_entity or not new_entity or old_entity == new_entity:
-        warn(f"[matter-merge] entity_id introuvable pour la fusion {old_node_id}→{new_node_id} ({device_name})")
-        return
-    log(f"[matter-merge] '{device_name}' : {old_entity} → {new_entity}")
+# ── Fusion d'un équipement Matter re-jumelé (lot « Pi-first ») ───────────────────────────────────────────────────
+# Cas réel : un équipement Matter est réinitialisé puis re-jumelé → matter-server lui donne un NOUVEAU node_id, Home
+# Assistant crée un NOUVEL équipement (nouvelles entités, sans nom ni pièce) et garde l'ancien, hors ligne. Tout ce qui
+# référence l'ancien entity_id en dur (automatisations, scènes, capteurs Alarmo, raccourcis de pièce, exposition vocale,
+# réglages de l'app) est alors cassé.
+# Avant : la détection et les suggestions vivaient dans Supabase (pi_sync_devices) et la fusion réécrivait les
+# automatisations une par une. Maintenant tout se passe sur le boîtier, et SANS réécrire aucune référence : on retire l'ancien
+# nœud, puis on donne aux entités du nouvel équipement les entity_id de l'ancien (+ son nom et sa pièce). Toutes les
+# références restent valides, partout, parce que l'identité d'un équipement EST son entity_id.
+#  - détection (à la demande, jamais automatique — décision d'Hicham du 2026-08-01 : seul le client sait si c'est le même
+#    appareil physique) : un équipement Matter EN LIGNE, sans pièce, et UN SEUL équipement Matter hors ligne de mêmes
+#    vendeur + modèle, de node_id plus ancien ; ambiguïté (2 anciens possibles, ou 2 nouveaux pour 1 ancien) = rien proposé ;
+#  - « Non, ce n'est pas le même » : la paire est mémorisée (/data/matter-merge.json), plus jamais reproposée.
+_MATTER_MERGE_FILE = "/data/matter-merge.json"
+_MATTER_UID_REST_RE = re.compile(r"^[0-9a-fA-F]{16}-[0-9a-fA-F]{16}-(.+)$")
 
-    # ── Alarmo ────────────────────────────────────────────────────────────────
-    sensors_result = _ha_ws_call("alarmo/sensors")
-    sensors = sensors_result.get("result") if sensors_result and sensors_result.get("success") else {}
-    old_config = (sensors or {}).get(old_entity)
-    if old_config:
-        modes = [_ALARMO_MODE_MAP_REVERSE[m] for m in (old_config.get("modes") or []) if m in _ALARMO_MODE_MAP_REVERSE]
-        sensor_type = old_config.get("type") or "other"
-        always_on = bool(old_config.get("always_on"))
-        handle_alarmo_remove_sensor(old_entity)
-        if modes:
-            result = handle_alarmo_update_sensor(new_entity, sensor_type, modes, always_on)
-            if result.get("ok"):
-                log(f"[matter-merge] Alarmo migré : {new_entity} ({sensor_type}, {modes})")
-            else:
-                warn(f"[matter-merge] Alarmo migration échouée : {result.get('detail')}")
 
-    # ── Retrait du nœud mort côté matter-server ─────────────────────────────────
-    # Sans ça, matter-server continue de reporter l'ancien node_id à chaque cycle
-    # de synchro (jamais oublié tant qu'il n'est pas explicitement retiré du
-    # fabric) — recréant un fantôme anonyme au cycle suivant (demande Hicham,
-    # 2026-08-01 : "il faudrait le supprimer une fois la fusion faite").
-    # Audit add-on 2026-09-22 : le résultat était ignoré — un échec transitoire
-    # (matter-server injoignable, jusqu'à 20s de délai WS) laissait un fantôme
-    # permanent sans qu'aucune trace ne le signale. Toujours pas de retry
-    # automatique ici (fusion rare, pas un chemin chaud) mais au moins visible
-    # dans les logs pour un diagnostic manuel plutôt qu'un silence total.
-    if not _matter_remove_node(int(old_node_id)):
-        warn(f"[matter-merge] Échec du retrait du nœud mort {old_node_id} côté matter-server — "
-             f"risque de fantôme recréé au prochain cycle de synchro, à vérifier manuellement")
-
-    # ── Automatisations ──────────────────────────────────────────────────────
+def _matter_merge_rejected() -> set:
     try:
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:migrate_entity:{old_entity}:{new_entity}"
-        r = _supabase_rpc("pi_migrate_entity_references", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_old_entity_id": old_entity, "p_new_entity_id": new_entity,
-        }, timeout=15)
-        if r.status_code >= 300:
-            warn(f"[matter-merge] pi_migrate_entity_references {r.status_code}: {r.text[:200]}")
-            return
-        automations = r.json() or []
-        for auto in automations:
-            _republish_automation(auto["id"], auto["name"], auto["trigger"], auto["action"])
-        if automations:
-            log(f"[matter-merge] {len(automations)} automatisation(s) migrée(s) et republiée(s) vers HA")
-    except Exception as e:
-        warn(f"[matter-merge] migration automatisations : {e}")
+        with open(_MATTER_MERGE_FILE) as f:
+            return {str(x) for x in (json.load(f).get("rejected") or [])}
+    except Exception:
+        return set()
 
 
-def _republish_automation(automation_id: str, name: str, trigger_json: str, action_json: str):
-    """Republie une automatisation vers HA — même logique que le cmd_type
-    'automation_upsert' de _handle_ha_command(), réutilisée après une migration
-    d'entity_id (cf. _migrate_matter_device_merge)."""
-    object_id = f"domoticium_auto_{automation_id.replace('-', '_')}"
+def _matter_merge_pair_key(new_node, old_node) -> str:
+    return f"{int(new_node)}:{int(old_node)}"
+
+
+def handle_matter_merge_suggestions() -> dict:
+    """Paires (nouvel équipement Matter, ancien équipement hors ligne) que le client peut fusionner."""
+    matter = [d for d in _build_local_devices() if d.get("matterNodeId") is not None and d.get("vendor") and d.get("model")]
+    rejected = _matter_merge_rejected()
+    olds_of = {}
+    for new in matter:
+        if not new.get("online") or new.get("areaId"):
+            continue
+        olds = [o for o in matter if o is not new and not o.get("online") and o["vendor"] == new["vendor"]
+                and o["model"] == new["model"] and int(o["matterNodeId"]) < int(new["matterNodeId"])]
+        if len(olds) == 1:
+            olds_of[int(new["matterNodeId"])] = (new, olds[0])
+    used = {}
+    for new_node, (_n, old) in olds_of.items():
+        used.setdefault(int(old["matterNodeId"]), []).append(new_node)
+    out = []
+    for new_node, (new, old) in sorted(olds_of.items()):
+        if len(used[int(old["matterNodeId"])]) != 1:
+            continue                                   # 2 nouveaux pour 1 ancien : ambigu
+        if _matter_merge_pair_key(new_node, old["matterNodeId"]) in rejected:
+            continue
+        out.append({"newNodeId": new_node, "oldNodeId": int(old["matterNodeId"]), "newName": new["name"], "oldName": old["name"],
+                    "newEntityId": new["haEntityId"], "oldEntityId": old["haEntityId"], "vendor": new["vendor"], "model": new["model"]})
+    return {"suggestions": out}
+
+
+def handle_matter_merge_reject(data: dict) -> dict:
+    """« Ce n'est pas le même appareil » : la paire n'est plus jamais proposée."""
     try:
-        trigger_data = json.loads(trigger_json) if trigger_json else {}
-        action_data = json.loads(action_json) if action_json else []
-    except Exception as e:
-        warn(f"[matter-merge] JSON automation {automation_id} invalide : {e}")
-        return
-    auto_cfg = {
-        "alias":     name,
-        "trigger":   trigger_data.get("triggers", []),
-        "condition": trigger_data.get("conditions", []),
-        "action":    action_data,
-        "mode":      "single",
-    }
-    r = ha_post(f"/config/automation/config/{object_id}", auto_cfg)
-    if r.ok:
-        ha_post("/services/automation/reload", {})
-        log(f"[matter-merge] Automation HA republiée : {object_id}")
-    else:
-        warn(f"[matter-merge] Erreur republication automation {object_id} : {r.status_code} {r.text[:200]}")
-
-
-def handle_matter_merge_confirm(suggestion_id: str) -> dict:
-    """Le client confirme qu'un nouvel équipement Matter détecté est bien le même
-    appareil physique qu'un équipement existant hors ligne (cf. matter_merge_suggestions,
-    jamais fusionné automatiquement — décision Hicham 2026-08-01). Applique la fusion
-    en base (pi_apply_matter_merge) puis migre Alarmo/automatisations."""
-    if not suggestion_id:
-        return {"ok": False, "detail": "suggestionId manquant"}
-    ts = int(time.time())
-    message = f"{SITE_PREFIX}:{ts}:apply_matter_merge:{suggestion_id}"
-    r = _supabase_rpc("pi_apply_matter_merge", {
-        "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-        "p_suggestion_id": suggestion_id,
-    }, timeout=15)
-    if r.status_code >= 300:
-        warn(f"[matter-merge] pi_apply_matter_merge {r.status_code}: {r.text[:200]}")
-        return {"ok": False, "detail": f"Supabase {r.status_code}"}
-    rows = r.json() or []
-    if not rows or rows[0].get("old_node_id") is None:
-        return {"ok": False, "detail": "Suggestion introuvable ou déjà traitée"}
-    row = rows[0]
-    threading.Thread(
-        target=_migrate_matter_device_merge,
-        args=(row["old_node_id"], row["new_node_id"], row["device_name"]),
-        daemon=True,
-    ).start()
+        key = _matter_merge_pair_key(data.get("newNodeId"), data.get("oldNodeId"))
+    except (TypeError, ValueError):
+        return {"ok": False, "detail": "newNodeId et oldNodeId requis"}
+    rejected = _matter_merge_rejected() | {key}
+    tmp = _MATTER_MERGE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps({"rejected": sorted(rejected)}))
+    os.replace(tmp, _MATTER_MERGE_FILE)
     return {"ok": True}
 
 
-def handle_matter_merge_reject(suggestion_id: str) -> dict:
-    """Le client indique que ce n'est PAS le même appareil — la suggestion est
-    écartée, les deux équipements restent distincts définitivement."""
-    if not suggestion_id:
-        return {"ok": False, "detail": "suggestionId manquant"}
-    ts = int(time.time())
-    message = f"{SITE_PREFIX}:{ts}:reject_matter_merge:{suggestion_id}"
-    r = _supabase_rpc("pi_reject_matter_merge", {
-        "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-        "p_suggestion_id": suggestion_id,
-    }, timeout=15)
-    if r.status_code >= 300:
-        warn(f"[matter-merge] pi_reject_matter_merge {r.status_code}: {r.text[:200]}")
-        return {"ok": False, "detail": f"Supabase {r.status_code}"}
-    return {"ok": True}
+def _matter_entries(entries: list, node_id: int) -> list:
+    return [e for e in entries if _matter_node_id_from_unique_id(e.get("unique_id")) == node_id]
+
+
+def handle_matter_merge_confirm(data: dict, sleep=None) -> dict:
+    """Fusionne : retire l'ancien nœud, puis les entités du nouvel équipement prennent les entity_id, le nom et la pièce
+    de l'ancien. Idempotent côté lecture (une paire qui n'est plus proposée est refusée) ; la partie destructive n'a lieu
+    qu'après avoir vérifié qu'au moins une entité du nouvel équipement correspond à une entité de l'ancien."""
+    sleep = sleep or time.sleep
+    try:
+        new_node, old_node = int(data.get("newNodeId")), int(data.get("oldNodeId"))
+    except (TypeError, ValueError):
+        return {"ok": False, "detail": "newNodeId et oldNodeId requis"}
+    if not any(s["newNodeId"] == new_node and s["oldNodeId"] == old_node for s in handle_matter_merge_suggestions()["suggestions"]):
+        return {"ok": False, "detail": "Fusion introuvable ou déjà traitée"}
+
+    ent = _ha_ws_call("config/entity_registry/list")
+    dev = _ha_ws_call("config/device_registry/list")
+    if not ent or not ent.get("success") or not dev or not dev.get("success"):
+        return {"ok": False, "detail": "Home Assistant injoignable"}
+    entries, devices = ent["result"], dev["result"]
+    old_entries, new_entries = _matter_entries(entries, old_node), _matter_entries(entries, new_node)
+
+    def rest(e):
+        m = _MATTER_UID_REST_RE.match(e.get("unique_id") or "")
+        return m.group(1) if m else None
+    old_by_rest = {rest(e): e for e in old_entries if rest(e)}
+    pairs = [(n, old_by_rest[rest(n)]) for n in new_entries if rest(n) in old_by_rest]
+    if not pairs:
+        return {"ok": False, "detail": "Aucune entité de l'ancien équipement ne correspond au nouveau (modèle différent ?)"}
+
+    old_dev_id = next((e.get("device_id") for e in old_entries if e.get("device_id")), None)
+    new_dev_id = next((e.get("device_id") for e in new_entries if e.get("device_id")), None)
+    old_dev = next((d for d in devices if d.get("id") == old_dev_id), {})
+    old_ids = {o["entity_id"] for _n, o in pairs} | {e["entity_id"] for e in old_entries}
+
+    if not _matter_remove_node(old_node):
+        return {"ok": False, "detail": "Impossible de retirer l'ancien équipement du réseau Matter — rien n'a été modifié"}
+
+    # Home Assistant retire l'ancien équipement tout seul à la suite : on attend que ses entity_id se libèrent.
+    remaining = old_ids
+    for _ in range(15):
+        res = _ha_ws_call("config/entity_registry/list")
+        present = {e["entity_id"] for e in (res or {}).get("result", [])} if res and res.get("success") else remaining
+        remaining = old_ids & present
+        if not remaining:
+            break
+        sleep(1.5)
+    for eid in remaining:                                  # filet : entrée orpheline qui n'a pas été retirée
+        _ha_ws_call("config/entity_registry/remove", entity_id=eid)
+
+    renamed, failed = 0, []
+    for new_e, old_e in pairs:
+        params = {"entity_id": new_e["entity_id"], "new_entity_id": old_e["entity_id"]}
+        if old_e.get("name"):
+            params["name"] = old_e["name"]
+        res = _ha_ws_call("config/entity_registry/update", **params)
+        if res and res.get("success"):
+            renamed += 1
+        else:
+            failed.append(old_e["entity_id"])
+            warn(f"[matter-merge] renommage {new_e['entity_id']} → {old_e['entity_id']} refusé : {json.dumps(res)[:200] if res else 'pas de réponse'}")
+    if new_dev_id:
+        dparams = {"device_id": new_dev_id, "name_by_user": old_dev.get("name_by_user") or old_dev.get("name")}
+        if old_dev.get("area_id"):
+            dparams["area_id"] = old_dev["area_id"]
+        res = _ha_ws_call("config/device_registry/update", **dparams)
+        if not (res and res.get("success")):
+            warn(f"[matter-merge] nom / pièce non reportés : {json.dumps(res)[:200] if res else 'pas de réponse'}")
+    log(f"[matter-merge] nœud {old_node} → {new_node} : {renamed} entité(s) reprennent leurs anciens identifiants, {len(failed)} échec(s)")
+    _alerts_reindex.set()
+    _alerts_wake.set()
+    try:
+        _sse_publish("fast")
+    except Exception:
+        pass
+    return {"ok": True, "renamed": renamed, "failed": failed}
 
 
 _ALARMO_SHORT_EXIT_TIME = 5  # secondes — voir docstring ci-dessous
@@ -10480,8 +10490,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/alarmo/area-mode":     self._handle_alarmo_area_mode_set_route,
                 "/alarmo/general-config": self._handle_alarmo_general_config_set_route,
                 "/alarmo/sensor-group":  self._handle_alarmo_sensor_group_route,
-                "/matter/merge/confirm": self._handle_matter_merge_confirm_route,
-                "/matter/merge/reject":  self._handle_matter_merge_reject_route,
+                "/local/matter/merge/confirm": self._handle_local_matter_merge_confirm,
+                "/local/matter/merge/reject":  lambda d: self._ok(handle_matter_merge_reject(d)),
                 "/wifi/shelly/add":      self._handle_wifi_shelly_add_route,
                 "/voice/snapshot":       lambda d: self._ok(handle_voice_snapshot()),
                 "/local/voice/exposure": lambda d: self._ok(handle_voice_exposure_set(d)),
@@ -10952,15 +10962,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
         else:
             self._reject(400, result.get("detail", "échec"))
 
-    def _handle_matter_merge_confirm_route(self, data):
-        result = handle_matter_merge_confirm(data.get("suggestionId", ""))
-        if result.get("ok"):
-            self._ok(result)
-        else:
-            self._reject(400, result.get("detail", "échec"))
-
-    def _handle_matter_merge_reject_route(self, data):
-        result = handle_matter_merge_reject(data.get("suggestionId", ""))
+    def _handle_local_matter_merge_confirm(self, data):
+        result = handle_matter_merge_confirm(data)       # UNE seule exécution (opération destructive)
         if result.get("ok"):
             self._ok(result)
         else:
@@ -11036,6 +11039,12 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_alerts_route()
         elif route == "/local/stats":
             self._ok(handle_local_stats())
+        elif route == "/local/matter/merge":
+            try:
+                self._ok(handle_matter_merge_suggestions())
+            except Exception as e:
+                warn(f"[matter-merge] {e}")
+                self._reject(500, str(e))
         elif route == "/local/voice/exposure":
             try:
                 self._ok(handle_voice_exposure_get())
