@@ -9190,6 +9190,11 @@ def on_local_message(client, userdata, msg):
         threading.Thread(target=call_heartbeat_api, daemon=True).start()
         return
 
+    # ── Réponse au health_check de Zigbee2MQTT (cf. _health_probe_z2m) : seule PRÉSENCE d'une réponse compte
+    if topic == "zigbee2mqtt/bridge/response/health_check":
+        _z2m_health_event.set()
+        return
+
     # ── Réponse à une demande de reporting/configure (cf. _handle_zigbee_boost_reporting)
     if topic == "zigbee2mqtt/bridge/response/device/reporting/configure":
         try:
@@ -11887,6 +11892,163 @@ def _run_ha_port_shim(sleep=None, max_loops=None):
         sleep(5)
 
 
+# ── Superviseur des add-ons (2026-11-22) ─────────────────────────────────────────────────────────────────────
+# Retour d'Hicham au retest : un clavier d'alarme est resté hors ligne parce que Zigbee2MQTT/MQTT était « en erreur »
+# jusqu'à un redémarrage MANUEL, alors que le Watchdog du Supervisor est activé. Normal : ce Watchdog ne redémarre qu'un
+# add-on dont le process MEURT (cf. _enable_watchdogs_once) ; un service bloqué ou en erreur n'y change rien. Chez un
+# client, personne ne sera là pour le redémarrer : le boîtier surveille donc lui-même ses applications.
+#
+# On surveille les APPLICATIONS, jamais les équipements (une ampoule hors tension est « hors ligne » sans que Zigbee
+# y soit pour rien — décision d'Hicham). Une application est « en panne » si : le Supervisor la dit en erreur, ou arrêtée
+# alors qu'elle démarre normalement toute seule, ou démarrée mais ne répondant plus (sonde fonctionnelle). En panne en
+# continu depuis 5 min → (re)démarrage ciblé de CETTE application seulement. Garde-fous : rien pendant les 10 min qui
+# suivent le démarrage de cet add-on, 10 min de pause après un redémarrage, 3 redémarrages par heure au plus par
+# application (au-delà : on arrête et on le signale dans les logs, jamais de boucle), et un fichier /data/health_pause
+# suspend tout (maintenance volontaire par un technicien).
+_HEALTH_PERIOD_S = 60
+_HEALTH_FAIL_RESTART_S = 300
+_HEALTH_BOOT_GRACE_S = 600
+_HEALTH_COOLDOWN_S = 600
+_HEALTH_MAX_PER_HOUR = 3
+_HEALTH_PAUSE_FILE = "/data/health_pause"
+_HEALTH_BOOT_AT = time.time()
+_health_state: dict = {}
+_z2m_health_event = threading.Event()
+_z2m_health_seen = {"ok": False}
+
+
+def _tcp_ok(host: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def _health_probe_z2m() -> bool:
+    """Zigbee2MQTT répond-il ? Son état « online » (bridge/state) est retenu par le broker et reste vrai même si le
+    process est bloqué : on lui adresse donc un health_check (réponse attendue sous 8 s ; une réponse d'erreur compte,
+    elle prouve qu'il est vivant). Sans connexion MQTT de notre côté, on ne conclut rien (None = pas de sonde)."""
+    if _z2m_online is False:
+        return False
+    if not _local_client or not _local_client.is_connected():
+        return None  # notre propre lien MQTT est coupé : c'est la sonde Mosquitto qui tranche, pas celle-ci
+    _z2m_health_event.clear()
+    try:
+        _local_client.publish("zigbee2mqtt/bridge/request/health_check", "", qos=0)
+    except Exception:
+        return None
+    got = _z2m_health_event.wait(timeout=8)
+    if got:
+        _z2m_health_seen["ok"] = True
+        return True
+    # Une version de Zigbee2MQTT qui ne connaîtrait pas health_check ne répondrait jamais : tant qu'une réponse n'a pas
+    # été vue AU MOINS UNE FOIS, l'absence de réponse ne prouve rien (jamais de redémarrage sur cette seule base).
+    return False if _z2m_health_seen["ok"] else None
+
+
+def _health_probe_local_web() -> bool:
+    try:
+        return requests.get("http://127.0.0.1:8100/", timeout=6, allow_redirects=False).status_code < 500
+    except Exception:
+        return False
+
+
+# (clé, reconnaissance du slug, sonde fonctionnelle ou None = on ne regarde que l'état Supervisor)
+_HEALTH_APPS = [
+    ("mosquitto", lambda s: s == "core_mosquitto", lambda: _tcp_ok("127.0.0.1", 1883)),
+    ("zigbee2mqtt", lambda s: s.endswith("_zigbee2mqtt"), _health_probe_z2m),
+    ("matter", lambda s: s == "core_matter_server", lambda: _tcp_ok("127.0.0.1", 5580)),
+    ("accès local", lambda s: s.endswith("_domoticium_web") and not s.endswith("_local_web"), _health_probe_local_web),
+    # Frigate : état Supervisor seulement (jamais de redémarrage sur une sonde — risque de faux positif documenté).
+    ("frigate", lambda s: s.endswith("_frigate") and s != OLD_FRIGATE_SLUG, None),
+    ("thread", lambda s: s == "core_openthread_border_router", None),
+]
+
+
+def _health_decide(st: dict, bad: bool, stopped: bool, now: float) -> str:
+    """Décision pure pour une application : « none », « restart », « start » ou « give_up » (plafond atteint).
+    Met à jour st : since (début de la panne continue), restarts (horodatages), gave_up."""
+    if not bad:
+        st["since"] = None
+        st["gave_up"] = False
+        return "none"
+    if st.get("since") is None:
+        st["since"] = now
+    if now - st["since"] < _HEALTH_FAIL_RESTART_S:
+        return "none"
+    st["restarts"] = [t for t in st.get("restarts", []) if now - t < 3600]
+    if st["restarts"] and now - st["restarts"][-1] < _HEALTH_COOLDOWN_S:
+        return "none"
+    if len(st["restarts"]) >= _HEALTH_MAX_PER_HOUR:
+        return "give_up"
+    st["restarts"].append(now)
+    return "start" if stopped else "restart"
+
+
+def _health_check_once(now: float | None = None) -> list:
+    """Un passage de contrôle ; renvoie la liste des actions entreprises [(application, action)] (pour les tests)."""
+    now = time.time() if now is None else now
+    done = []
+    if now - _HEALTH_BOOT_AT < _HEALTH_BOOT_GRACE_S or os.path.exists(_HEALTH_PAUSE_FILE):
+        return done
+    r = sup_get("/addons")
+    if not r.ok:
+        return done
+    body = r.json()
+    addons = (body.get("data", body) or {}).get("addons", [])
+    by_slug = {a.get("slug", ""): a for a in addons if isinstance(a, dict)}
+    for key, match, probe in _HEALTH_APPS:
+        slug = next((sl for sl in by_slug if match(sl)), None)
+        if not slug:
+            continue  # application non installée sur ce site
+        st = _health_state.setdefault(key, {"since": None, "restarts": [], "gave_up": False})
+        state = by_slug[slug].get("state")
+        stopped = state in ("stopped", "unknown", None, "")
+        if state == "startup":
+            continue  # démarrage en cours : ni sain ni en panne
+        if stopped:
+            info = sup_get(f"/addons/{slug}/info")
+            boot = ((info.json().get("data") or {}).get("boot") if info.ok else None)
+            bad = boot == "auto"  # arrêtée à la main alors qu'elle devrait tourner : on la relance après 5 min
+        elif state == "error":
+            bad = True
+        else:
+            ok = probe() if probe else None
+            bad = ok is False
+        action = _health_decide(st, bad, stopped, now)
+        if action == "give_up":
+            if not st["gave_up"]:
+                st["gave_up"] = True
+                warn(f"[health] {key} : toujours en panne après {_HEALTH_MAX_PER_HOUR} redémarrages en 1 h — abandon (intervention nécessaire)")
+            continue
+        if action in ("start", "restart"):
+            warn(f"[health] {key} ({slug}) en panne depuis ≥ {_HEALTH_FAIL_RESTART_S // 60} min (état Supervisor : {state}) — "
+                 f"{'démarrage' if action == 'start' else 'redémarrage'}")
+            try:
+                rr = sup_post(f"/addons/{slug}/{action}", timeout=120)
+                if not rr.ok:
+                    warn(f"[health] {key} : échec {action} HTTP {rr.status_code}")
+            except Exception as e:
+                warn(f"[health] {key} : échec {action} : {e}")
+            done.append((key, action))
+            st["since"] = None  # nouvelle période d'observation après l'action
+            break  # un seul redémarrage par passage : on laisse le temps à l'application de remonter
+    return done
+
+
+def _run_health_supervisor(sleep=None, max_loops=None):
+    sleep = sleep or time.sleep
+    n = 0
+    while max_loops is None or n < max_loops:
+        n += 1
+        try:
+            _health_check_once()
+        except Exception as e:
+            warn(f"[health] {e}")
+        sleep(_HEALTH_PERIOD_S)
+
+
 def _turn_refresh_loop():
     """Rafraîchit les identifiants TURN Cloudflare avant leur expiration (48h max) et
     redémarre Frigate pour que go2rtc les recharge. Nouvel essai dans 5 min si le
@@ -11947,6 +12109,7 @@ def run_bridge():
     threading.Thread(target=run_local_tls_relay, daemon=True).start()
     threading.Thread(target=run_local_ha_tls_relay, daemon=True).start()
     threading.Thread(target=_run_ha_port_shim, daemon=True, name="ha-shim").start()
+    threading.Thread(target=_run_health_supervisor, daemon=True, name="health").start()
 
     # Serveur de commandes — bloquant, tourne dans le thread principal
     run_command_server()
