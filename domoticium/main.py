@@ -3598,30 +3598,64 @@ def _ensure_alarmo_keypad_control(devices_list):
 
     keypad_topic = f"zigbee2mqtt/{friendly_name}"
 
+    # (2026-11-22) Réponse d'ERREUR au clavier. Retour d'Hicham au retest : « avant, un faux code donnait une aide rouge
+    # + bip bip, plus maintenant ». Le clavier (ZCL IAS ACE) attend une réponse à SA requête, identifiée par
+    # `action_transaction` ; Alarmo reste la seule autorité de validation (cf. docstring), donc on regarde l'état RÉEL
+    # du panneau juste après l'appel : toujours « désarmé » après une demande d'armement (ou pas « désarmé » après une
+    # demande de désarmement) = refusé. Modes Zigbee2MQTT documentés : invalid_code (code faux), not_ready (ouverture
+    # détectée), already_disarmed. Le retour de SUCCÈS reste assuré par la 2e automatisation (LED d'après l'état).
+    tx = "{{ trigger.payload_json.action_transaction | default(0) | int(0) }}"
+
+    def _kp_reply(mode):
+        return {
+            "action": "mqtt.publish",
+            "data": {"topic": f"{keypad_topic}/set", "payload": '{"arm_mode": {"mode": "%s", "transaction": %s}}' % (mode, tx)},
+        }
+
+    p_id = panel_entity_id
+    still_disarmed = f"{{{{ is_state('{p_id}', 'disarmed') }}}}"
+    not_disarmed = f"{{{{ not is_state('{p_id}', 'disarmed') }}}}"
+    disarmed_and_open = (f"{{{{ is_state('{p_id}', 'disarmed') and "
+                         f"((state_attr('{p_id}', 'open_sensors') or {{}}) | length) > 0 }}}}")
+
+    def _kp_branch(action, service):
+        refused = ([{"conditions": [{"condition": "template", "value_template": not_disarmed}],
+                     "sequence": [_kp_reply("invalid_code")]}]
+                   if action == "disarm" else
+                   [{"conditions": [{"condition": "template", "value_template": disarmed_and_open}],
+                     "sequence": [_kp_reply("not_ready")]},
+                    {"conditions": [{"condition": "template", "value_template": still_disarmed}],
+                     "sequence": [_kp_reply("invalid_code")]}])
+        return {
+            "conditions": [{
+                "condition": "template",
+                "value_template": f"{{{{ trigger.payload_json.action == '{action}' }}}}",
+            }],
+            "sequence": [
+                {
+                    "action": service,
+                    "target": {"entity_id": panel_entity_id},
+                    # default('') : un clavier sans code configuré (code_arm_required
+                    # désactivé) peut omettre action_code du payload — un template
+                    # non défini planterait sinon l'appel de service.
+                    "data": {"code": "{{ trigger.payload_json.action_code | default('') }}"},
+                    # un code refusé lève (ou non, selon la version d'Alarmo) une erreur de service : dans les deux cas
+                    # on continue pour répondre au clavier.
+                    "continue_on_error": True,
+                },
+                {"delay": {"milliseconds": 800}},
+                {"choose": refused},
+            ],
+        }
+
     arm_cfg = {
         "type": "automation_upsert",
         "object_id": _KEYPAD_ARM_OBJECT_ID,
         "alias": "Domoticium — Armement clavier",
         "trigger": [{"platform": "mqtt", "topic": keypad_topic}],
-        "action": [{
-            "choose": [
-                {
-                    "conditions": [{
-                        "condition": "template",
-                        "value_template": f"{{{{ trigger.payload_json.action == '{action}' }}}}",
-                    }],
-                    "sequence": [{
-                        "action": service,
-                        "target": {"entity_id": panel_entity_id},
-                        # default('') : un clavier sans code configuré (code_arm_required
-                        # désactivé) peut omettre action_code du payload — un template
-                        # non défini planterait sinon l'appel de service.
-                        "data": {"code": "{{ trigger.payload_json.action_code | default('') }}"},
-                    }],
-                }
-                for action, service in _KEYPAD_ACTION_TO_SERVICE.items()
-            ],
-        }],
+        "action": [{"choose": [_kp_branch(action, service) for action, service in _KEYPAD_ACTION_TO_SERVICE.items()]}],
+        # « queued » : la pause de 0,8 s avant de juger le résultat ne doit pas faire perdre une 2e pression de touche.
+        "mode": "queued",
     }
     # (2026-11-09) Retours vérifiés — cf. commentaire équivalent dans
     # _ensure_alarmo_sos_automation pour le détail du bug réel trouvé ainsi.
