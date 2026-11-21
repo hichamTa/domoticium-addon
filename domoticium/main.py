@@ -85,6 +85,10 @@ GO2RTC_PROXY_PORT = 8099
 # jamais directement à 8098/8099, seulement à 8100, qui relaie lui-même en interne
 # côté serveur vers 8098/1984 (go2rtc) — pas de routage par chemin à faire ici.
 LOCAL_TLS_PORT = 8443
+# 2e relais HTTPS (même certificat) : page de connexion de Home Assistant. Sans lui, « Connexion via Home Assistant »
+# faisait passer le navigateur d'une page HTTPS (l'app) à une page HTTP (HA) : avertissement Chrome « ce site ne
+# prend pas en charge les connexions sécurisées » + mot de passe en clair sur le LAN (retest du 2026-11-21).
+LOCAL_HA_TLS_PORT = 8444
 
 # Mode réseau (PoE) ou USB
 NETWORK_MODE = bool(COORDINATOR_HOST)
@@ -723,7 +727,7 @@ def _ha_mint_access_token(refresh_token: str) -> str:
     host_network: true (config.yaml) fait partager à cet add-on la pile réseau de l'hôte,
     où Home Assistant Core écoute réellement."""
     resp = requests.post(
-        "http://127.0.0.1:8123/auth/token",
+        f"http://127.0.0.1:{_ha_core_port()}/auth/token",
         data={
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -10684,7 +10688,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             return self._ok({"ok": False, "error": str(e)})
 
         ws_send, ws_recv, ws_close = _ha_ws_connect(
-            access_token=access_token, host="127.0.0.1", port=8123, path="/api/websocket"
+            access_token=access_token, host="127.0.0.1", port=_ha_core_port(), path="/api/websocket"
         )
         if not ws_send:
             return self._ok({"ok": False, "error": "Connexion WebSocket HA échouée"})
@@ -10728,7 +10732,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             return self._reject(400, "Jeton HA sans claim iss")
 
         ws_send, ws_recv, ws_close = _ha_ws_connect(
-            access_token=session_token, host="127.0.0.1", port=8123, path="/api/websocket"
+            access_token=session_token, host="127.0.0.1", port=_ha_core_port(), path="/api/websocket"
         )
         if not ws_send:
             return self._ok({"ok": False, "error": "Connexion WebSocket HA échouée"})
@@ -11682,12 +11686,15 @@ class _LocalTlsRelayHandler(socketserver.BaseRequestHandler):
     ici — l'app locale gère sa propre session (même mécanisme qu'un accès
     direct non-TLS à 8100 aujourd'hui), ce relais ne fait que terminer le TLS."""
 
+    def _upstream_addr(self):
+        return _LOCAL_WEB_UPSTREAM_ADDR
+
     def handle(self):
         client_sock = self.request  # déjà un ssl.SSLSocket, cf. _LocalTlsRelayServer.get_request
         upstream = None
         try:
             client_sock.settimeout(10)
-            upstream = socket.create_connection(_LOCAL_WEB_UPSTREAM_ADDR, timeout=10)
+            upstream = socket.create_connection(self._upstream_addr(), timeout=10)
             client_sock.settimeout(None)
             upstream.settimeout(None)
             t = threading.Thread(target=_pipe_bytes, args=(client_sock, upstream), daemon=True)
@@ -11704,6 +11711,13 @@ class _LocalTlsRelayHandler(socketserver.BaseRequestHandler):
                     upstream.close()
                 except OSError:
                     pass
+
+
+class _LocalHaTlsRelayHandler(_LocalTlsRelayHandler):
+    """Même relais TLS, mais vers le frontend de Home Assistant (port RÉEL lu auprès du Supervisor)."""
+
+    def _upstream_addr(self):
+        return ("127.0.0.1", _ha_core_port())
 
 
 class _LocalTlsRelayServer(_ReusableTCPServer):
@@ -11727,20 +11741,116 @@ class _LocalTlsRelayServer(_ReusableTCPServer):
         return wrapped, addr
 
 
-def run_local_tls_relay():
-    """Relais HTTPS local (0.0.0.0:LOCAL_TLS_PORT → 127.0.0.1:8100) — attend qu'un
-    1er certificat soit chargé (_fetch_local_cert, cycle de sync 5 min) avant de
-    se lier : un site tout juste créé n'a pas encore de certificat émis côté
-    cloud (cron quotidien), ce n'est jamais une erreur à signaler en boucle."""
+def _run_tls_relay(port, handler_cls, label):
+    """Relais HTTPS local (0.0.0.0:port) — attend qu'un 1er certificat soit chargé
+    (_fetch_local_cert, cycle de sync 5 min) avant de se lier : un site tout juste créé
+    n'a pas encore de certificat émis côté cloud (cron quotidien), ce n'est jamais une
+    erreur à signaler en boucle."""
     while _local_tls_context is None:
         time.sleep(15)
     try:
-        server = _LocalTlsRelayServer(("0.0.0.0", LOCAL_TLS_PORT), _LocalTlsRelayHandler)
+        server = _LocalTlsRelayServer(("0.0.0.0", port), handler_cls)
         server.daemon_threads = True
-        log(f"[local-tls] ✓ Relais HTTPS actif sur 0.0.0.0:{LOCAL_TLS_PORT} → 127.0.0.1:8100")
+        log(f"[local-tls] ✓ Relais HTTPS actif sur 0.0.0.0:{port} → {label}")
         server.serve_forever()
     except Exception as e:
-        warn(f"[local-tls] Erreur fatale : {e}")
+        warn(f"[local-tls] Erreur fatale ({label}) : {e}")
+
+
+def run_local_tls_relay():
+    """0.0.0.0:LOCAL_TLS_PORT → 127.0.0.1:8100 (app « Accès local »)."""
+    _run_tls_relay(LOCAL_TLS_PORT, _LocalTlsRelayHandler, "127.0.0.1:8100")
+
+
+def run_local_ha_tls_relay():
+    """0.0.0.0:LOCAL_HA_TLS_PORT → frontend de Home Assistant (connexion HA en HTTPS)."""
+    _run_tls_relay(LOCAL_HA_TLS_PORT, _LocalHaTlsRelayHandler, "Home Assistant")
+
+
+# ── Port réel de Home Assistant Core ─────────────────────────────────────────────────────────────
+# Bug réel trouvé au retest (2026-11-21) : depuis HA 2026.8, une installation neuve écoute sur le port 80, plus
+# 8123 (Supervisor /core/info → "port": 80, vérifié sur le site de test). Tout ce qui supposait « HA = 127.0.0.1:8123 »
+# était donc cassé en silence : l'app locale (500 sur /api/auth/callback), l'accès technicien (WebSocket + /auth/token
+# de main.py) et l'ingress du tunnel du site (ha-{slug} → http://127.0.0.1:8123, défini côté Cloudflare).
+_ha_core_port_cache = {"at": 0.0, "port": 8123}
+
+
+def _ha_core_port():
+    """Port sur lequel HA Core écoute VRAIMENT, d'après le Supervisor (source de vérité, jamais deviné).
+    Gardé 5 s ; si le Supervisor ne répond pas, on garde la dernière valeur connue (8123 au tout début)."""
+    now = time.time()
+    if now - _ha_core_port_cache["at"] < 5:
+        return _ha_core_port_cache["port"]
+    try:
+        r = requests.get(f"{SUP}/core/info", headers=HDRS, timeout=5)
+        port = int((r.json().get("data") or {}).get("port") or 0)
+        if 0 < port < 65536:
+            _ha_core_port_cache["port"] = port
+    except Exception:
+        pass
+    _ha_core_port_cache["at"] = now
+    return _ha_core_port_cache["port"]
+
+
+class _HaPortShimHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client_sock = self.request
+        upstream = None
+        try:
+            upstream = socket.create_connection(("127.0.0.1", _ha_core_port()), timeout=10)
+            client_sock.settimeout(None)
+            upstream.settimeout(None)
+            t = threading.Thread(target=_pipe_bytes, args=(client_sock, upstream), daemon=True)
+            t.start()
+            _pipe_bytes(upstream, client_sock)
+            t.join(timeout=5)
+        except OSError:
+            pass
+        except Exception as e:
+            warn(f"[ha-shim] {e}")
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+
+def _run_ha_port_shim(sleep=None, max_loops=None):
+    """Garde 127.0.0.1:8123 joignable quand HA Core écoute ailleurs (port 80 depuis HA 2026.8) : l'ingress du
+    tunnel (défini côté Cloudflare, identique pour tous les sites) vise 127.0.0.1:8123 et ne peut pas connaître le
+    port de chaque boîtier. Un simple relais TCP loopback uniquement, actif SEULEMENT tant que le Supervisor dit
+    que HA n'est pas sur 8123 : si HA est (re)configuré sur 8123, le relais se retire en ≤ 5 s pour lui laisser la
+    place. Port déjà occupé (par HA lui-même) : on ne touche à rien."""
+    sleep = sleep or time.sleep
+    server = None
+    warned = False
+    n = 0
+    while max_loops is None or n < max_loops:
+        n += 1
+        try:
+            port = _ha_core_port()
+            want = bool(port) and port != 8123
+            if want and server is None:
+                try:
+                    server = _ReusableTCPServer(("127.0.0.1", 8123), _HaPortShimHandler)
+                    server.daemon_threads = True
+                    threading.Thread(target=server.serve_forever, daemon=True).start()
+                    log(f"[ha-shim] ✓ 127.0.0.1:8123 → 127.0.0.1:{port} (HA Core n'écoute pas sur 8123)")
+                    warned = False
+                except OSError as e:
+                    server = None
+                    if not warned:
+                        warn(f"[ha-shim] 127.0.0.1:8123 déjà occupé ({e}) — laissé tel quel")
+                        warned = True
+            elif not want and server is not None:
+                server.shutdown()
+                server.server_close()
+                server = None
+                log("[ha-shim] HA Core est (re)passé sur 8123 — relais retiré")
+        except Exception as e:
+            warn(f"[ha-shim] {e}")
+        sleep(5)
 
 
 def _turn_refresh_loop():
@@ -11801,6 +11911,8 @@ def run_bridge():
     threading.Thread(target=run_go2rtc_prefix_proxy, daemon=True).start()
     # Relais HTTPS local (pastille 3 couleurs) → add-on "Domoticium — Accès local" (8100)
     threading.Thread(target=run_local_tls_relay, daemon=True).start()
+    threading.Thread(target=run_local_ha_tls_relay, daemon=True).start()
+    threading.Thread(target=_run_ha_port_shim, daemon=True, name="ha-shim").start()
 
     # Serveur de commandes — bloquant, tourne dans le thread principal
     run_command_server()
