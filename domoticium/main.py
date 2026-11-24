@@ -331,6 +331,7 @@ def _normalize_device(
 # changement de présence en ligne), avec un renvoi de sécurité toutes les heures — qui garde aussi
 # `devices.last_seen` (« vu il y a… » côté staff) à moins d'1 h et répare une ligne perdue côté base.
 _devices_sync_sent: dict = {}
+_devices_sync_locks: dict = {}
 _DEVICES_SYNC_RESEND_S = 3600
 
 
@@ -342,13 +343,16 @@ def _sync_devices_to_supabase(protocol: str, devices: list[dict], timeout: float
     sig = hashlib.sha1(
         json.dumps(sorted(devices, key=lambda d: d["external_id"]), sort_keys=True, default=str).encode()
     ).hexdigest()
-    prev = _devices_sync_sent.get(protocol)
-    if prev and prev[0] == sig and time.time() - prev[1] < _DEVICES_SYNC_RESEND_S:
-        return True
-    ok = _sync_devices_to_supabase_now(protocol, devices, timeout)
-    if ok:
-        _devices_sync_sent[protocol] = (sig, time.time())
-    return ok
+    # Verrou par protocole : au redémarrage, plusieurs fils de fond (re-souscription bridge/devices…) appellent la synchro
+    # dans la même seconde — sans verrou aucun ne voit l'envoi des autres (vu en réel : 9 envois zigbee d'affilée).
+    with _devices_sync_locks.setdefault(protocol, threading.Lock()):
+        prev = _devices_sync_sent.get(protocol)
+        if prev and prev[0] == sig and time.time() - prev[1] < _DEVICES_SYNC_RESEND_S:
+            return True
+        ok = _sync_devices_to_supabase_now(protocol, devices, timeout)
+        if ok:
+            _devices_sync_sent[protocol] = (sig, time.time())
+        return ok
 
 
 def _sync_devices_to_supabase_now(protocol: str, devices: list[dict], timeout: float = 30.0) -> bool:
