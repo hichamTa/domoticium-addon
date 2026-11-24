@@ -6449,15 +6449,6 @@ def call_heartbeat_api():
     _fleet_request.set()
 
 
-def _relay_alarm_state(entity_id: str, state_val: str, attributes: dict):
-    """Alarme (alarm_control_panel.*) : déclenche le push « alarme déclenchée » envoyé par le BOÎTIER (lot F, clé VAPID
-    propre au site, cf. _alarm_push_on_state). Plus aucun envoi au cloud (2026-11-25) : les RPC pi_report_alarm_state /
-    pi_get_alarm_state et le webhook Vercel de push ont été retirés — l'app du Pi lit l'état d'alarme directement dans HA."""
-    if not entity_id.startswith("alarm_control_panel."):
-        return
-    _alarm_push_on_state(entity_id, state_val)
-
-
 # ── Flux temps réel vers l'app locale (SSE) ────────────────────────────────
 # Chantier « Pi-first » (2026-11-17) : l'app Domoticium servie par le Pi n'interroge plus
 # l'add-on toutes les 4 s — elle ouvre UN flux Server-Sent Events (GET /local/events, via sa
@@ -6521,8 +6512,8 @@ def _sse_note_state_change(entity_id: str, new_state: dict) -> None:
 
 def run_ha_ws_bridge():
     """Thread permanent : écoute le WebSocket de Home Assistant (state_changed + entity_registry_updated). Seul canal d'état
-    événementiel. Alimente : le flux temps réel de l'app du Pi (SSE), le moteur d'alertes, le push d'alarme local
-    (cf. _relay_alarm_state) et le registre d'entités. Plus aucun état d'équipement ni d'alarme n'est envoyé à Supabase."""
+    événementiel. Alimente : le flux temps réel de l'app du Pi (SSE), le moteur d'alertes
+    et le registre d'entités. Plus aucun état d'équipement ni d'alarme n'est envoyé à Supabase."""
     global _ws_bridge_connected
     while True:
         _ws_bridge_connected = False
@@ -6554,7 +6545,6 @@ def run_ha_ws_bridge():
                         continue
                     _sse_note_state_change(entity_id, new_state)
                     _alerts_note_state(entity_id, new_state.get("state", ""), new_state.get("attributes") or {})
-                    _relay_alarm_state(entity_id, new_state.get("state", ""), new_state.get("attributes", {}))
 
                 elif event_type == "entity_registry_updated":
                     action = data.get("action")
@@ -7014,7 +7004,7 @@ def _run_camera_watchdog():
 #   - une alerte ouverte par (type, équipement) : jamais de doublon (0053) ;
 #   - anti-flap : une coupure qui revient en < 5 min RÉ-OUVRE la même alerte, sans nouvelle notification (0103) ;
 #   - e-mail IMMÉDIAT pour caméra, capteurs, sirène, clavier…, mais JAMAIS pour ampoule/interrupteur/prise
-#     (light/switch/plug : push seulement, décision du 2026-09-02 — le push revient au lot F) ;
+#     (light/switch/plug : alerte dans l'app seulement — le push a été retiré le 2026-11-25) ;
 #   - batterie faible < 15 % : alerte dans l'app uniquement, jamais d'e-mail (0092) ;
 #   - pont WebSocket HA déconnecté > 5 min alors que l'add-on tourne : « ws_bridge_down » (0122).
 # `ha_offline` (Pi éteint) ne peut pas venir du Pi lui-même : surveillance côté portail (lot F).
@@ -7031,23 +7021,6 @@ _ALERT_NO_EMAIL_DEVICE_TYPES = frozenset({"light", "switch", "plug"})
 _ALERT_EMAIL_TYPES = frozenset({"camera_offline", "device_offline", "ws_bridge_down"})
 _ALERTS_TICK_S = 30
 _ALERTS_RECONCILE_S = 300
-# Notifications PUSH (lot F) : envoyées par l'app du Pi (127.0.0.1:8100, route interne signée) qui détient la clé VAPID du
-# site et les abonnements des appareils du foyer. Règles reprises à la lettre de l'ancienne route Vercel alerts-email
-# (décisions d'Hicham du 2026-09-02) : tout ce qui part par e-mail part aussi en push ; prises/interrupteurs : push SEUL,
-# tout de suite ; ampoules : push seul, après 24 h hors ligne (coupées au mur = normal) ; batterie faible : app seulement.
-_PUSH_URL = "http://127.0.0.1:8100/api/internal/push/send"
-_PUSH_ROUTE = "/push/send"
-_ALERT_PUSH_LIGHT_DELAY_S = 24 * 3600
-_ALERT_PUSH_GIVE_UP_S = 24 * 3600        # un push « hors ligne » dû depuis plus d'un jour n'a plus de sens
-_ALERT_PUSH_GROUP_MIN = 4                # ≥ 4 équipements dus au même passage (redémarrage) : UN push groupé
-_ALERT_PUSH_TYPES = frozenset({"camera_offline", "device_offline", "ws_bridge_down"})
-_PUSH_CONTENT = {
-    "camera_offline": ("⚠️ Caméra hors ligne", "votre caméra", "vérifiez son alimentation et sa connexion Wi-Fi", "/cameras"),
-    "device_offline": ("⚠️ Équipement déconnecté", "votre équipement", "vérifiez sa portée et sa pile", "/devices"),
-    "ws_bridge_down": ("⚠️ États des équipements figés", "votre installation",
-                       "un redémarrage de l'add-on Domoticium depuis Home Assistant suffit généralement", "/"),
-}
-
 _alerts_lock = threading.RLock()
 _alerts_state = {"loaded": False, "items": [], "dirty": False, "priming_since": None}
 _ALERT_PRIMING_MAX_S = 600        # amorçage : au plus 10 min, même si la réconciliation n'aboutit pas
@@ -7123,18 +7096,6 @@ def _alerts_save() -> None:
             _alerts_state["dirty"] = True
 
 
-def _alert_initial_push(alert_type: str, device_type: str | None, now: float, silent: bool = False) -> dict:
-    """État initial du PUSH d'une alerte (indépendant de l'e-mail). `due_at` : instant où il devient dû, conservé pour
-    la règle d'abandon ; les ampoules attendent 24 h."""
-    wants = alert_type in _ALERT_PUSH_TYPES and not silent
-    due = now
-    if now < _ALERTS_BOOT_AT + _ALERT_STARTUP_GRACE_S:
-        due = _ALERTS_BOOT_AT + _ALERT_STARTUP_GRACE_S + _ALERT_STARTUP_GRACE_MARGIN_S
-    if alert_type == "device_offline" and device_type == "light":
-        due = max(due, now + _ALERT_PUSH_LIGHT_DELAY_S)
-    return {"state": "pending" if wants else "none", "attempts": 0, "next_at": due, "due_at": due}
-
-
 def _alerts_priming_active(now: float) -> bool:
     """Vrai pendant l'amorçage du tout premier démarrage (fichier d'alertes absent) : de la création du moteur
     jusqu'à la fin de sa première réconciliation complète, 10 min au plus. Sous verrou."""
@@ -7187,7 +7148,6 @@ def _alert_set_condition(alert_type: str, key: str, name: str, active: bool, now
                 "id": secrets.token_hex(6), "type": alert_type, "key": key, "name": name, "device_type": device_type,
                 "message": _alert_message(alert_type, name), "created_at": now, "resolved_at": None,
                 "notify": _alert_initial_notify(alert_type, device_type, now, silent=_alerts_priming_active(now)),
-                "push": _alert_initial_push(alert_type, device_type, now, silent=_alerts_priming_active(now)),
             })
             _alerts_wake.set()
         _alerts_state["dirty"] = True
@@ -7247,131 +7207,6 @@ def _alerts_process_notifications(now: float, send=None) -> int:
                 n["next_at"] = now + min(300 * 2 ** (n["attempts"] - 1), 3600)
             _alerts_state["dirty"] = True
     return len(snapshots)
-
-
-def _push_auth_header(body: str) -> str:
-    """Même jeton que celui que l'app du Pi présente à l'add-on, dans le sens inverse :
-    `<ts>.<hmac>` sur `<ts>:POST:<route>:<sha256(corps)>` avec le secret du site."""
-    ts = int(time.time())
-    message = f"{ts}:POST:{_PUSH_ROUTE}:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
-    return f"{ts}." + hmac.new(INGEST_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
-
-
-def _push_send(title: str, body: str, url: str = "/dashboard", tag: str | None = None, urgent: bool = False) -> tuple[int, int]:
-    """Demande à l'app du Pi d'envoyer une notification push à TOUS les appareils abonnés. Retourne (code HTTP, échecs) :
-    (0, 0) = app injoignable ; (200, n) avec n > 0 = n envois ont échoué côté service de push (à retenter). Un foyer sans
-    appareil abonné répond (200, 0) : rien à retenter."""
-    if not INGEST_SECRET:
-        return 0, 0
-    # `n` : aléa propre à CETTE requête — deux push identiques dans la même seconde ne doivent pas avoir la même signature
-    # (l'app du Pi refuse toute signature déjà vue, anti-rejeu).
-    payload = {"title": title, "body": body, "url": url, "n": secrets.token_hex(6)}
-    if tag:
-        payload["tag"] = tag
-    if urgent:
-        payload["urgent"] = True
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    try:
-        r = requests.post(_PUSH_URL, data=raw.encode("utf-8"), timeout=20,
-                          headers={"Content-Type": "application/json", "X-Site-Secret": _push_auth_header(raw)})
-        failed = 0
-        if r.status_code == 200:
-            try:
-                failed = int((r.json() or {}).get("failed", 0))
-            except Exception:
-                failed = 0
-        return r.status_code, failed
-    except Exception as e:
-        warn(f"[push] app du Pi injoignable : {e}")
-        return 0, 0
-
-
-def _alert_push_text(alert: dict) -> tuple[str, str, str, str]:
-    title, fallback, hint, url = _PUSH_CONTENT[alert["type"]]
-    name = alert.get("name") if alert["type"] != "ws_bridge_down" else None
-    return title, f"{name or fallback} — {hint}.", url, f"domoticium-alert-{alert['id']}"
-
-
-def _alerts_process_push(now: float, send=None) -> int:
-    """Envoie les push dus. ≥ _ALERT_PUSH_GROUP_MIN équipements dus au même passage (redémarrage, coupure de courant) :
-    UN seul push groupé plutôt qu'une salve. Retourne le nombre de requêtes d'envoi tentées."""
-    send = send or _push_send
-    with _alerts_lock:
-        _alerts_load()
-        due = []
-        for a in _alerts_state["items"]:
-            p = a.get("push")
-            if not p or p.get("state") != "pending" or p["next_at"] > now:
-                continue
-            if a.get("resolved_at") is not None:
-                p["state"] = "skipped"             # incident terminé avant l'envoi : un push tardif serait trompeur
-                _alerts_state["dirty"] = True
-            elif now - p.get("due_at", p["next_at"]) > _ALERT_PUSH_GIVE_UP_S:
-                p["state"] = "given_up"
-                _alerts_state["dirty"] = True
-            else:
-                due.append(a)
-        due.sort(key=lambda a: a["created_at"])
-        devices = [a for a in due if a["type"] == "device_offline"]
-        group = devices if len(devices) >= _ALERT_PUSH_GROUP_MIN else []
-        singles = [a for a in due if a not in group][:_ALERT_NOTIFY_PER_TICK]
-        jobs = []
-        if group:
-            names = [a.get("name") or "équipement" for a in group]
-            shown = ", ".join(names[:3]) + (f" et {len(names) - 3} autre(s)" if len(names) > 3 else "")
-            jobs.append(([a["id"] for a in group], ("⚠️ Équipements déconnectés", f"{len(names)} équipements ne répondent plus : {shown}.", "/devices", "domoticium-offline-group")))
-        for a in singles:
-            jobs.append(([a["id"]], _alert_push_text(a)))
-    for ids, (title, body, url, tag) in jobs:
-        status, failed = send(title, body, url, tag)       # hors verrou : réseau local
-        with _alerts_lock:
-            for a in _alerts_state["items"]:
-                if a["id"] not in ids:
-                    continue
-                p = a["push"]
-                p["attempts"] += 1
-                if status == 200 and failed == 0:
-                    p["state"], p["sent_at"] = "sent", now
-                elif status in (400, 413):
-                    p["state"] = "given_up"
-                    warn(f"[alerts] push refusé par l'app du Pi (HTTP {status}) pour {a['type']}")
-                else:
-                    p["next_at"] = now + min(60 * 2 ** (p["attempts"] - 1), 1800)    # app en redémarrage : 1, 2, 4… 30 min
-                _alerts_state["dirty"] = True
-    return len(jobs)
-
-
-_alarm_push_state: dict = {}
-
-
-def _alarm_push_deliver(send=None, sleep=None) -> bool:
-    """Envoie le push d'alarme, avec reprises (l'app du Pi peut être en redémarrage) : 0, 3, 10, 30 s puis abandon."""
-    send = send or _push_send
-    sleep = sleep or time.sleep
-    for delay in (0, 3, 10, 30):
-        if delay:
-            sleep(delay)
-        status, failed = send("🚨 Alarme déclenchée", "L'alarme de votre logement vient de se déclencher.", "/alarm", "domoticium-alarm", True)
-        if status == 200 and failed == 0:
-            return True
-        if status in (400, 413):
-            break
-    warn("[alarm-push] push d'alarme non délivré")
-    return False
-
-
-def _alarm_push_on_state(entity_id: str, state: str, deliver=None) -> bool:
-    """Alarme : UN push « déclenchée » à chaque passage RÉEL à l'état `triggered` (jamais à l'armement/désarmement ni
-    quand un attribut change pendant que l'alarme reste déclenchée). Livraison en fil de fond. True si lancé."""
-    previous = _alarm_push_state.get(entity_id)
-    _alarm_push_state[entity_id] = state
-    if state != "triggered" or previous == "triggered":
-        return False
-    if deliver is None:
-        threading.Thread(target=_alarm_push_deliver, daemon=True).start()
-    else:
-        deliver()
-    return True
 
 
 def _alerts_eval_device(entity_id: str, state: str, attributes: dict, now: float) -> bool:
@@ -7701,7 +7536,6 @@ def _run_alerts_engine():
             if _alerts_check_tunnel(now):
                 _alerts_changed()
             _alerts_process_notifications(now)
-            _alerts_process_push(now)
             _alerts_save()
         except Exception as e:
             warn(f"[alerts] cycle échoué (poursuite au prochain) : {e}")
