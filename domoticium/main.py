@@ -250,19 +250,25 @@ def _cloud_post(label: str, url: str, **kwargs):
 # changé, avec un renvoi de sécurité toutes les 24 h (réparation si le portail a perdu la donnée).
 _registry_sent: dict = {}
 _REGISTRY_RESEND_S = 24 * 3600
+_registry_pause_until = 0.0  # portail en échec (HTTP non 2xx) : on arrête d'insister 10 min au lieu de renvoyer chaque entité en vain
 
 
 def _cloud_post_if_changed(label: str, url: str, payload: dict, key: str) -> bool:
-    """Poste `payload` au portail sauf s'il est identique au dernier envoi réussi (même clé) de moins de 24 h. Renvoie True si envoyé."""
+    """Poste `payload` au portail sauf s'il est identique au dernier envoi réussi (même clé) de moins de 24 h, ou si le portail vient de répondre en échec (pause 10 min). Renvoie True si envoyé."""
     body = {k: v for k, v in payload.items() if k != "siteSecret"}
     sig = hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    global _registry_pause_until
     now = time.time()
+    if now < _registry_pause_until:
+        return False
     prev = _registry_sent.get(key)
     if prev and prev[0] == sig and now - prev[1] < _REGISTRY_RESEND_S:
         return False
     r = _cloud_post(label, url, json=payload, timeout=10)
     if getattr(r, "ok", True):
         _registry_sent[key] = (sig, now)
+    else:
+        _registry_pause_until = now + 600
     return True
 
 
