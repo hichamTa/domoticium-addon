@@ -325,10 +325,33 @@ def _normalize_device(
     return device
 
 
+# Audit cloud 2026-11-24 : pi_sync_devices réécrivait TOUTES les lignes `devices` à chaque cycle de
+# 5 min × 3 protocoles (8,1 M de mises à jour cumulées sur la base), alors que seules les pages staff
+# lisent cette table. On n'envoie désormais que si la liste normalisée a changé (ajout/retrait/renom/
+# changement de présence en ligne), avec un renvoi de sécurité toutes les heures — qui garde aussi
+# `devices.last_seen` (« vu il y a… » côté staff) à moins d'1 h et répare une ligne perdue côté base.
+_devices_sync_sent: dict = {}
+_DEVICES_SYNC_RESEND_S = 3600
+
+
 def _sync_devices_to_supabase(protocol: str, devices: list[dict], timeout: float = 30.0) -> bool:
     """Appelle pi_sync_devices — remplace le bloc signature+appel+log répété en
     fin de chaque _sync_*_direct (harmonisation Zigbee/Matter/WiFi). True si
-    réussi. `devices` : liste d'objets déjà normalisés via _normalize_device."""
+    réussi (ou si rien n'a changé depuis le dernier envoi réussi de moins d'1 h).
+    `devices` : liste d'objets déjà normalisés via _normalize_device."""
+    sig = hashlib.sha1(
+        json.dumps(sorted(devices, key=lambda d: d["external_id"]), sort_keys=True, default=str).encode()
+    ).hexdigest()
+    prev = _devices_sync_sent.get(protocol)
+    if prev and prev[0] == sig and time.time() - prev[1] < _DEVICES_SYNC_RESEND_S:
+        return True
+    ok = _sync_devices_to_supabase_now(protocol, devices, timeout)
+    if ok:
+        _devices_sync_sent[protocol] = (sig, time.time())
+    return ok
+
+
+def _sync_devices_to_supabase_now(protocol: str, devices: list[dict], timeout: float = 30.0) -> bool:
     try:
         ts = int(time.time())
         id_sorted = ",".join(sorted(d["external_id"] for d in devices))
@@ -5863,8 +5886,8 @@ def _matter_commission_ws(code: str, request_id: str, timeout_s: int = 200):
 
 def handle_matter_commission(request_id: str, code: str):
     """Commissionne un device Matter via matter-server WebSocket (thread de fond).
-    Le résultat est poussé vers Supabase (sites.last_commission_status) via ingest —
-    l'app le lit par polling pendant la fenêtre de commissioning.
+    Le résultat n'est plus envoyé au cloud (audit 2026-11-24 : plus aucun lecteur) — l'app
+    locale détecte le nouvel appareil via la synchro (cf. AddDeviceFlow, mode local).
 
     Une seule tentative à la fois (_matter_commission_lock) : matter-server ne gère
     pas 2 sessions PASE concurrentes vers le même discriminator — vu en test réel,
@@ -5874,10 +5897,6 @@ def handle_matter_commission(request_id: str, code: str):
     entre-temps (retrouvé ensuite par la sync périodique via get_nodes())."""
     if not _matter_commission_lock.acquire(blocking=False):
         warn(f"Matter commission {request_id[:8]}… rejetée — un appairage est déjà en cours")
-        _post_ingest_commission_status(
-            request_id, False,
-            error="Un appairage Matter est déjà en cours — attends qu'il se termine avant de réessayer."
-        )
         return
 
     def _do():
@@ -5889,17 +5908,14 @@ def handle_matter_commission(request_id: str, code: str):
             success, detail = _matter_commission_ws(code, request_id)
             if success:
                 log(f"✓ Matter commission réussie — node_id={detail}")
-                _post_ingest_commission_status(request_id, True, node_id=detail)
                 try:
                     _explicitly_commissioned_matter_nodes.add(int(detail))
                 except (TypeError, ValueError):
                     pass
             else:
                 warn(f"⚠ Matter commission échouée: {detail}")
-                _post_ingest_commission_status(request_id, False, error=detail)
         except Exception as exc:
             warn(f"Matter commission: {exc}")
-            _post_ingest_commission_status(request_id, False, error=str(exc))
         finally:
             # Réveille la réconciliation complète (_sync_matter_devices_to_app via
             # _run_ha_maintenance_cycle) dans TOUS les cas — succès, échec ET exception — pas
@@ -5916,30 +5932,6 @@ def handle_matter_commission(request_id: str, code: str):
             _matter_commission_lock.release()
 
     threading.Thread(target=_do, daemon=True).start()
-
-
-def _post_ingest_commission_status(
-    request_id: str, success: bool, node_id: str | None = None, error: str | None = None
-):
-    """Pousse le résultat du commissioning Matter vers Supabase (sites.last_commission_status)."""
-    if not INGEST_SECRET:
-        return
-    try:
-        _cloud_post(
-            "vercel:ingest/commission-status",
-            f"{APP_URL}/api/ingest/commission-status",
-            json={
-                "siteSecret": INGEST_SECRET,
-                "siteId": SITE_PREFIX,
-                "requestId": request_id,
-                "success": success,
-                "nodeId": node_id,
-                "error": error,
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        warn(f"[ingest/commission-status] {e}")
 
 
 _z2m_online: bool | None = None  # état Z2M courant, None = inconnu
@@ -6336,7 +6328,6 @@ def _run_ha_maintenance_cycle():
     _sync_wifi_devices_to_app()
 
     _backfill_ha_entity_links()
-    _backfill_camera_entity_links()
     _reconcile_alarm_state()
     _report_local_ip()
     _fetch_local_cert()
@@ -6430,81 +6421,6 @@ def _backfill_ha_entity_links():
             _cloud_post_if_changed("vercel:ingest/registry", f"{APP_URL}/api/ingest/registry", payload, f"ent:{entity_id}")
         except Exception as ex:
             warn(f"[sync] backfill ha_entity_id {entity_id}: {ex}")
-
-
-def _backfill_camera_entity_links():
-    """Relie chaque caméra HA à ses entités secondaires (micro, IR, PTZ presets,
-    détection mouvement…) dans Supabase. Même pattern que _backfill_ha_entity_links()
-    mais pour les caméras : lit le device_id HA de chaque entité camera.*, puis
-    regroupe toutes les entités siblings (non diagnostic/config) du même device.
-    Idempotent — upsert côté web ne réécrase pas visible_client (override admin préservé).
-    """
-    result = _ha_ws_call("config/entity_registry/list")
-    if not result or not result.get("success"):
-        return
-
-    entities = result.get("result", [])
-
-    # Grouper par device_id HA (UUID interne HA)
-    by_device: dict[str, list[dict]] = {}
-    for e in entities:
-        did = e.get("device_id")
-        if did:
-            by_device.setdefault(did, []).append(e)
-
-    WRITABLE_DOMAINS = {
-        "switch", "select", "number", "input_boolean", "input_number",
-        "input_select", "button", "light", "cover", "climate", "lock", "fan",
-        "valve", "humidifier",
-    }
-
-    for e in entities:
-        entity_id = e.get("entity_id", "")
-        if not entity_id.startswith("camera."):
-            continue
-        if e.get("entity_category") in ("diagnostic", "config"):
-            continue
-        device_id = e.get("device_id")
-        if not device_id:
-            continue
-
-        secondary = []
-        for sibling in by_device.get(device_id, []):
-            s_id = sibling.get("entity_id", "")
-            if s_id == entity_id:
-                continue
-            if sibling.get("entity_category") in ("diagnostic", "config"):
-                continue
-            domain = s_id.split(".")[0] if "." in s_id else ""
-            if not domain:
-                continue
-            secondary.append({
-                "entityId": s_id,
-                "domain": domain,
-                "friendlyName": sibling.get("name") or sibling.get("original_name"),
-                "deviceClass": sibling.get("device_class") or sibling.get("original_device_class"),
-                "writable": domain in WRITABLE_DOMAINS,
-            })
-
-        if not secondary:
-            continue
-
-        try:
-            sent = _cloud_post_if_changed(
-                "vercel:ingest/camera-registry",
-                f"{APP_URL}/api/ingest/camera-registry",
-                {
-                    "siteSecret": INGEST_SECRET,
-                    "siteId": SITE_PREFIX,
-                    "cameraHaEntityId": entity_id,
-                    "entities": secondary,
-                },
-                f"cam:{entity_id}",
-            )
-            if sent:
-                log(f"[camera-registry] {entity_id} → {len(secondary)} entité(s) secondaire(s)")
-        except Exception as ex:
-            warn(f"[camera-registry] {entity_id}: {ex}")
 
 
 def _ha_sync_loop():
@@ -7907,6 +7823,7 @@ def _report_local_ip():
 # cycle de sync (5 min) quand le certificat n'a pas changé (cas normal, un
 # renouvellement n'arrive qu'environ tous les 60 jours).
 _last_local_cert_expires_at: str | None = None
+_last_local_cert_check = 0.0
 _local_tls_context: "ssl.SSLContext | None" = None
 
 _LOCAL_CERT_FILE = "/data/local_cert.pem"
@@ -7920,8 +7837,13 @@ def _fetch_local_cert():
     valeur a changé (1ère émission ou renouvellement). Lecture seule, même
     cadence que _report_local_ip (5 min, cf. _run_ha_maintenance_cycle) — un cycle en
     plus après un renouvellement (tous les ~60 jours) est sans conséquence."""
-    global _last_local_cert_expires_at, _local_tls_context
+    global _last_local_cert_expires_at, _local_tls_context, _last_local_cert_check
     if not INGEST_SECRET:
+        return
+    # Audit cloud 2026-11-24 : un certificat déjà chargé ne change que tous les ~60 jours — on ne le
+    # redemande qu'1 fois par jour (au lieu de chaque cycle de 5 min). Tant qu'aucun certificat n'est
+    # chargé (nouveau site), on continue de réessayer à chaque cycle.
+    if _last_local_cert_expires_at and time.time() - _last_local_cert_check < 24 * 3600:
         return
     try:
         ts = int(time.time())
@@ -7937,6 +7859,8 @@ def _fetch_local_cert():
             return  # pas encore émis côté cloud (nouveau site, cron pas encore passé)
         row = rows[0]
         expires_at = row.get("expires_at")
+        if expires_at:
+            _last_local_cert_check = time.time()
         if not expires_at or expires_at == _last_local_cert_expires_at:
             return
         with open(_LOCAL_CERT_FILE, "w") as f:
