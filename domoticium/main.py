@@ -1811,7 +1811,9 @@ def _gateway_ent_load() -> None:
     try:
         with open(_GATEWAY_ENTITLEMENT_FILE) as f:
             d = json.load(f)
-        _gateway_ent["suspended"] = d.get("suspended") is True
+        # Un état « suspendu » écrit avant 2.9.258 n'a pas de drapeau « explicit » : il a pu venir d'un faux 402 de l'hébergeur du
+        # portail. On ne le croit donc pas ; si la suspension est réelle, le prochain contrôle (≤ 90 s) la réécrit avec le drapeau.
+        _gateway_ent["suspended"] = d.get("suspended") is True and d.get("explicit") is True
         _gateway_ent["since"] = d.get("since") if isinstance(d.get("since"), (int, float)) else None
     except Exception:
         pass
@@ -1833,7 +1835,7 @@ def _gateway_set_suspended(suspended: bool) -> None:
         tmp = _GATEWAY_ENTITLEMENT_FILE + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump({"suspended": suspended, "since": _gateway_ent["since"]}, f)
+            json.dump({"suspended": suspended, "since": _gateway_ent["since"], "explicit": True}, f)
         os.replace(tmp, _GATEWAY_ENTITLEMENT_FILE)
     except Exception as e:
         warn(f"[gateway] écriture de l'état d'abonnement impossible : {e}")
@@ -1860,7 +1862,17 @@ def _gateway_pass_request() -> tuple[str, tuple[str, float] | None]:
             timeout=15,
         )
         if r.status_code == 402:
-            return "suspended", None
+            # Seul NOTRE refus explicite signifie « abonnement suspendu ». Un 402 sans ce motif vient de l'hébergeur du portail
+            # (Vercel : 402 DEPLOYMENT_DISABLED quand le compte dépasse ses limites, constaté le 2026-11-24 — le boîtier de test
+            # s'était alors déclaré « suspendu » alors que le client payait). Ce n'est pas une suspension.
+            try:
+                body = r.json()
+            except Exception:
+                body = None
+            if isinstance(body, dict) and body.get("error") == "subscription_suspended":
+                return "suspended", None
+            warn("[gateway] HTTP 402 sans le motif « subscription_suspended » (hébergeur du portail indisponible ?) — pas une suspension")
+            return "error", None
         if not r.ok:
             warn(f"[gateway] laissez-passer refusé par le portail : HTTP {r.status_code}")
             return "error", None
