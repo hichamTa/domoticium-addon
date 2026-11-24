@@ -4614,6 +4614,13 @@ def _ensure_ha_trusted_proxy():
     except FileNotFoundError:
         return False
 
+    # Diagnostic (2026-11-24) : l'accès technicien renvoyait 400 « request from a reverse proxy … not set-up » alors que le marqueur
+    # est censé garantir le bloc http: → on journalise le bloc RÉEL (aucun secret n'y figure) pour voir ce que HA lit vraiment.
+    m_http = re.search(r"(?m)^http:\s*$(?:\n(?:[ \t].*|\s*#.*|\s*))*", content)
+    warn(f"[trusted-proxy] marqueur={'oui' if _HA_TRUSTED_PROXY_MARKER in content else 'non'} ; bloc http: "
+         f"{('présent : ' + repr(m_http.group(0)[:400])) if m_http else 'ABSENT'} ; "
+         f"nb de lignes 'http:' au niveau racine = {len(re.findall(r'(?m)^http:', content))}")
+
     if _HA_TRUSTED_PROXY_MARKER in content:
         return False  # déjà fait
 
