@@ -6328,7 +6328,6 @@ def _run_ha_maintenance_cycle():
     _sync_wifi_devices_to_app()
 
     _backfill_ha_entity_links()
-    _reconcile_alarm_state()
     _report_local_ip()
     _fetch_local_cert()
 
@@ -6447,24 +6446,12 @@ def call_heartbeat_api():
 
 
 def _relay_alarm_state(entity_id: str, state_val: str, attributes: dict):
-    """Pousse l'état d'une alarme (alarm_control_panel.*) vers Supabase (pi_report_alarm_state) — appel direct
-    immédiat (rare : seulement les transitions). Depuis le lot D (phase 1) du chantier « Pi-first », c'est le SEUL état
-    d'équipement encore remonté au cloud : il déclenche le PUSH « alarme déclenchée » (pg_net → /api/webhooks/push-alarm),
-    fonction de sécurité conservée jusqu'à ce que le Pi envoie lui-même ses notifications (lot F). Tout le reste
-    (lumières, capteurs, prises, mesures… — le gros du volume Supabase) n'est plus envoyé : l'app du Pi lit HA directement.
-
-    Audit add-on 2026-09-22 : l'appel direct n'avait aucun filet de retry — un échec (Supabase indisponible, timeout)
-    perdait la transition définitivement, sur la donnée la plus sensible du système. En cas d'échec du premier essai,
-    réintégré dans _alarm_state_batch pour être retenté par _flush_alarm_state_batch au prochain cycle (2.5s)."""
-    if not entity_id.startswith("alarm_control_panel.") or not INGEST_SECRET:
+    """Alarme (alarm_control_panel.*) : déclenche le push « alarme déclenchée » envoyé par le BOÎTIER (lot F, clé VAPID
+    propre au site, cf. _alarm_push_on_state). Plus aucun envoi au cloud (2026-11-25) : les RPC pi_report_alarm_state /
+    pi_get_alarm_state et le webhook Vercel de push ont été retirés — l'app du Pi lit l'état d'alarme directement dans HA."""
+    if not entity_id.startswith("alarm_control_panel."):
         return
-    _alarm_push_on_state(entity_id, state_val)       # push d'alarme envoyé par le boîtier (lot F), indépendant du cloud
-
-    def _send_alarm_with_retry():
-        if not _report_alarm_state_direct(entity_id, state_val, attributes):
-            with _state_batch_lock:
-                _alarm_state_batch[entity_id] = (state_val, attributes)
-    threading.Thread(target=_send_alarm_with_retry, daemon=True).start()
+    _alarm_push_on_state(entity_id, state_val)
 
 
 # ── Flux temps réel vers l'app locale (SSE) ────────────────────────────────
@@ -6530,9 +6517,8 @@ def _sse_note_state_change(entity_id: str, new_state: dict) -> None:
 
 def run_ha_ws_bridge():
     """Thread permanent : écoute le WebSocket de Home Assistant (state_changed + entity_registry_updated). Seul canal d'état
-    événementiel. Alimente : le flux temps réel de l'app du Pi (SSE), le moteur d'alertes, le relais d'ALARME vers le cloud
-    (seul état encore remonté, cf. _relay_alarm_state) et le registre d'entités. Depuis le lot D (phase 1) du chantier
-    « Pi-first », les états d'équipements ne sont plus envoyés à Supabase."""
+    événementiel. Alimente : le flux temps réel de l'app du Pi (SSE), le moteur d'alertes, le push d'alarme local
+    (cf. _relay_alarm_state) et le registre d'entités. Plus aucun état d'équipement ni d'alarme n'est envoyé à Supabase."""
     global _ws_bridge_connected
     while True:
         _ws_bridge_connected = False
@@ -6902,13 +6888,6 @@ def _ha_attributes_to_capabilities(entity_id: str, attrs: dict) -> dict:
 
     return result
 
-
-# ── Retry de l'état d'alarme (seul état encore remonté au cloud) ──────────────────────────────────────
-# Les batchs d'états d'équipements (HA + Zigbee brut), leurs frein/filtres/tolérances et le « statut caméra » ont été retirés
-# au lot D (phase 1) : c'était le gros du volume Supabase (3 dépassements de quota en novembre 2026). Reste le retry de
-# l'alarme, qui utilise une RPC dédiée (pi_report_alarm_state) — cf. _relay_alarm_state / _flush_alarm_state_batch.
-_state_batch_lock = threading.Lock()
-_alarm_state_batch: dict = {}
 
 # Attributs « horloge » qui changent sans valeur pour l'app (position d'un lecteur média…) : un événement dont l'état ET
 # tous les autres attributs sont identiques au précédent est ignoré par le flux temps réel local (cf. _sse_note_state_change)
@@ -7726,57 +7705,6 @@ def _run_alerts_engine():
         _alerts_wake.clear()
 
 
-def _reconcile_alarm_state():
-    """Sécurité add-on, point 12 (audit 2026-09-22, resté ouvert jusqu'ici) : l'état
-    alarme (armé/désarmé) ne remonte QUE via le bridge événementiel (state_changed
-    sur alarm_control_panel.*, cf. run_ha_ws_bridge). Si l'add-on redémarre pile
-    pendant un changement d'état, ou si HA était déjà dans un état donné avant que
-    le bridge WebSocket ne se (re)connecte, aucun state_changed n'est émis pour le
-    rattraper — même raisonnement déjà établi pour les devices (_reconcile_device_states,
-    0104/0105/0111) : HA ne republie jamais le même état en boucle une fois émis.
-
-    Comparé à _reconcile_device_states, on ne peut pas simplement repousser l'état
-    HA à chaque cycle sans condition : pi_report_alarm_state (0116) insère une ligne
-    alarm_events ET déclenche la notification push "alarme déclenchée" quand
-    state='triggered' — un push inconditionnel toutes les 60s dupliquerait
-    l'historique et réenverrait cette alerte en boucle. On ne corrige donc QUE s'il
-    y a un vrai écart avec ce que l'app a stocké (pi_get_alarm_state, lecture
-    seule) — jamais un resync aveugle."""
-    area_id, _ = _alarmo_get_sole_area()
-    if not area_id:
-        return
-    entity_id = _alarmo_panel_entity_id(area_id)
-    if not entity_id:
-        return
-    r = ha_get(f"/states/{entity_id}")
-    if not r.ok:
-        return
-    try:
-        payload = r.json()
-    except Exception:
-        return
-    real_state = payload.get("state")
-    if not real_state or real_state in ("unavailable", "unknown"):
-        return
-
-    try:
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:get_alarm_state"
-        resp = _supabase_rpc("pi_get_alarm_state", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-        })
-        rows = resp.json() if resp.ok else []
-        stored_state = rows[0].get("alarm_state") if rows else None
-    except Exception as e:
-        warn(f"[reconcile] pi_get_alarm_state échoué : {e}")
-        return
-
-    if stored_state == real_state:
-        return
-    if _report_alarm_state_direct(entity_id, real_state, payload.get("attributes") or {}):
-        log(f"[reconcile] alarme resynchronisée : {stored_state!r} → {real_state!r} (filet périodique)")
-
-
 # Dernière IP locale réellement signalée — évite un appel RPC à chaque cycle
 # de sync (5 min) quand rien n'a changé (cas normal, l'IP ne bouge presque
 # jamais une fois le bail DHCP établi). Pas besoin de persister across un
@@ -7875,61 +7803,6 @@ def _fetch_local_cert():
         log(f"[local-tls] ✓ Certificat local chargé (expire {expires_at})")
     except Exception as e:
         warn(f"[local-tls] {e}")
-
-
-def _report_alarm_state_direct(entity_id: str, state: str, attributes: dict) -> bool:
-    """pi_report_alarm_state via Supabase direct — True si réussi. alarm_control_panel
-    n'est pas un "device" au sens de notre schéma (pas de room_id/ieee_address…) —
-    table dédiée sites.alarm_* plutôt que le pipeline générique pi_report_device_state
-    (qui ne trouverait aucune ligne correspondante dans `devices`).
-
-    open_sensors : dict {entity_id: sensor_state} côté Alarmo (vérifié dans
-    sensors.py::async_arm — "open_sensors[entity] = sensor_state"), pas une liste —
-    on prend la première clé comme capteur déclencheur."""
-    try:
-        mode = attributes.get("arm_mode")
-        open_sensors = attributes.get("open_sensors") or {}
-        triggered_by = next(iter(open_sensors.keys()), None) if isinstance(open_sensors, dict) else None
-        ts = int(time.time())
-        message = f"{SITE_PREFIX}:{ts}:alarm_state:{state}"
-        r = _supabase_rpc("pi_report_alarm_state", {
-            "p_mqtt_prefix": SITE_PREFIX, "p_timestamp": ts, "p_signature": _pi_sign(message),
-            "p_state": state, "p_mode": mode, "p_triggered_by": triggered_by,
-        })
-        if r.status_code >= 300:
-            warn(f"[supabase] pi_report_alarm_state({entity_id}) {r.status_code}: {r.text[:120]}")
-            return False
-        return True
-    except Exception as e:
-        warn(f"[supabase] pi_report_alarm_state({entity_id}): {e}")
-        return False
-
-
-def _flush_alarm_state_batch():
-    """Thread de fond (cycle 2,5 s) : retente les transitions d'alarme qui n'ont pas pu partir (réseau, Supabase). Seul reste de
-    l'ancien _flush_state_batch, qui groupait aussi états d'équipements (HA + Zigbee brut) et statuts de caméras — retirés au
-    lot D (phase 1). Une transition non envoyée est réintégrée pour être retentée — jamais perdue silencieusement ; après un
-    refus Supabase, pause croissante (cf. _supabase_rpc). Blindé : une exception non prévue ne tue pas le thread."""
-    while True:
-        time.sleep(2.5)
-        try:
-            if not INGEST_SECRET or _supabase_is_backing_off():
-                continue
-            with _state_batch_lock:
-                alarm_batch = dict(_alarm_state_batch)
-                _alarm_state_batch.clear()
-            if not alarm_batch:
-                continue
-            failed = {
-                eid: (st, attrs) for eid, (st, attrs) in alarm_batch.items()
-                if not _report_alarm_state_direct(eid, st, attrs)
-            }
-            if failed:
-                with _state_batch_lock:
-                    for eid, v in failed.items():
-                        _alarm_state_batch.setdefault(eid, v)
-        except Exception as e:
-            warn(f"[flush-alarm] cycle échoué (poursuite au prochain) : {e}")
 
 
 _IEEE_RE = re.compile(r"0x[0-9a-fA-F]{16}")
@@ -12070,8 +11943,6 @@ def run_bridge():
     threading.Thread(target=run_local_bridge, daemon=True).start()
     # Bridge HA WebSocket → Supabase (ingest) : seul canal d'état, remplace EMQX
     threading.Thread(target=run_ha_ws_bridge, daemon=True).start()
-    # Retry des transitions d'alarme (seul état encore remonté au cloud)
-    threading.Thread(target=_flush_alarm_state_batch, daemon=True).start()
     threading.Thread(target=_run_alerts_engine,      daemon=True).start()
     threading.Thread(target=_run_entitlement_loop,   daemon=True, name="entitlement").start()
     # Watchdog caméras : sonde go2rtc toutes les 60s, deltas envoyés dans le batch
