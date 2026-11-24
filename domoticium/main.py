@@ -11807,12 +11807,42 @@ def _ha_core_port():
     return _ha_core_port_cache["port"]
 
 
+# En-têtes posés par un reverse proxy (cloudflared / Cloudflare) que Home Assistant traite à part.
+_HA_FORWARD_HEADERS = (b"x-forwarded-for:", b"x-forwarded-proto:", b"x-forwarded-host:", b"x-forwarded-port:", b"forwarded:", b"x-real-ip:")
+
+
+def _strip_forwarded_head(head: bytes) -> bytes:
+    """Retire de la requête les en-têtes de reverse proxy et force Connection: close (hors upgrade WebSocket).
+
+    Bug réel trouvé au retest (2026-11-24) : l'accès technicien (tunnel ha-{slug} → ce relais → HA) renvoyait « 400 Bad
+    Request ». HA 2026.11 (port 80) répond à toute requête portant X-Forwarded-For par « A request from a reverse proxy was
+    received from …, but your HTTP integration is not set-up for reverse proxies », ALORS QUE le bloc `http:` de
+    configuration.yaml (use_x_forwarded_for + trusted_proxies 127.0.0.1) est présent, valide, et que HA a été redémarré
+    depuis — vérifié : HA ne l'applique pas sur cette version. Plutôt que de dépendre d'un réglage que HA ignore, le relais
+    présente la requête comme locale (HA voit 127.0.0.1, comme pour l'add-on « Accès local »). Connection: close évite qu'une
+    connexion réutilisée par cloudflared fasse passer une 2e requête, jamais relue, avec ses propres en-têtes."""
+    sep = b"\r\n\r\n"
+    idx = head.find(sep)
+    head_part, rest = (head[:idx], head[idx + 4:]) if idx != -1 else (head, b"")
+    lines = head_part.split(b"\r\n")
+    kept = [lines[0]] + [ln for ln in lines[1:] if not ln.lower().startswith(_HA_FORWARD_HEADERS)]
+    is_websocket = any(ln.lower().startswith(b"upgrade:") and b"websocket" in ln.lower() for ln in kept[1:])
+    if not is_websocket:
+        kept = [kept[0]] + [ln for ln in kept[1:] if not ln.lower().startswith(b"connection:")] + [b"Connection: close"]
+    return b"\r\n".join(kept) + sep + rest
+
+
 class _HaPortShimHandler(socketserver.BaseRequestHandler):
     def handle(self):
         client_sock = self.request
         upstream = None
         try:
+            client_sock.settimeout(15)
+            head = _read_http_head(client_sock)
+            if not head:
+                return
             upstream = socket.create_connection(("127.0.0.1", _ha_core_port()), timeout=10)
+            upstream.sendall(_strip_forwarded_head(head))
             client_sock.settimeout(None)
             upstream.settimeout(None)
             t = threading.Thread(target=_pipe_bytes, args=(client_sock, upstream), daemon=True)
