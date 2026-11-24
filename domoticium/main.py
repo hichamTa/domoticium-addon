@@ -242,6 +242,30 @@ def _cloud_post(label: str, url: str, **kwargs):
     return r
 
 
+# ── Envois au portail : seulement ce qui CHANGE ───────────────────────────────────────────────────────────
+# Retour du 2026-11-24 : Vercel a désactivé le portail (offre Hobby dépassée : 1,4 M d'appels de fonctions pour 1 M permis,
+# CPU actif 5 h 18 pour 4 h). Cause : les entretiens de fond (_backfill_ha_entity_links / _backfill_camera_entity_links,
+# toutes les ~5 min) renvoyaient CHAQUE entité à /api/ingest/registry à chaque passage — mesuré : 2035 appels à l'heure pour
+# UN seul site, soit ~1,5 M par mois. Les envois sont désormais mémorisés (empreinte du contenu) : on ne renvoie que ce qui a
+# changé, avec un renvoi de sécurité toutes les 24 h (réparation si le portail a perdu la donnée).
+_registry_sent: dict = {}
+_REGISTRY_RESEND_S = 24 * 3600
+
+
+def _cloud_post_if_changed(label: str, url: str, payload: dict, key: str) -> bool:
+    """Poste `payload` au portail sauf s'il est identique au dernier envoi réussi (même clé) de moins de 24 h. Renvoie True si envoyé."""
+    body = {k: v for k, v in payload.items() if k != "siteSecret"}
+    sig = hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    now = time.time()
+    prev = _registry_sent.get(key)
+    if prev and prev[0] == sig and now - prev[1] < _REGISTRY_RESEND_S:
+        return False
+    r = _cloud_post(label, url, json=payload, timeout=10)
+    if getattr(r, "ok", True):
+        _registry_sent[key] = (sig, now)
+    return True
+
+
 def _supabase_rpc(fn_name: str, payload: dict, timeout: float = 10.0) -> requests.Response:
     """Appelle une fonction Postgres pi_* via PostgREST (clé publique anon — la vraie
     autorisation vient de la signature HMAC incluse dans payload, vérifiée côté DB)."""
@@ -6397,7 +6421,7 @@ def _backfill_ha_entity_links():
                     continue
                 payload["wifiId"] = wifi_id
         try:
-            _cloud_post("vercel:ingest/registry", f"{APP_URL}/api/ingest/registry", json=payload, timeout=10)
+            _cloud_post_if_changed("vercel:ingest/registry", f"{APP_URL}/api/ingest/registry", payload, f"ent:{entity_id}")
         except Exception as ex:
             warn(f"[sync] backfill ha_entity_id {entity_id}: {ex}")
 
@@ -6460,18 +6484,19 @@ def _backfill_camera_entity_links():
             continue
 
         try:
-            _cloud_post(
+            sent = _cloud_post_if_changed(
                 "vercel:ingest/camera-registry",
                 f"{APP_URL}/api/ingest/camera-registry",
-                json={
+                {
                     "siteSecret": INGEST_SECRET,
                     "siteId": SITE_PREFIX,
                     "cameraHaEntityId": entity_id,
                     "entities": secondary,
                 },
-                timeout=10,
+                f"cam:{entity_id}",
             )
-            log(f"[camera-registry] {entity_id} → {len(secondary)} entité(s) secondaire(s)")
+            if sent:
+                log(f"[camera-registry] {entity_id} → {len(secondary)} entité(s) secondaire(s)")
         except Exception as ex:
             warn(f"[camera-registry] {entity_id}: {ex}")
 
