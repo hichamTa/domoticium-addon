@@ -3598,6 +3598,14 @@ _KEYPAD_ACTION_TO_SERVICE = {
     "arm_all_zones":   "alarm_control_panel.alarm_arm_away",
 }
 
+# états du panneau Alarmo qui prouvent que la commande du clavier a été acceptée (code valide) — sinon : code refusé
+_KEYPAD_ACTION_TO_OK_STATES = {
+    "disarm":          ["disarmed"],
+    "arm_day_zones":   ["arming", "armed_home"],
+    "arm_night_zones": ["arming", "armed_night"],
+    "arm_all_zones":   ["arming", "armed_away"],
+}
+
 # état réel du panneau Alarmo → mode à republier vers le clavier (ses LED) — même
 # vocabulaire ZCL IAS ACE que les actions reçues, dans l'autre sens.
 _ALARMO_STATE_TO_KEYPAD_MODE = {
@@ -3627,7 +3635,7 @@ def _ensure_alarmo_keypad_control(devices_list):
     2. Alarmo → clavier : dès que l'état RÉEL du panneau change, une 2e automation
        republie ce même état vers le clavier (zigbee2mqtt/{clavier}/set) pour que ses
        LED reflètent la vérité — jamais ce que le client vient juste de taper (un
-       code refusé ne fait donc simplement rien, pas de fausse confirmation "armé").
+       code refusé ne change donc jamais les LED en "armé" : il reçoit seulement le clignotement d'erreur orange).
 
     Même précondition et même détection générique que _ensure_alarmo_sos_automation
     (cf. _find_ias_ace_keypad) — n'importe quel clavier conforme au cluster Zigbee
@@ -3667,13 +3675,18 @@ def _ensure_alarmo_keypad_control(devices_list):
 
     keypad_topic = f"zigbee2mqtt/{friendly_name}"
 
-    # (2026-11-23) Pas de réponse d'erreur envoyée au clavier : essayée en 2.9.253 (invalid_code / not_ready avec la
-    # transaction), elle a au contraire SUPPRIMÉ le signal d'erreur du clavier (rouge + bips) que le clavier donne de lui-même
-    # quand personne ne répond à sa requête — constaté par Hicham au retest. Un code refusé ne fait donc rien ici, volontairement.
+    # (2026-11-25) Code refusé → réponse `invalid_code` AVEC la transaction de la requête (« armRsp » côté Z2M).
+    # Mesuré sur le vrai clavier (4 variantes essayées 5 fois : invalid_code / not_ready / already_disarmed, immédiat ou
+    # retardé de 0,8 s) : TOUTE réponse à la transaction donne le même signal — LED orange qui clignote 2 fois, sans bip ;
+    # SANS réponse le clavier ne fait rien du tout (contredit le constat de 2.9.253, qui était donc faux). Alarmo ne dit
+    # jamais qu'un code est refusé (le service répond 200 et logue juste « Wrong code provided. ») : on détecte le refus
+    # à l'état du panneau, resté différent de l'état attendu 1 s après l'appel (un panneau déjà dans le bon état ne
+    # déclenche donc aucune réponse, comme avant).
     arm_cfg = {
         "type": "automation_upsert",
         "object_id": _KEYPAD_ARM_OBJECT_ID,
         "alias": "Domoticium — Armement clavier",
+        "mode": "queued",
         "trigger": [{"platform": "mqtt", "topic": keypad_topic}],
         "action": [{
             "choose": [
@@ -3682,14 +3695,30 @@ def _ensure_alarmo_keypad_control(devices_list):
                         "condition": "template",
                         "value_template": f"{{{{ trigger.payload_json.action == '{action}' }}}}",
                     }],
-                    "sequence": [{
-                        "action": service,
-                        "target": {"entity_id": panel_entity_id},
-                        # default('') : un clavier sans code configuré (code_arm_required
-                        # désactivé) peut omettre action_code du payload — un template
-                        # non défini planterait sinon l'appel de service.
-                        "data": {"code": "{{ trigger.payload_json.action_code | default('') }}"},
-                    }],
+                    "sequence": [
+                        {
+                            "action": service,
+                            "target": {"entity_id": panel_entity_id},
+                            # default('') : un clavier sans code configuré (code_arm_required
+                            # désactivé) peut omettre action_code du payload — un template
+                            # non défini planterait sinon l'appel de service.
+                            "data": {"code": "{{ trigger.payload_json.action_code | default('') }}"},
+                        },
+                        {"delay": {"seconds": 1}},
+                        {"choose": [{
+                            "conditions": [{
+                                "condition": "template",
+                                "value_template": f"{{{{ states('{panel_entity_id}') not in {_KEYPAD_ACTION_TO_OK_STATES[action]!r} }}}}",
+                            }],
+                            "sequence": [{
+                                "action": "mqtt.publish",
+                                "data": {
+                                    "topic": f"{keypad_topic}/set",
+                                    "payload": "{\"arm_mode\": {\"mode\": \"invalid_code\", \"transaction\": {{ trigger.payload_json.action_transaction | default(0) }}}}",
+                                },
+                            }],
+                        }]},
+                    ],
                 }
                 for action, service in _KEYPAD_ACTION_TO_SERVICE.items()
             ],
