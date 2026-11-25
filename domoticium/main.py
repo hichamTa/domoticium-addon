@@ -3680,7 +3680,8 @@ def _ensure_alarmo_keypad_control(devices_list):
     # retardé de 0,8 s) : TOUTE réponse à la transaction donne le même signal — LED orange qui clignote 2 fois, sans bip ;
     # SANS réponse le clavier ne fait rien du tout (contredit le constat de 2.9.253, qui était donc faux). Alarmo ne dit
     # jamais qu'un code est refusé (le service répond 200 et logue juste « Wrong code provided. ») : on détecte le refus
-    # à l'état du panneau, resté différent de l'état attendu 1 s après l'appel (un panneau déjà dans le bon état ne
+    # à l'état du panneau, resté différent de l'état attendu 0,3 s après l'appel (à 1 s le clavier n'affichait plus rien : la réponse doit
+    # arriver vite après sa requête, 2.9.266 retesté et corrigé en 2.9.267) (un panneau déjà dans le bon état ne
     # déclenche donc aucune réponse, comme avant).
     arm_cfg = {
         "type": "automation_upsert",
@@ -3704,7 +3705,7 @@ def _ensure_alarmo_keypad_control(devices_list):
                             # non défini planterait sinon l'appel de service.
                             "data": {"code": "{{ trigger.payload_json.action_code | default('') }}"},
                         },
-                        {"delay": {"seconds": 1}},
+                        {"delay": {"milliseconds": 300}},
                         {"choose": [{
                             "conditions": [{
                                 "condition": "template",
