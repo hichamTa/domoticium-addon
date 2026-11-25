@@ -4661,21 +4661,28 @@ def remove_legacy_mqtt_discovery_prefix():
 
 
 _HA_TRUSTED_PROXY_MARKER = "# domoticium-trusted-proxy"
+# Le bloc EXACT que les anciennes versions de l'add-on (jusqu'à 2.9.264) ajoutaient à configuration.yaml.
+_HA_TRUSTED_PROXY_BLOCK_RE = re.compile(
+    r"\n?" + re.escape(_HA_TRUSTED_PROXY_MARKER) + r"[^\n]*\n"
+    r"http:\n  use_x_forwarded_for: true\n  trusted_proxies:\n    - 127\.0\.0\.1\n"
+    r"(?![ \t])"  # le bloc doit s'arrêter là : une ligne indentée à sa suite = bloc personnalisé, jamais amputé
+)
 
 
-def _ensure_ha_trusted_proxy():
-    """Idempotent, tourne à chaque démarrage (patch aussi les sites déjà provisionnés
-    avant l'accès distant HA, Phase 2) : Home Assistant refuse par défaut les requêtes
-    venant d'un reverse proxy inconnu (cf. homeassistant.components.http.forwarded) —
-    depuis que le tunnel Cloudflare route désormais Home Assistant lui-même (racine du
-    hostname, plus seulement les caméras/l'addon), il faut déclarer 127.0.0.1 (là où
-    cloudflared se connecte) comme proxy de confiance, sinon 400 Bad Request systématique.
-    Erreur réelle observée en conditions réelles le 2026-08-13 : "A request from a
-    reverse proxy was received from 127.0.0.1, but your HTTP integration is not
-    set-up for reverse proxies" — jamais un problème avant ce jour car HA n'était
-    jusque-là jamais exposé derrière le tunnel, seulement les caméras et l'addon.
-    Ne touche jamais à un bloc "http:" déjà personnalisé par l'utilisateur — log
-    seulement, pour ne jamais corrompre une config existante qu'on ne maîtrise pas."""
+def _remove_ha_trusted_proxy_block():
+    """Idempotent, tourne à chaque démarrage : retire de configuration.yaml l'ancien bloc `http: use_x_forwarded_for /
+    trusted_proxies 127.0.0.1` posé par les versions ≤ 2.9.264. Il ne servait plus à rien et gênait :
+
+    Cause racine (trouvée le 2026-11-25, code source HA 2026.11 : components/http/config.py + forwarded.py) : depuis
+    HA 2026.11 le bloc `http:` du YAML n'est lu qu'UNE SEULE FOIS (migration vers `.storage/http` au 1er démarrage, ou
+    marquée « faite » d'office s'il n'y a pas de YAML à ce moment-là) ; ensuite le YAML est IGNORÉ et HA affiche dans
+    Réparations l'avertissement « yaml_still_present_after_migration ». Notre bloc, ajouté après coup par l'add-on, n'a donc
+    jamais été appliqué (vérifié sur le Pi de test via la commande WebSocket `http/config` : stable = valeurs par défaut,
+    sans use_x_forwarded_for) → 400 sur toute requête portant X-Forwarded-For. Le relais local (`_HaPortShimHandler`) retire
+    ces en-têtes avant HA : plus besoin d'aucun réglage proxy côté HA, donc on retire le bloc inutile.
+
+    Ne touche JAMAIS un bloc `http:` personnalisé : seul le bloc strictement identique à l'ancien ajout est retiré.
+    Aucun redémarrage de HA requis (l'avertissement disparaît tout seul au prochain démarrage de HA)."""
     main_cfg = "/homeassistant/configuration.yaml"
     try:
         with open(main_cfg) as f:
@@ -4683,33 +4690,17 @@ def _ensure_ha_trusted_proxy():
     except FileNotFoundError:
         return False
 
-    # Diagnostic (2026-11-24) : l'accès technicien renvoyait 400 « request from a reverse proxy … not set-up » alors que le marqueur
-    # est censé garantir le bloc http: → on journalise le bloc RÉEL (aucun secret n'y figure) pour voir ce que HA lit vraiment.
-    m_http = re.search(r"(?m)^http:\s*$(?:\n(?:[ \t].*|\s*#.*|\s*))*", content)
-    warn(f"[trusted-proxy] marqueur={'oui' if _HA_TRUSTED_PROXY_MARKER in content else 'non'} ; bloc http: "
-         f"{('présent : ' + repr(m_http.group(0)[:400])) if m_http else 'ABSENT'} ; "
-         f"nb de lignes 'http:' au niveau racine = {len(re.findall(r'(?m)^http:', content))}")
+    if _HA_TRUSTED_PROXY_MARKER not in content:
+        return False  # jamais posé (nouveau site) ou déjà retiré
 
-    if _HA_TRUSTED_PROXY_MARKER in content:
-        return False  # déjà fait
-
-    if re.search(r"(?m)^http:\s*$", content):
-        warn("[trusted-proxy] Un bloc 'http:' existe déjà dans configuration.yaml — "
-             "vérifier manuellement que use_x_forwarded_for/trusted_proxies (127.0.0.1) y figurent.")
+    new_content, n = _HA_TRUSTED_PROXY_BLOCK_RE.subn("", content, count=1)
+    if n == 0:
+        warn("[trusted-proxy] Marqueur trouvé mais bloc non reconnu (modifié à la main ?) — pas touché.")
         return False
-
-    block = (
-        f"\n{_HA_TRUSTED_PROXY_MARKER} — requis pour l'accès distant technicien (Phase 2),"
-        " Home Assistant est désormais exposé (protégé par Cloudflare Access) via le tunnel\n"
-        "http:\n"
-        "  use_x_forwarded_for: true\n"
-        "  trusted_proxies:\n"
-        "    - 127.0.0.1\n"
-    )
-    with open(main_cfg, "a") as f:
-        f.write(block)
-    log("✓ configuration.yaml : proxy de confiance ajouté (127.0.0.1) pour l'accès distant HA")
-    return True
+    with open(main_cfg, "w") as f:
+        f.write(new_content)
+    log("✓ configuration.yaml : ancien bloc http: proxy de confiance retiré (inutile, ignoré par HA ≥ 2026.11)")
+    return False
 
 
 # Nettoyage du diagnostic temporaire posé en v2.9.226 (logger debug loader/
@@ -11496,7 +11487,8 @@ def _strip_forwarded_head(head: bytes) -> bytes:
     Request ». HA 2026.11 (port 80) répond à toute requête portant X-Forwarded-For par « A request from a reverse proxy was
     received from …, but your HTTP integration is not set-up for reverse proxies », ALORS QUE le bloc `http:` de
     configuration.yaml (use_x_forwarded_for + trusted_proxies 127.0.0.1) est présent, valide, et que HA a été redémarré
-    depuis — vérifié : HA ne l'applique pas sur cette version. Plutôt que de dépendre d'un réglage que HA ignore, le relais
+    depuis. Cause racine (2026-11-25) : depuis HA 2026.11 le bloc `http:` du YAML n'est lu qu'une seule fois (migration vers
+    .storage/http) puis ignoré — voir `_remove_ha_trusted_proxy_block`. Plutôt que de dépendre d'un réglage que HA ignore, le relais
     présente la requête comme locale (HA voit 127.0.0.1, comme pour l'add-on « Accès local »). Connection: close évite qu'une
     connexion réutilisée par cloudflared fasse passer une 2e requête, jamais relue, avec ses propres en-têtes."""
     sep = b"\r\n\r\n"
@@ -11837,7 +11829,8 @@ if __name__ == "__main__":
     # (appairage Zigbee/Matter en cours plus loin dans l'installation) plutôt que de
     # risquer de tomber en plein milieu.
     wait_for_ha()
-    _needs_ha_restart = _ensure_ha_trusted_proxy()
+    _remove_ha_trusted_proxy_block()
+    _needs_ha_restart = False
     _needs_ha_restart = _remove_ha_debug_logger_once() or _needs_ha_restart
     if _needs_ha_restart:
         log("[setup] Redémarrage HA Core pour appliquer configuration.yaml…")
