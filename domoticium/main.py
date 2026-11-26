@@ -10532,7 +10532,24 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             ws_recv()
             self._ok({"ok": True})
         except Exception as e:
-            self._ok({"ok": False, "error": f"Révocation WebSocket HA échouée: {e}"})
+            # (2026-11-26) HA ferme la connexion dès qu'il supprime le refresh_token qui l'authentifie : la réponse n'arrive
+            # parfois jamais et on reçoit « WS close frame » alors que la révocation a RÉUSSI (constaté en réel : session
+            # révoquée, erreur remontée à tort, journal Vercel « révocation du jeton HA échouée »). On ne devine pas : on
+            # retente de se connecter avec le même jeton — refusé = révoqué ; accepté = la révocation a vraiment échoué.
+            still_valid = True
+            try:
+                v_send, _v_recv, v_close = _ha_ws_connect(
+                    access_token=session_token, host="127.0.0.1", port=_ha_core_port(), path="/api/websocket"
+                )
+                still_valid = bool(v_send)
+                if v_send:
+                    v_close()
+            except Exception:
+                still_valid = False
+            if still_valid:
+                self._ok({"ok": False, "error": f"Révocation WebSocket HA échouée: {e}"})
+            else:
+                self._ok({"ok": True})
         finally:
             try:
                 ws_close()
