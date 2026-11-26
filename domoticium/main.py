@@ -6560,6 +6560,23 @@ def handle_remote_access_set(data: dict) -> dict:
     return {"ok": True, "count": len(cleaned)}
 
 
+def _remote_access_resync_at_startup() -> None:
+    """La liste des demandes/sessions d'accès technicien vit EN MÉMOIRE : un redémarrage de l'add-on la perdait, et le bandeau de
+    l'accueil disparaissait en pleine session jusqu'au prochain changement (le portail, lui, la montrait toujours). Au démarrage,
+    on demande donc UNE fois au portail de la repousser (action « sync »). Le portail rappelle l'add-on par le tunnel : on laisse
+    à celui-ci le temps de monter, et on réessaie quelques fois (au plus 5 requêtes, jamais en boucle)."""
+    for delay in (45, 60, 120, 240, 480):
+        time.sleep(delay)
+        try:
+            r = _cloud_post("vercel:ingest/remote-access", f"{APP_URL}/api/ingest/remote-access",
+                            json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX, "action": "sync"}, timeout=20)
+            if r.ok and (r.json() or {}).get("ok"):
+                return
+        except Exception:
+            pass
+    warn("[remote-access] resynchronisation au démarrage impossible (portail injoignable) — le portail reste la voie de secours")
+
+
 def handle_remote_access_respond(data: dict) -> dict:
     """Le client répond depuis le bandeau de l'accueil de l'app du foyer : le boîtier relaie au portail, signé avec le secret du
     site (POST /api/ingest/remote-access). La vérification que la session est celle d'une PERSONNE (pas une tablette murale) est
@@ -11910,6 +11927,7 @@ def run_bridge():
     threading.Thread(target=run_local_ha_tls_relay, daemon=True).start()
     threading.Thread(target=_run_ha_port_shim, daemon=True, name="ha-shim").start()
     threading.Thread(target=_run_health_supervisor, daemon=True, name="health").start()
+    threading.Thread(target=_remote_access_resync_at_startup, daemon=True, name="ra-resync").start()
 
     # Serveur de commandes — bloquant, tourne dans le thread principal
     run_command_server()
