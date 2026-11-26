@@ -6513,6 +6513,58 @@ def _sse_publish(lane: str) -> None:
             pass  # abonné lent : le prochain signal (ou la relève client) le rattrape
 
 
+# ── Demandes d'accès technicien en attente (2026-11-26) ──────────────────────────────────────────────────────────────
+# L'état vit dans le cloud (le staff et la règle Cloudflare Access le lisent) ; l'app du foyer, servie par le Pi, n'a aucun accès
+# au cloud. Le portail envoie donc au Pi, à chaque changement (demande, prolongation, réponse, annulation), la liste COMPLÈTE des
+# demandes en attente (POST /remote-access/pending, signé comme toute commande) ; le Pi la garde EN MÉMOIRE (jamais sur disque :
+# une demande dure 5 min) et prévient l'app du foyer par le flux SSE, qui l'affiche en alerte sur l'accueil. Chaque demande porte
+# son heure d'expiration : elle disparaît d'elle-même si un envoi d'annulation se perd.
+_REMOTE_ACCESS_MAX = 5
+_remote_access_lock = threading.Lock()
+_remote_access_pending: list = []
+
+
+def _remote_access_clean(raw) -> list:
+    """Valide/borne ce que le portail envoie : jamais plus de _REMOTE_ACCESS_MAX entrées, champs textes tronqués."""
+    out = []
+    for r in (raw if isinstance(raw, list) else [])[:_REMOTE_ACCESS_MAX]:
+        if not isinstance(r, dict):
+            continue
+        try:
+            expires = datetime.fromisoformat(str(r.get("expiresAt", "")).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        resource = r.get("resource") if r.get("resource") in ("ha", "cameras", "both") else "ha"
+        out.append({
+            "id": str(r.get("id", ""))[:64],
+            "resource": resource,
+            "reason": str(r.get("reason") or "")[:500],
+            "technicianName": (str(r["technicianName"])[:100] if r.get("technicianName") else None),
+            "cameraName": (str(r["cameraName"])[:100] if r.get("cameraName") else None),
+            "isExtension": bool(r.get("isExtension")),
+            "expiresAtMs": int(expires * 1000),
+        })
+    return out
+
+
+def handle_remote_access_set(data: dict) -> dict:
+    global _remote_access_pending
+    cleaned = _remote_access_clean(data.get("requests"))
+    with _remote_access_lock:
+        changed = [r["id"] for r in _remote_access_pending] != [r["id"] for r in cleaned]
+        _remote_access_pending = cleaned
+    log(f"[remote-access] {len(cleaned)} demande(s) d'accès technicien en attente" + ("" if changed else " (inchangé)"))
+    _sse_publish("fast")  # l'app du foyer relit aussitôt (alerte sur l'accueil)
+    return {"ok": True, "count": len(cleaned)}
+
+
+def handle_local_remote_access() -> dict:
+    """Demandes en attente non expirées, pour l'alerte de l'accueil de l'app du foyer."""
+    now_ms = int(time.time() * 1000)
+    with _remote_access_lock:
+        return {"requests": [r for r in _remote_access_pending if r["expiresAtMs"] > now_ms]}
+
+
 def _sse_note_state_change(entity_id: str, new_state: dict) -> None:
     """Appelé par le pont WebSocket pour chaque state_changed — très bon marché tant qu'aucun client n'est connecté."""
     if not _sse_subscribers:
@@ -10341,6 +10393,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/local/voice/exposure": lambda d: self._ok(handle_voice_exposure_set(d)),
                 "/ha/session-token/create": self._handle_ha_session_token_create,
                 "/ha/session-token/revoke": self._handle_ha_session_token_revoke,
+                "/remote-access/pending": lambda d: self._ok(handle_remote_access_set(d)),
             }
             handler = handlers.get(route)
             if not handler:
@@ -10881,6 +10934,8 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self._handle_local_site_route()
         elif route == "/local/alerts":
             self._handle_local_alerts_route()
+        elif route == "/local/remote-access":
+            self._ok(handle_local_remote_access())
         elif route == "/local/stats":
             self._ok(handle_local_stats())
         elif route == "/local/entitlement":
