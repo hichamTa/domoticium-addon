@@ -6516,7 +6516,7 @@ def _sse_publish(lane: str) -> None:
 # ── Demandes d'accès technicien en attente (2026-11-26) ──────────────────────────────────────────────────────────────
 # L'état vit dans le cloud (le staff et la règle Cloudflare Access le lisent) ; l'app du foyer, servie par le Pi, n'a aucun accès
 # au cloud. Le portail envoie donc au Pi, à chaque changement (demande, prolongation, réponse, annulation), la liste COMPLÈTE des
-# demandes en attente (POST /remote-access/pending, signé comme toute commande) ; le Pi la garde EN MÉMOIRE (jamais sur disque :
+# demandes en attente ET de la session active (POST /remote-access/pending, signé comme toute commande) ; le Pi la garde EN MÉMOIRE (jamais sur disque :
 # une demande dure 5 min) et prévient l'app du foyer par le flux SSE, qui l'affiche en alerte sur l'accueil. Chaque demande porte
 # son heure d'expiration : elle disparaît d'elle-même si un envoi d'annulation se perd.
 _REMOTE_ACCESS_MAX = 5
@@ -6537,6 +6537,8 @@ def _remote_access_clean(raw) -> list:
         resource = r.get("resource") if r.get("resource") in ("ha", "cameras", "both") else "ha"
         out.append({
             "id": str(r.get("id", ""))[:64],
+            "kind": "active" if r.get("kind") == "active" else "pending",
+            "extendable": bool(r.get("extendable")),
             "resource": resource,
             "reason": str(r.get("reason") or "")[:500],
             "technicianName": (str(r["technicianName"])[:100] if r.get("technicianName") else None),
@@ -6554,8 +6556,29 @@ def handle_remote_access_set(data: dict) -> dict:
         changed = [r["id"] for r in _remote_access_pending] != [r["id"] for r in cleaned]
         _remote_access_pending = cleaned
     log(f"[remote-access] {len(cleaned)} demande(s) d'accès technicien en attente" + ("" if changed else " (inchangé)"))
-    _sse_publish("fast")  # l'app du foyer relit aussitôt (alerte sur l'accueil)
+    _sse_publish("remote")  # voie dédiée : seul le bandeau de l'accueil relit (pas les équipements)
     return {"ok": True, "count": len(cleaned)}
+
+
+def handle_remote_access_respond(data: dict) -> dict:
+    """Le client répond depuis le bandeau de l'accueil de l'app du foyer : le boîtier relaie au portail, signé avec le secret du
+    site (POST /api/ingest/remote-access). La vérification que la session est celle d'une PERSONNE (pas une tablette murale) est
+    faite en amont par l'app du foyer ; ici on borne seulement les entrées. Le portail applique la même logique que pour une
+    réponse faite sur le portail, puis repousse l'état réel à cet add-on (le bandeau se met à jour par le flux temps réel)."""
+    request_id = str(data.get("requestId") or "")[:64]
+    action = data.get("action")
+    if not request_id or action not in ("approve", "refuse", "revoke", "extend"):
+        return {"ok": False, "error": "Paramètres invalides"}
+    try:
+        r = _cloud_post("vercel:ingest/remote-access", f"{APP_URL}/api/ingest/remote-access",
+                        json={"siteSecret": INGEST_SECRET, "siteId": SITE_PREFIX, "action": action, "requestId": request_id}, timeout=30)
+        body = r.json() if r.content else {}
+    except Exception as e:
+        warn(f"[remote-access] relais de la réponse au portail échoué: {e}")
+        return {"ok": False, "error": "Portail injoignable — réessayez, ou répondez depuis votre espace client."}
+    if r.status_code in (401, 403):
+        return {"ok": False, "error": "Boîtier non reconnu par le portail"}
+    return {"ok": bool(body.get("ok")), **({"error": str(body.get("error"))[:300]} if body.get("error") else {})}
 
 
 def handle_local_remote_access() -> dict:
@@ -10394,6 +10417,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 "/ha/session-token/create": self._handle_ha_session_token_create,
                 "/ha/session-token/revoke": self._handle_ha_session_token_revoke,
                 "/remote-access/pending": lambda d: self._ok(handle_remote_access_set(d)),
+                "/local/remote-access/respond": lambda d: self._ok(handle_remote_access_respond(d)),
             }
             handler = handlers.get(route)
             if not handler:
@@ -10986,9 +11010,9 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
             self.wfile.write(b"retry: 3000\n: connecte\n\n")
             self.wfile.flush()
 
-            pending = {"fast": False, "slow": False}
-            last_sent = {"fast": 0.0, "slow": 0.0}
-            min_interval = {"fast": _SSE_FAST_MIN_INTERVAL_S, "slow": _SSE_SLOW_MIN_INTERVAL_S}
+            pending = {"fast": False, "slow": False, "remote": False}
+            last_sent = {"fast": 0.0, "slow": 0.0, "remote": 0.0}
+            min_interval = {"fast": _SSE_FAST_MIN_INTERVAL_S, "slow": _SSE_SLOW_MIN_INTERVAL_S, "remote": 0.3}
             last_write = time.time()
             while True:
                 if self._sse_client_gone():
@@ -10996,7 +11020,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                 now = time.time()
                 # Réveil au moins toutes les secondes pour détecter une fermeture côté client.
                 wait = min(1.0, _SSE_KEEPALIVE_S - (now - last_write))
-                for lane in ("fast", "slow"):
+                for lane in ("fast", "slow", "remote"):
                     if pending[lane]:
                         wait = min(wait, last_sent[lane] + min_interval[lane] - now)
                 try:
@@ -11008,7 +11032,7 @@ height:100vh;margin:0;text-align:center;padding:0 20px"><p>{safe}</p></body></ht
                     pass
 
                 now = time.time()
-                for lane in ("fast", "slow"):
+                for lane in ("fast", "slow", "remote"):
                     if pending[lane] and now - last_sent[lane] >= min_interval[lane]:
                         self.wfile.write(f'event: change\ndata: {{"lane":"{lane}"}}\n\n'.encode())
                         self.wfile.flush()
